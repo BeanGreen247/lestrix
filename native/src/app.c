@@ -560,9 +560,19 @@ static void on_ftp_password(const char *pw, gpointer data) {
     g_free(o);
 }
 
-static Tab *open_connection(App *a, SdConn *c) {
+static Tab *open_connection_copy(App *a, SdConn *c);
+
+/* refresh() reloads ~/.ssh/config and frees the store's connection records, so work on a private copy. */
+static Tab *open_connection(App *a, SdConn *conn) {
+    SdConn *c = sd_conn_copy(conn);
     sd_store_touch(a->store, c->id);
     refresh(a);
+    Tab *t = open_connection_copy(a, c);
+    sd_conn_free(c);
+    return t;
+}
+
+static Tab *open_connection_copy(App *a, SdConn *c) {
     if (g_str_equal(c->protocol, "ftp") || g_str_equal(c->protocol, "ftps")) {
         if (*c->user) {
             FtpOpen *o = g_new0(FtpOpen, 1);
@@ -1623,6 +1633,7 @@ static void build_window(App *a, Startup *s) {
 
 static void on_activate(GtkApplication *gapp, gpointer data) {
     Startup *s = data;
+    gtk_window_set_default_icon_name("lestrix");  /* window and taskbar icon (the theme lookup finds the installed PNG) */
     App *a = g_new0(App, 1);
     a->gapp = gapp;
     s->a = a;

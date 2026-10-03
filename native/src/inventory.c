@@ -486,6 +486,9 @@ GPtrArray *sd_parse_ssh_config(const char *path, gboolean live) {
     for (guint i = 0; i < aliases->len; i++) {
         const char *alias = aliases->pdata[i];
         GHashTable *o = alias_opts->pdata[i];
+        gboolean dup = FALSE;  /* the same alias in two Host lines: ssh uses the first, so list it once */
+        for (guint j = 0; j < i && !dup; j++) dup = g_str_equal(aliases->pdata[j], alias);
+        if (dup) continue;
         SdConn *c = sd_conn_new();
         sd_conn_set(&c->name, alias);
         const char *hn = g_hash_table_lookup(o, "hostname");
