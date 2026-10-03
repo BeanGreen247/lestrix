@@ -10,7 +10,7 @@ A fast, light SSH terminal manager for Linux in plain C and GTK4. Saved connecti
   <img src="native/docs/welcome.png" alt="Lestrix start page with saved connections" width="900"/>
 </p>
 
-**Version:** 0.2.0  
+**Version:** 0.2.1  
 **Author:** BeanGreen247  
 **License:** MIT
 

@@ -11,7 +11,7 @@
 #include "theme.h"
 #include "xfer.h"
 
-#define APP_VERSION "0.2.0"
+#define APP_VERSION "0.2.1"
 #define APP_ID "term.beangreen247.lestrix"
 
 typedef struct App App;
