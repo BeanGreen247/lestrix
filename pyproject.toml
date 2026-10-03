@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lestrix"
+version = "0.2.0"
+description = "SSH sessions, SFTP and local shells in one window: saved connections on the left, terminal tabs on the right."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "PyQt6>=6.5",
+    "pyte>=0.8.2",
+    "pywinpty>=2.0; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+lestrix = "lestrix.app:main"
+
+[tool.setuptools]
+packages = ["lestrix"]
+
+[tool.setuptools.package-data]
+lestrix = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

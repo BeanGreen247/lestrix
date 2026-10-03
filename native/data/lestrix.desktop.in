@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Lestrix
+GenericName=Terminal Emulator
+Comment=SSH sessions, SFTP/FTP and local shells in one window
+Exec=@BINDIR@/lestrix
+Icon=lestrix
+Terminal=false
+StartupNotify=true
+Categories=System;TerminalEmulator;
+Keywords=ssh;sftp;ftp;terminal;shell;console;remote;ansible;
+StartupWMClass=term.beangreen247.lestrix
+Actions=local;
+
+[Desktop Action local]
+Name=New local shell
+Exec=@BINDIR@/lestrix --local
