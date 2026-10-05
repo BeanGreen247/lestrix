@@ -164,7 +164,13 @@ ensure_sudo() {
   done
   return 1
 }
-trap '[ -n "$SUDO_KEEPALIVE" ] && kill "$SUDO_KEEPALIVE" 2>/dev/null' EXIT
+# on the way out: stop the sudo keepalive and, after a dialog session, clear the screen so nothing of the installer is left in the terminal
+cleanup() {
+  [ -n "$SUDO_KEEPALIVE" ] && kill "$SUDO_KEEPALIVE" 2>/dev/null
+  if [ -n "$TUI" ] && [ "$DRY" = 0 ]; then clear 2>/dev/null || printf '\033[H\033[2J\033[3J'; fi
+  return 0
+}
+trap cleanup EXIT
 
 # ---- what is installed now --------------------------------------------------------------------------------------------------------------------
 BINPATH="$(command -v lestrix 2>/dev/null || true)"
