@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds and installs the native Lestrix. Safe to re-run: it rebuilds and replaces the installed binary.
-#   ./install.sh                   build and install for the current user (~/.local)
-#   ./install.sh --prefix /usr/local   install system-wide (uses sudo for the copy)
+#   ./install.sh                   build and install system-wide (/usr/local; the copy step uses sudo)
+#   ./install.sh --prefix ~/.local     install only for the current user (no sudo for the copy)
 #   ./install.sh --deps            install build dependencies first (needs root or sudo)
 #   ./install.sh --no-deps         never touch system packages
 #   ./install.sh --no-default-terminal   do not make Lestrix the default terminal (the default is to do it)
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
-PREFIX="$HOME/.local"; DEPS=ask; UNINSTALL=0; DEFAULT_TERM=1
+PREFIX="/usr/local"; DEPS=ask; UNINSTALL=0; DEFAULT_TERM=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) PREFIX="$2"; shift ;;

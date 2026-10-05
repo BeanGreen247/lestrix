@@ -2,12 +2,12 @@
 # Removes everything the native Lestrix installer created.
 #   ./uninstall.sh                 remove the app, menu entry, icon and build output
 #   ./uninstall.sh --purge         also delete saved connections, settings and leftover history files
-#   ./uninstall.sh --prefix DIR    uninstall from DIR instead of ~/.local (and /usr/local)
+#   ./uninstall.sh --prefix DIR    uninstall from DIR instead of looking in /usr/local, ~/.local and /usr
 #   ./uninstall.sh --yes           do not ask before --purge deletes your data
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
-PREFIXES=("$HOME/.local" /usr/local /usr); PURGE=0; YES=0
+PREFIXES=(/usr/local "$HOME/.local" /usr); PURGE=0; YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) PREFIXES=("$2"); shift ;;

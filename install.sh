@@ -4,7 +4,7 @@
 #   ./install.sh                     the dialog installer (asks what you want)
 #   ./install.sh --yes               no questions: install with the defaults
 #   ./install.sh --uninstall         remove Lestrix (--purge also deletes saved connections and settings)
-#   --prefix DIR                     install under DIR (default ~/.local; /usr/local uses sudo)
+#   --prefix DIR                     install under DIR (default /usr/local, which uses sudo; ~/.local is for your user only)
 #   --deps / --no-deps               install missing system packages / never touch them
 #   --default-terminal / --no-default-terminal   make Lestrix the default terminal (default: yes)
 #   --plain                          no dialog, ask plain questions in the terminal
@@ -223,9 +223,9 @@ if [ "$INTERACTIVE" = 1 ]; then
   OPTS=$(ui_check "Install options" "Space marks or unmarks an option, Enter continues." \
     deps "Install missing build packages (compiler, SDL2, FreeType, ...; asks for sudo)" "$DEPS_ON" \
     defterm "Make Lestrix the default terminal" on \
-    system "Install system-wide to /usr/local instead of your home folder (asks for sudo)" off \
+    user "Install only for my user in ~/.local instead of system-wide in /usr/local (no sudo for the files)" off \
     tests "Run the test suite after installing (takes about a minute)" off) || exit 0
-  [ -z "$PREFIX" ] && chosen "$OPTS" system && PREFIX=/usr/local
+  [ -z "$PREFIX" ] && chosen "$OPTS" user && PREFIX="$HOME/.local"
   [ -z "$DEPS" ] && { chosen "$OPTS" deps && DEPS=yes || DEPS=no; }
   [ -z "$DEFTERM" ] && { chosen "$OPTS" defterm && DEFTERM=yes || DEFTERM=no; }
   chosen "$OPTS" tests && RUN_TESTS=1
@@ -233,9 +233,10 @@ else
   [ -z "$DEPS" ] && DEPS=ask
 fi
 [ -z "$DEFTERM" ] && DEFTERM=yes
+[ -z "$PREFIX" ] && PREFIX=/usr/local   # system-wide by default: every user of the machine gets it
 
 # ---- confirm --------------------------------------------------------------------------------------------------------------------------------------
-SUMMARY="Install to:        ${PREFIX:-$HOME/.local}
+SUMMARY="Install to:        $PREFIX
 System packages:   ${DEPS}
 Default terminal:  ${DEFTERM}
 Run tests:         $([ "$RUN_TESTS" = 1 ] && echo yes || echo no)
@@ -253,7 +254,8 @@ case "$DEPS" in yes) a+=(--deps) ;; no) a+=(--no-deps) ;; esac
 [ "$DEFTERM" = no ] && a+=(--no-default-terminal)
 [ -n "$PREFIX" ] && a+=(--prefix "$PREFIX")
 NEED_SUDO=0
-{ [ "$DEPS" = yes ] || [ "$PREFIX" = /usr/local ] || { [ "$DEFTERM" = yes ] && have update-alternatives; }; } && NEED_SUDO=1
+probe="$PREFIX"; while [ ! -e "$probe" ] && [ "$probe" != / ]; do probe=$(dirname "$probe"); done
+{ [ "$DEPS" = yes ] || [ ! -w "$probe" ] || { [ "$DEFTERM" = yes ] && have update-alternatives; }; } && NEED_SUDO=1
 if [ "$NEED_SUDO" = 1 ]; then ensure_sudo || { warn "no sudo access: continuing without it (system packages and the x-terminal-emulator setting may be skipped)"; }; fi
 step "Installing Lestrix (building takes a minute)" native ./install.sh "${a[@]}" || rc=$?
 if [ $rc = 0 ] && [ "$RUN_TESTS" = 1 ]; then
@@ -262,7 +264,7 @@ fi
 
 if [ $rc = 0 ]; then
   MSG="Lestrix is installed.\n\n$([ "$TEST_FAILED" = 1 ] && printf 'Some tests failed; the output was shown in the test step.\\n\\n')Start it from your application menu (System) or run:  lestrix\n\nRemove it any time with:  ./install.sh --uninstall\n\nExtras: 'lxcat' prints big files at memory speed in a Lestrix tab; 'cat' uses it automatically (View > Fast cat)."
-  case ":$PATH:" in *":${PREFIX:-$HOME/.local}/bin:"*) ;; *) MSG="$MSG\n\nNote: add ${PREFIX:-$HOME/.local}/bin to your PATH to run 'lestrix' from a shell." ;; esac
+  case ":$PATH:" in *":$PREFIX/bin:"*) ;; *) MSG="$MSG\n\nNote: add $PREFIX/bin to your PATH to run 'lestrix' from a shell." ;; esac
   if [ "$INTERACTIVE" = 1 ]; then ui_msg "Done" "$MSG"; else printf '%b\n' "$MSG"; fi
 else
   MSG="The installer stopped with an error (code $rc). The messages above say what failed."

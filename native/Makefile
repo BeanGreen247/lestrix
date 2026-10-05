@@ -74,7 +74,7 @@ $(BUILD)/test_ftp: tests/test_ftp.c src/xfer.c src/store.c src/json.c src/invent
 test-ftp: $(BUILD)/test_ftp
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/test_ftp
 
-PREFIX ?= $(HOME)/.local
+PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 DATADIR := $(PREFIX)/share
 
