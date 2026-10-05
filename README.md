@@ -10,7 +10,7 @@ A fast, light SSH terminal manager in plain C. No GTK, no Qt: the window, the wi
   <img src="native/docs/welcome.png" alt="Lestrix start page with saved connections" width="900"/>
 </p>
 
-**Version:** 0.2.1  
+**Version:** 0.2.2  
 **Author:** BeanGreen247  
 **License:** MIT
 

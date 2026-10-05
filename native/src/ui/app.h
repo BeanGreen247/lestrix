@@ -14,7 +14,7 @@
 #include "ui.h"
 #include "uitheme.h"
 
-#define APP_VERSION "0.2.1"
+#define APP_VERSION "0.2.2"
 
 typedef struct App App;
 typedef struct Dialog Dialog;
