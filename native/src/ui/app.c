@@ -18,6 +18,7 @@
 #include "../bench.h"
 #include "fleetwm.h"
 #include "app.h"
+#include "appicon.h"
 #include "workpool.h"
 #include "gl.h"
 #include "jobs.h"
@@ -1454,6 +1455,10 @@ static bool gl_init(App *a, GlKind kind) {
     int win_w = 1440, win_h = 780;   /* wide enough for the performance overlay; shrunk to fit small screens */
     { SDL_Rect db; if (SDL_GetDisplayBounds(0, &db) == 0) { if (win_w > db.w * 95 / 100) win_w = db.w * 95 / 100; if (win_h > db.h * 90 / 100) win_h = db.h * 90 / 100; } }
     a->win = SDL_CreateWindow("Lestrix", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (a->win) {
+        SDL_Surface *ic = SDL_CreateRGBSurfaceWithFormatFrom((void *)APP_ICON_RGBA, 64, 64, 32, 64 * 4, SDL_PIXELFORMAT_RGBA32);
+        if (ic) { SDL_SetWindowIcon(a->win, ic); SDL_FreeSurface(ic); }
+    }
     tmark("window created");
     a->gl = a->win ? SDL_GL_CreateContext(a->win) : NULL;
     tmark("GL context created");

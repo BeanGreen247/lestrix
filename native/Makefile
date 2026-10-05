@@ -79,14 +79,17 @@ BINDIR := $(PREFIX)/bin
 DATADIR := $(PREFIX)/share
 
 install: $(BUILD)/lestrix $(BUILD)/lxcat
-	install -d $(BINDIR) $(DATADIR)/applications $(DATADIR)/icons/hicolor/256x256/apps
+	install -d -m 755 $(BINDIR) $(DATADIR)/applications $(DATADIR)/icons/hicolor/256x256/apps
 	install -m 755 $(BUILD)/lestrix $(BINDIR)/lestrix
 	install -m 755 $(BUILD)/lxcat $(BINDIR)/lxcat
 	install -m 644 data/lestrix.png $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png
 	sed 's|@BINDIR@|$(BINDIR)|g' data/lestrix.desktop.in > $(DATADIR)/applications/lestrix.desktop
+	chmod 644 $(DATADIR)/applications/lestrix.desktop   # root's umask is often 027: a menu entry the user cannot read does not show up
 	-desktop-file-validate $(DATADIR)/applications/lestrix.desktop 2>&1 | sed 's/^/desktop-file-validate: /'
 	-update-desktop-database $(DATADIR)/applications 2>/dev/null
+	-chmod 644 $(DATADIR)/applications/mimeinfo.cache 2>/dev/null
 	-gtk-update-icon-cache -q -t $(DATADIR)/icons/hicolor 2>/dev/null || true
+	-chmod -R a+rX $(DATADIR)/icons/hicolor 2>/dev/null
 
 uninstall:
 	rm -f $(BINDIR)/lestrix $(BINDIR)/lxcat $(DATADIR)/applications/lestrix.desktop $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png

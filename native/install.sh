@@ -7,6 +7,7 @@
 #   ./install.sh --no-default-terminal   do not make Lestrix the default terminal (the default is to do it)
 #   ./install.sh --uninstall       remove it (same as ./uninstall.sh)
 set -euo pipefail
+umask 022   # files installed with sudo must be readable by everyone, whatever root's umask is
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 PREFIX="/usr/local"; DEPS=ask; UNINSTALL=0; DEFAULT_TERM=1
