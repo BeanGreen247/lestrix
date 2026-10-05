@@ -78,7 +78,7 @@ if [ -n "$miss" ]; then
     install_deps || true
   else warn "missing: $miss"; fi
 fi
-python3 -c 'import pyte' 2>/dev/null || warn "pyte is not installed: the differential test against pyte will be skipped (pip install pyte)"
+python3 -c 'import pyte' 2>/dev/null || echo "note: the optional comparison against pyte is skipped (python3-pyte is not installed; ./test.sh --deps adds it)"
 
 declare -a NAMES RESULTS
 record() { NAMES+=("$1"); RESULTS+=("$2"); }

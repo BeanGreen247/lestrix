@@ -39,9 +39,23 @@ say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
 # ---- which interface -------------------------------------------------------------------------------------------------------------------------
+OS=$(uname -s)
+PM=""; for c in apt-get dnf yum pacman zypper brew; do have "$c" && { PM="$c"; break; }; done
 TUI=""
+pick_tui() { TUI=""; if have dialog; then TUI=dialog; elif have whiptail; then TUI=whiptail; fi; }
 if [ "$PLAIN" = 0 ] && [ "$YES" = 0 ] && [ -t 0 ] && [ -t 1 ]; then
-  if have dialog; then TUI=dialog; elif have whiptail; then TUI=whiptail; fi
+  pick_tui
+  if [ -z "$TUI" ] && [ -n "$PM" ]; then   # the installer is a dialog program: offer to fetch dialog (the only question asked in plain text)
+    printf 'The full-screen installer needs the "dialog" program, which is not installed.\nInstall it now with %s? [Y/n] ' "$PM"
+    read -r ans
+    case "${ans:-y}" in
+      [Yy]*) case "$PM" in
+               apt-get) sudo apt-get install -y dialog ;; dnf|yum) sudo "$PM" install -y dialog ;;
+               pacman) sudo pacman -S --needed --noconfirm dialog ;; zypper) sudo zypper --non-interactive install dialog ;;
+               brew) brew install dialog ;;
+             esac; pick_tui ;;
+    esac
+  fi
 fi
 INTERACTIVE=0; [ "$YES" = 0 ] && [ -t 0 ] && INTERACTIVE=1
 BACKTITLE="Lestrix installer"
@@ -107,18 +121,63 @@ ui_input() {   # title text default -> prints the text typed
 }
 chosen() { printf '%s\n' "$1" | grep -qx "$2"; }   # chosen "$list" tag
 
-# run a command in a folder, or only show it with --dry-run
-runin() {   # folder command args...
-  local d=$1; shift
+# run a command in a folder: in the dialog interface its output scrolls inside a dialog box (programbox), otherwise it goes to the terminal;
+# with --dry-run only the command is shown
+step() {   # title folder command args...
+  local title=$1 d=$2; shift 2
   if [ "$DRY" = 1 ]; then echo "[dry run] (cd $d && $*)"; return 0; fi
-  ( cd "$d" && "$@" )
+  if [ -z "$TUI" ]; then ( cd "$d" && "$@" ); return; fi
+  local rcf; rcf=$(mktemp)
+  case "$TUI" in
+    dialog)
+      ( cd "$d" && "$@" < /dev/null 2>&1; echo $? > "$rcf" ) | sed -u 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
+        | dialog --backtitle "$BACKTITLE" --title "$title" --programbox "$H" "$W" ;;
+    whiptail)   # whiptail has no live output box: work behind a notice, then show what was printed
+      local log; log=$(mktemp)
+      whiptail --backtitle "$BACKTITLE" --title "$title" --infobox "Working, please wait...\n\nThis can take a minute or two." 9 "$W"
+      ( cd "$d" && "$@" < /dev/null > "$log" 2>&1; echo $? > "$rcf" )
+      sed -i 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$log"
+      whiptail --backtitle "$BACKTITLE" --title "$title - output" --scrolltext --textbox "$log" "$H" "$W"
+      rm -f "$log" ;;
+  esac
+  local rc; rc=$(cat "$rcf" 2>/dev/null); rm -f "$rcf"; return "${rc:-1}"
 }
+
+# sudo asks for its password on the terminal, which would tear the dialog screen: ask for it in a dialog box once and keep it warm
+SUDO_KEEPALIVE=""
+ensure_sudo() {
+  [ "$DRY" = 1 ] && return 0
+  [ "$(id -u)" = 0 ] && return 0
+  have sudo || return 0
+  sudo -n true 2>/dev/null && return 0
+  if [ -z "$TUI" ]; then sudo -v; return; fi
+  local pw tries=0
+  while [ $tries -lt 3 ]; do
+    pw=$($TUI --backtitle "$BACKTITLE" --title "Administrator password" --insecure --passwordbox "Lestrix needs your password for sudo to install packages or system files.\n\nPassword for $(id -un):" 10 "$W" 3>&1 1>&2 2>&3) || return 1
+    if printf '%s\n' "$pw" | sudo -S -v 2>/dev/null; then
+      ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null; sleep 45; done ) &
+      SUDO_KEEPALIVE=$!
+      return 0
+    fi
+    tries=$((tries + 1))
+    ui_msg "Wrong password" "That password did not work ($tries of 3)."
+  done
+  return 1
+}
+trap '[ -n "$SUDO_KEEPALIVE" ] && kill "$SUDO_KEEPALIVE" 2>/dev/null' EXIT
 
 # ---- what is installed now --------------------------------------------------------------------------------------------------------------------
 BINPATH="$(command -v lestrix 2>/dev/null || true)"
 [ -z "$BINPATH" ] && [ -e "$HOME/.local/bin/lestrix" ] && BINPATH="$HOME/.local/bin/lestrix"
 CURRENT_TEXT="Lestrix is not installed yet."
 [ -n "$BINPATH" ] && CURRENT_TEXT="Lestrix is installed ($BINPATH); installing again updates it."
+
+# ---- platform -----------------------------------------------------------------------------------------------------------------------------------
+if [ "$OS" != Linux ]; then
+  MSG="Lestrix has no build for $OS yet: the program uses Linux system calls (pty handling, /proc, epoll-style readers). Only Linux (X11 or Wayland) is supported for now, so nothing was changed."
+  if [ -n "$TUI" ]; then ui_msg "Not supported on $OS yet" "$MSG"; else echo "$MSG" >&2; fi
+  exit 1
+fi
 
 # ---- choose what to do ------------------------------------------------------------------------------------------------------------------------
 if [ -z "$ACTION" ]; then
@@ -142,17 +201,17 @@ if [ "$ACTION" = uninstall ]; then
   if [ "$INTERACTIVE" = 1 ]; then
     ui_yesno "Confirm" "Remove Lestrix now?$([ "$PURGE" = 1 ] && printf '\n\nYour saved connections and settings will be deleted too.')" yes || { echo "Nothing changed."; exit 0; }
   fi
-  clear 2>/dev/null || true
   a=(); [ "$PURGE" = 1 ] && a=(--purge --yes)
   [ -n "$PREFIX" ] && a+=(--prefix "$PREFIX")
   rc=0
-  runin native ./uninstall.sh "${a[@]}" || rc=1
+  ensure_sudo || warn "no sudo: system-wide parts may stay"
+  step "Removing Lestrix" native ./uninstall.sh "${a[@]}" || rc=1
   [ -n "$TUI" ] && ui_msg "Lestrix removed" "Lestrix was removed.\n\nYour default-terminal settings were given back where they pointed at Lestrix."
   exit $rc
 fi
 
 # ---- install: options -------------------------------------------------------------------------------------------------------------------------
-RUN_TESTS=0
+RUN_TESTS=0; TEST_FAILED=0
 if [ "$INTERACTIVE" = 1 ]; then
   DEPS_ON=on; have gcc && have make && pkg-config --exists sdl2 freetype2 fontconfig glib-2.0 libcurl 2>/dev/null && DEPS_ON=off
   OPTS=$(ui_check "Install options" "Space marks or unmarks an option, Enter continues." \
@@ -180,7 +239,6 @@ if [ "$INTERACTIVE" = 1 ]; then
 else
   say "Installing Lestrix"
 fi
-clear 2>/dev/null || true
 
 # ---- run ------------------------------------------------------------------------------------------------------------------------------------
 rc=0
@@ -188,14 +246,16 @@ a=()
 case "$DEPS" in yes) a+=(--deps) ;; no) a+=(--no-deps) ;; esac
 [ "$DEFTERM" = no ] && a+=(--no-default-terminal)
 [ -n "$PREFIX" ] && a+=(--prefix "$PREFIX")
-runin native ./install.sh "${a[@]}" || rc=$?
+NEED_SUDO=0
+{ [ "$DEPS" = yes ] || [ "$PREFIX" = /usr/local ] || { [ "$DEFTERM" = yes ] && have update-alternatives; }; } && NEED_SUDO=1
+if [ "$NEED_SUDO" = 1 ]; then ensure_sudo || { warn "no sudo access: continuing without it (system packages and the x-terminal-emulator setting may be skipped)"; }; fi
+step "Installing Lestrix (building takes a minute)" native ./install.sh "${a[@]}" || rc=$?
 if [ $rc = 0 ] && [ "$RUN_TESTS" = 1 ]; then
-  say "Running the test suite"
-  runin native ./test.sh $([ "$DEPS" = yes ] && echo --deps || echo --no-deps) || warn "some tests failed (the install itself is done)"
+  step "Running the test suite" native ./test.sh $([ "$DEPS" = yes ] && echo --deps || echo --no-deps) || { TEST_FAILED=1; warn "some tests failed (the install itself is done)"; }
 fi
 
 if [ $rc = 0 ]; then
-  MSG="Lestrix is installed.\n\nStart it from your application menu (System) or run:  lestrix\n\nRemove it any time with:  ./install.sh --uninstall\n\nExtras: 'lxcat' prints big files at memory speed in a Lestrix tab; 'cat' uses it automatically (View > Fast cat)."
+  MSG="Lestrix is installed.\n\n$([ "$TEST_FAILED" = 1 ] && printf 'Some tests failed; the output was shown in the test step.\\n\\n')Start it from your application menu (System) or run:  lestrix\n\nRemove it any time with:  ./install.sh --uninstall\n\nExtras: 'lxcat' prints big files at memory speed in a Lestrix tab; 'cat' uses it automatically (View > Fast cat)."
   case ":$PATH:" in *":${PREFIX:-$HOME/.local}/bin:"*) ;; *) MSG="$MSG\n\nNote: add ${PREFIX:-$HOME/.local}/bin to your PATH to run 'lestrix' from a shell." ;; esac
   if [ "$INTERACTIVE" = 1 ]; then ui_msg "Done" "$MSG"; else printf '%b\n' "$MSG"; fi
 else

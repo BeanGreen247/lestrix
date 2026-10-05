@@ -35,7 +35,7 @@ cd lestrix
 ./install.sh             # a full-screen installer (dialog or whiptail): pick the options, then confirm
 ```
 
-The installer asks what you want (install, update or remove) and a few options: install the missing system packages, make Lestrix the default terminal, install system-wide instead of into your home folder, and run the test suite. Nothing changes until you confirm on the last screen. Without `dialog` or `whiptail`, or with `--plain`, it asks plain questions in the terminal. To skip the questions:
+The installer is a `dialog` program from start to finish (if `dialog` is missing it offers to install it; `whiptail` and plain questions are fallbacks): the choices, the sudo password, and the build and test output all appear inside dialog boxes. It asks what you want (install, update or remove) and a few options: install the missing system packages, make Lestrix the default terminal, install system-wide instead of into your home folder, and run the test suite. Nothing changes until you confirm on the last screen. Without `dialog` or `whiptail`, or with `--plain`, it asks plain questions in the terminal. To skip the questions:
 
 ```bash
 ./install.sh --yes --deps                # install the build packages, build, install with the default settings
@@ -44,7 +44,7 @@ The installer asks what you want (install, update or remove) and a few options: 
 ./install.sh --dry-run                   # show what would be run, change nothing
 ```
 
-Lestrix runs on Linux (X11 or Wayland, through SDL2); there is no Windows or macOS build yet. The installer calls `native/install.sh`, which does the build and the install and can be used directly. It is safe to re-run: it rebuilds and replaces the installed copy. `--no-deps` never touches system packages.
+Lestrix runs on Linux (X11 or Wayland, through SDL2); there is no Windows or macOS build yet, and on macOS the installer says so in a dialog and changes nothing. The installer calls `native/install.sh`, which does the build and the install and can be used directly. It is safe to re-run: it rebuilds and replaces the installed copy. `--no-deps` never touches system packages.
 
 By default it also sets Lestrix as the default terminal, with settings that need no privileges where possible: the first entry in `~/.config/xdg-terminals.list` (the xdg-terminal-exec convention), GNOME's default-terminal setting, Xfce's preferred terminal, and KDE's `TerminalApplication`; on Debian and Ubuntu it also registers the `x-terminal-emulator` alternative, which needs `sudo`. It prints each thing it changed, and uninstalling gives them back (only entries that point at Lestrix are touched). It also installs `lxcat`, the fast `cat` described below.
 
