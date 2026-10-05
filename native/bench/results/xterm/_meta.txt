@@ -1,0 +1,6 @@
+terminal=xterm
+startup_s=0.10
+rss_rest_mb=11
+rss_peak_mb=16
+idle_cpu_s=0.00
+done=1

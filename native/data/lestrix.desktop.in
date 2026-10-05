@@ -10,6 +10,8 @@ StartupNotify=true
 Categories=System;TerminalEmulator;
 Keywords=ssh;sftp;ftp;terminal;shell;console;remote;ansible;
 StartupWMClass=lestrix
+X-TerminalArgExec=-e
+X-TerminalArgDir=--working-directory=
 Actions=local;
 
 [Desktop Action local]

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <stdbool.h>
 #include "pty.h"
 
 #include <errno.h>
@@ -24,6 +25,12 @@ static char **build_env(char *const extra[]) {
     for (size_t i = 0; i < n; i++) {
         const char *e = environ[i];
         if (!strncmp(e, "TERM=", 5) || !strncmp(e, "COLORTERM=", 10)) continue;
+        bool shadowed = false;   /* an extra variable with the same name replaces the inherited one (getenv would find the first) */
+        for (size_t x = 0; extra && extra[x] && !shadowed; x++) {
+            const char *eq = strchr(extra[x], '=');
+            if (eq && !strncmp(e, extra[x], (size_t)(eq - extra[x] + 1))) shadowed = true;
+        }
+        if (shadowed) continue;
         env[k++] = strdup(e);
     }
     env[k++] = strdup("TERM=xterm-256color");

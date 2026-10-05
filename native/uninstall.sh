@@ -32,9 +32,28 @@ rm_path() {
   echo "  removed $1"; removed=$((removed + 1))
 }
 
+# Give the default-terminal settings back (only entries that point at Lestrix are touched)
+say "Releasing the default-terminal settings"
+cfgd="${XDG_CONFIG_HOME:-$HOME/.config}"
+if [ -f "$cfgd/xdg-terminals.list" ] && grep -qx 'lestrix.desktop' "$cfgd/xdg-terminals.list"; then
+  grep -vx 'lestrix.desktop' "$cfgd/xdg-terminals.list" > "$cfgd/xdg-terminals.list.new"; mv "$cfgd/xdg-terminals.list.new" "$cfgd/xdg-terminals.list"
+  [ -s "$cfgd/xdg-terminals.list" ] || rm -f "$cfgd/xdg-terminals.list"; echo "  removed lestrix from xdg-terminals.list"
+fi
+if have gsettings && [ "$(gsettings get org.gnome.desktop.default-applications.terminal exec 2>/dev/null)" ]; then
+  case "$(gsettings get org.gnome.desktop.default-applications.terminal exec 2>/dev/null)" in *lestrix*) gsettings reset org.gnome.desktop.default-applications.terminal exec; gsettings reset org.gnome.desktop.default-applications.terminal exec-arg; echo "  GNOME default terminal reset" ;; esac
+fi
+if grep -qs '^TerminalEmulator=lestrix' "$cfgd/xfce4/helpers.rc"; then sed -i 's/^TerminalEmulator=lestrix/TerminalEmulator=xfce4-terminal/' "$cfgd/xfce4/helpers.rc"; echo "  Xfce preferred terminal set back to xfce4-terminal"; fi
+rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/xfce4/helpers/lestrix.desktop"
+if grep -qs 'TerminalApplication=.*lestrix' "$cfgd/kdeglobals"; then for kw in kwriteconfig6 kwriteconfig5; do have "$kw" && { "$kw" --file kdeglobals --group General --key TerminalApplication konsole; "$kw" --file kdeglobals --group General --key TerminalService org.kde.konsole.desktop; echo "  KDE default terminal set back to konsole"; break; }; done; fi
+if have update-alternatives && update-alternatives --query x-terminal-emulator 2>/dev/null | grep -q 'lestrix'; then
+  for p in "${PREFIXES[@]}"; do if [ "$(id -u)" = 0 ]; then update-alternatives --remove x-terminal-emulator "$p/bin/lestrix" >/dev/null 2>&1; elif have sudo; then sudo update-alternatives --remove x-terminal-emulator "$p/bin/lestrix" >/dev/null 2>&1; fi; done
+  echo "  x-terminal-emulator alternative removed"
+fi
+
 say "Removing Lestrix"
 for p in "${PREFIXES[@]}"; do
   rm_path "$p/bin/lestrix"
+  rm_path "$p/bin/lxcat"
   rm_path "$p/share/applications/lestrix.desktop"
   for sz in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do rm_path "$p/share/icons/hicolor/$sz/apps/lestrix.png"; done
   rm_path "$p/share/icons/hicolor/scalable/apps/lestrix.svg"

@@ -67,6 +67,16 @@ void vt_free(Vt *t);
 void vt_set_callbacks(Vt *t, VtWriteFn write, VtEventFn event, VtCacheFree cache_free, void *user);
 void vt_resize(Vt *t, int cols, int rows);
 void vt_feed(Vt *t, const uint8_t *data, size_t len);
+/* File streaming, for the fast `lxcat`: a program in the tab sends OSC 7777;cat;TOKEN;PATH;OFFSET;LENGTH;FLAGS and the terminal prints
+ * the file itself, bypassing the kernel's tty layer, which is the bottleneck for big output. Off until vt_set_stream_token() gives
+ * the tab a secret; requests without it are ignored. vt_feed_stream stops right after a valid request and returns the bytes used,
+ * so the caller can splice the file in at exactly that point (vt_take_stream returns the request). */
+size_t vt_feed_stream(Vt *t, const uint8_t *data, size_t len);
+void vt_set_stream_token(Vt *t, const char *token);
+/* Threads: parse_workers help build big batches of plain text (see vt.c), compress_workers pack the scrollback. -1 = decide from the
+ * number of cores (half of them for parsing, up to eight; compressing gets a quarter, at least two); 0 parse workers turns bulk parsing off. */
+void vt_set_threads(int parse_workers, int compress_workers);
+bool vt_take_stream(Vt *t, char *path, size_t cap, uint64_t *off, uint64_t *len, unsigned *flags);
 void vt_reset(Vt *t);
 
 int vt_cols(const Vt *t);
@@ -106,6 +116,9 @@ typedef struct {
 void vt_history_stats(const Vt *t, VtHistoryStats *out);
 /* Give memory back: pack all but the newest lines, drop decoded blocks, shrink tables. Returns bytes freed (approx). */
 size_t vt_compact(Vt *t);
+
+/* Turn the bulk fast paths (UTF-8 runs) off or on; only the differential tests need to. */
+void vt_set_fast_paths(bool on);
 
 /* Width of a code point in cells: 0 (combining), 1 or 2; -1 for non-printing */
 int vt_wcwidth(uint32_t cp);

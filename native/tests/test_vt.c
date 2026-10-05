@@ -396,7 +396,63 @@ static void test_history_styles_survive_packing(void) {
     vt_free(t);
 }
 
+static void test_stream_requests(void) {
+    char path[4200]; uint64_t off, len; unsigned flags;
+    const char *good = "ab\x1b]7777;cat;s3cret;/tmp/a%3Bb%25c;5;9;3\acd";
+    Vt *t = vt_new(40, 5, 100);
+    vt_feed(t, (const uint8_t *)good, strlen(good));   /* no token set: refused, parsing carries on */
+    CHECK(!vt_take_stream(t, path, sizeof path, &off, &len, &flags));
+    vt_set_stream_token(t, "s3cret");
+    size_t used = vt_feed_stream(t, (const uint8_t *)good, strlen(good));
+    CHECK(used < strlen(good));   /* stopped right after the request */
+    CHECK(vt_take_stream(t, path, sizeof path, &off, &len, &flags));
+    CHECK(strcmp(path, "/tmp/a;b%c") == 0 && off == 5 && len == 9 && flags == 3);
+    CHECK(!vt_take_stream(t, path, sizeof path, &off, &len, &flags));
+    vt_feed(t, (const uint8_t *)good + used, strlen(good) - used);   /* the rest still parses: "cd" */
+    const char *bad_token = "\x1b]7777;cat;wrong;/tmp/x;0;0;0\a", *relative = "\x1b]7777;cat;s3cret;rel/x;0;0;0\a";
+    vt_feed_stream(t, (const uint8_t *)bad_token, strlen(bad_token));
+    CHECK(!vt_take_stream(t, path, sizeof path, &off, &len, &flags));
+    vt_feed_stream(t, (const uint8_t *)relative, strlen(relative));   /* only absolute paths */
+    CHECK(!vt_take_stream(t, path, sizeof path, &off, &len, &flags));
+    vt_free(t);
+}
+
+/* history segments: lines survive being packed whole (zero-copy), packed from a partly released segment, and a width change in between */
+static void test_history_segments(void) {
+    Vt *t = vt_new(40, 5, 1400);
+    char line[64];
+    for (int i = 0; i < 6000; i++) {
+        if (i == 2500) vt_resize(t, 90, 7);
+        if (i == 4200) vt_set_history(t, 1300, 0, 0, true);
+        int n = snprintf(line, sizeof line, "line %d\r\n", i);
+        vt_feed(t, (const uint8_t *)line, (size_t)n);
+    }
+    int hc = vt_history_count(t);
+    CHECK(hc <= 1300 && hc > 1300 - 129);   // whole blocks are dropped when the limit is crossed
+    int bad = 0;
+    for (int k = 1; k <= hc; k++) {
+        int len = 0;
+        VtCell *c = vt_line(t, -k, &len);
+        char want[64];
+        int wl = snprintf(want, sizeof want, "line %d", 6000 - (vt_rows(t) - 1) - k);
+        if (!c || len != wl) { bad++; continue; }
+        for (int x = 0; x < len; x++) if (VT_CELL_CH(c[x]) != (uint32_t)(unsigned char)want[x]) { bad++; break; }
+    }
+    CHECK(bad == 0);
+    vt_compact(t);
+    int bad2 = 0;
+    for (int k = 1; k <= hc; k += 37) { int len = 0; VtCell *c = vt_line(t, -k, &len); char want[64]; int wl = snprintf(want, sizeof want, "line %d", 6000 - (vt_rows(t) - 1) - k); if (!c || len != wl || VT_CELL_CH(c[0]) != 'l') bad2++; }
+    CHECK(bad2 == 0);
+    vt_clear_history(t);
+    CHECK(vt_history_count(t) == 0);
+    vt_feed(t, (const uint8_t *)"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\n", 16);
+    CHECK(vt_history_count(t) > 0);
+    vt_free(t);
+}
+
 int main(void) {
+    test_history_segments();
+    test_stream_requests();
     test_basic_and_wrap(); test_scrollback_ring(); test_insert_delete_lines(); test_edit_chars_at_pending_wrap();
     test_scroll_region(); test_save_restore(); test_alt_screen(); test_colours(); test_wide_and_combining();
     test_graphics_charset(); test_replies_and_events(); test_modes(); test_resize(); test_utf8_split_and_invalid();

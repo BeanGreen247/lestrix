@@ -1,11 +1,25 @@
 /* vt.c - terminal emulation core. See vt.h. */
 #define _GNU_SOURCE
 #include "vt.h"
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#define VT_NEON 1   /* Raspberry Pi and other ARM boards: the same three loops as the SSE2 code */
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <time.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,12 +44,16 @@ typedef struct {
     int *order;
 } Scr;
 
-/* A line in the scrollback: trailing blanks are not stored. */
-typedef struct {
-    VtLineMeta meta;
-    int len;
-    VtCell cells[];
-} HLine;
+/* Recent scrollback lines (trailing blanks are not stored) live in segments: one buffer per BLOCK_LINES lines, 2 bytes per line of
+ * length followed by the cells of all its lines, back to back. That is exactly the layout a block is packed from, so a complete
+ * segment is handed to the compressor as it is: no per-line allocation, no gathering copy. */
+typedef struct HSeg {
+    uint8_t *buf;            /* 2*BLOCK_LINES bytes reserved for the lengths, then the cells */
+    VtCell *cells;           /* buf + 2*BLOCK_LINES */
+    size_t used, cap;        /* cells */
+    int lines, live;         /* lines stored so far / of them still in the hot ring */
+} HSeg;
+typedef struct { VtLineMeta meta; VtCell *cells; HSeg *seg; int len; } HEnt;   /* one hot line */
 
 typedef struct {
     int x, y;
@@ -57,6 +75,7 @@ typedef struct Job {
     uint8_t *out; size_t out_size;
     int stored;                    /* incompressible: the raw bytes are kept as they are */
     int nlines;
+    struct Job *qnext;             /* the worker queue links jobs directly: no allocation per submit */
 } Job;
 
 typedef struct {
@@ -79,13 +98,16 @@ typedef struct {                   /* a decoded block, kept so a scrolled-back v
     uint64_t stamp;
 } CacheEntry;
 
+
 struct Vt {
+    HSeg *hseg;                    /* the segment new history lines are appended to */
     int cols, rows;
     Scr main, alt, *cur;
     /* history: a ring of recent lines kept as they are, then compressed blocks of older lines */
     int max_lines;                 /* -1 = unlimited */
-    HLine **hist;
+    HEnt *hist;
     int hcap, hhead, hcount;
+    int hmask;   /* physical ring size - 1: a power of two, so index arithmetic is a mask, not a divide (hcap stays the logical limit) */
     size_t hot_bytes;
     Block *blocks;
     int bcap, bhead, bcount;
@@ -104,6 +126,7 @@ struct Vt {
     uint32_t pen_fg, pen_bg;
     uint16_t pen_attrs;
     uint32_t pen_style, erase_style;
+    uint32_t sc_fg[64], sc_bg[64], sc_id[64]; uint16_t sc_attr[64];   /* the last styles seen, direct-mapped, in front of the hash table (id 0 = empty) */
     bool erase_valid;
     int top, bottom;
     uint32_t modes;
@@ -134,6 +157,14 @@ struct Vt {
 
     VtWriteFn write_fn;
     VtEventFn event_fn;
+    char stream_token[40];                       /* OSC 7777 file streaming: empty = refused; otherwise the secret a request must carry */
+    bool stream_pending;
+    char stream_path[OSC_MAX + 1];
+    uint64_t stream_off, stream_len;
+    double rate_bulk, rate_serial;   /* bytes per ns the two ways of taking a big batch have reached (0 = not measured yet) */
+    unsigned batch_no;
+    bool bulk_warm;
+    unsigned stream_flags;
     VtCacheFree cache_free;
     void *user;
 };
@@ -242,8 +273,16 @@ static uint32_t intern_style(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
     return id;
 }
 
+static inline uint32_t intern_cached(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
+    uint32_t k = ((fg * 0x9e3779b1u) ^ (bg * 0x85ebca6bu) ^ ((uint32_t)attrs * 0xc2b2ae35u)) >> 26;
+    if (t->sc_id[k] && t->sc_fg[k] == fg && t->sc_bg[k] == bg && t->sc_attr[k] == attrs) return t->sc_id[k];
+    uint32_t id = intern_style(t, fg, bg, attrs);
+    if (id) { t->sc_fg[k] = fg; t->sc_bg[k] = bg; t->sc_attr[k] = attrs; t->sc_id[k] = id; }
+    return id;
+}
+
 static inline void pen_commit(Vt *t) {
-    t->pen_style = intern_style(t, t->pen_fg, t->pen_bg, t->pen_attrs);
+    t->pen_style = intern_cached(t, t->pen_fg, t->pen_bg, t->pen_attrs);
     t->erase_valid = false;   /* erased cells take only the background; computed on first use */
 }
 
@@ -307,7 +346,14 @@ static void clear_row(Vt *t, int y) {
     VtLineMeta *m = rowm(t, y);
     VtCell *r = rowp(t, y);
     if (erase_style(t) == 0) {   /* default blanks: only the cells that were written need clearing */
-        memset(r, 0, (size_t)m->hw * sizeof(VtCell));
+        size_t hw = m->hw;
+        if (hw <= 32) {   /* short lines: a few stores beat a call to memset */
+            size_t i = 0;
+#ifdef __SSE2__
+            for (; i + 2 <= hw; i += 2) { _mm_storeu_si128((__m128i *)(r + i), _mm_setzero_si128()); __asm__ volatile("" ::: "memory"); }
+#endif
+            for (; i < hw; i++) { r[i].cp = 0; r[i].sf = 0; __asm__ volatile("" ::: "memory"); }
+        } else memset(r, 0, hw * sizeof(VtCell));
         m->hw = 0;
     } else {
         clear_cells(t, r, t->cols);
@@ -324,17 +370,34 @@ static void clear_row(Vt *t, int y) {
 
 static long total_lines(const Vt *t) { return (long)t->hcount + t->block_lines; }
 
-static void hist_release(Vt *t, HLine *h) {
-    if (h->meta.cache && t->cache_free) t->cache_free(h->meta.cache, t->user);
-    t->hot_bytes -= sizeof(HLine) + (size_t)h->len * sizeof(VtCell);
-    free(h);
+static HSeg *seg_new(Vt *t) {
+    size_t cap = (size_t)BLOCK_LINES * (size_t)t->cols;
+    HSeg *g = malloc(sizeof *g);
+    uint8_t *buf = g ? malloc(2 * (size_t)BLOCK_LINES + cap * sizeof(VtCell)) : NULL;
+    if (!buf) { free(g); return NULL; }
+    g->buf = buf; g->cells = (VtCell *)(buf + 2 * (size_t)BLOCK_LINES); g->used = 0; g->cap = cap; g->lines = g->live = 0;
+    return g;
+}
+
+/* a line left the hot ring: when its segment has no more lines in it, give the memory back (the open one is simply reused) */
+static void seg_line_gone(Vt *t, HSeg *g) {
+    if (--g->live > 0) return;
+    if (g == t->hseg) { g->used = 0; g->lines = 0; return; }
+    free(g->buf); free(g);
+}
+
+static void hist_release(Vt *t, HEnt *e) {
+    if (e->meta.cache && t->cache_free) t->cache_free(e->meta.cache, t->user);
+    t->hot_bytes -= sizeof(HEnt) + (size_t)e->len * sizeof(VtCell);
+    seg_line_gone(t, e->seg);
 }
 
 /* ---- compression workers: all cores, started on first use ---------------------------------------- */
 
-typedef struct Task { Job *job; struct Task *next; } Task;
-static struct { pthread_mutex_t m; pthread_cond_t c; Task *head, *tail; int started; } pool = {
-    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0};
+static int cfg_parse_workers = -1, cfg_compress_workers = -1;   /* -1: decide from the number of cores */
+
+static struct { pthread_mutex_t m; pthread_cond_t c; Job *head, *tail; int started, idle, qlen; } pool = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0};
 
 static void job_unref(Job *j) {
     if (atomic_fetch_sub(&j->refs, 1) == 1) { free(j->raw); free(j->out); free(j); }
@@ -350,7 +413,50 @@ static uint8_t *shuffle_block(const uint8_t *raw, size_t raw_size, int nlines) {
     memcpy(sh, raw, head);
     const uint8_t *cells = raw + head;
     uint8_t *planes = sh + head;
-    for (size_t c = 0; c < ncells; c++) {
+    size_t c = 0;
+#ifdef __SSE2__
+    /* 8x8 byte transpose per step: eight cells in, eight bytes out to each of the eight planes */
+    for (; c + 8 <= ncells; c += 8) {
+        const uint8_t *src = cells + 8 * c;
+        __m128i r0 = _mm_loadl_epi64((const __m128i *)(src)), r1 = _mm_loadl_epi64((const __m128i *)(src + 8)),
+                r2 = _mm_loadl_epi64((const __m128i *)(src + 16)), r3 = _mm_loadl_epi64((const __m128i *)(src + 24)),
+                r4 = _mm_loadl_epi64((const __m128i *)(src + 32)), r5 = _mm_loadl_epi64((const __m128i *)(src + 40)),
+                r6 = _mm_loadl_epi64((const __m128i *)(src + 48)), r7 = _mm_loadl_epi64((const __m128i *)(src + 56));
+        __m128i a0 = _mm_unpacklo_epi8(r0, r1), a1 = _mm_unpacklo_epi8(r2, r3), a2 = _mm_unpacklo_epi8(r4, r5), a3 = _mm_unpacklo_epi8(r6, r7);
+        __m128i b0 = _mm_unpacklo_epi16(a0, a1), b1 = _mm_unpackhi_epi16(a0, a1), c0 = _mm_unpacklo_epi16(a2, a3), c1 = _mm_unpackhi_epi16(a2, a3);
+        __m128i p01 = _mm_unpacklo_epi32(b0, c0), p23 = _mm_unpackhi_epi32(b0, c0), p45 = _mm_unpacklo_epi32(b1, c1), p67 = _mm_unpackhi_epi32(b1, c1);
+        _mm_storel_epi64((__m128i *)(planes + 0 * ncells + c), p01); _mm_storel_epi64((__m128i *)(planes + 1 * ncells + c), _mm_srli_si128(p01, 8));
+        _mm_storel_epi64((__m128i *)(planes + 2 * ncells + c), p23); _mm_storel_epi64((__m128i *)(planes + 3 * ncells + c), _mm_srli_si128(p23, 8));
+        _mm_storel_epi64((__m128i *)(planes + 4 * ncells + c), p45); _mm_storel_epi64((__m128i *)(planes + 5 * ncells + c), _mm_srli_si128(p45, 8));
+        _mm_storel_epi64((__m128i *)(planes + 6 * ncells + c), p67); _mm_storel_epi64((__m128i *)(planes + 7 * ncells + c), _mm_srli_si128(p67, 8));
+    }
+#endif
+#ifdef VT_NEON
+    /* the same 8x8 byte transpose as the SSE2 code, with vtrn: bytes, then 16-bit pairs, then 32-bit halves */
+    for (; c + 8 <= ncells; c += 8) {
+        const uint8_t *src = cells + 8 * c;
+        uint8x8_t r0 = vld1_u8(src), r1 = vld1_u8(src + 8), r2 = vld1_u8(src + 16), r3 = vld1_u8(src + 24),
+                  r4 = vld1_u8(src + 32), r5 = vld1_u8(src + 40), r6 = vld1_u8(src + 48), r7 = vld1_u8(src + 56);
+        uint8x8x2_t t01 = vtrn_u8(r0, r1), t23 = vtrn_u8(r2, r3), t45 = vtrn_u8(r4, r5), t67 = vtrn_u8(r6, r7);
+        uint16x4x2_t u02 = vtrn_u16(vreinterpret_u16_u8(t01.val[0]), vreinterpret_u16_u8(t23.val[0]));
+        uint16x4x2_t u13 = vtrn_u16(vreinterpret_u16_u8(t01.val[1]), vreinterpret_u16_u8(t23.val[1]));
+        uint16x4x2_t u46 = vtrn_u16(vreinterpret_u16_u8(t45.val[0]), vreinterpret_u16_u8(t67.val[0]));
+        uint16x4x2_t u57 = vtrn_u16(vreinterpret_u16_u8(t45.val[1]), vreinterpret_u16_u8(t67.val[1]));
+        uint32x2x2_t v04 = vtrn_u32(vreinterpret_u32_u16(u02.val[0]), vreinterpret_u32_u16(u46.val[0]));
+        uint32x2x2_t v15 = vtrn_u32(vreinterpret_u32_u16(u13.val[0]), vreinterpret_u32_u16(u57.val[0]));
+        uint32x2x2_t v26 = vtrn_u32(vreinterpret_u32_u16(u02.val[1]), vreinterpret_u32_u16(u46.val[1]));
+        uint32x2x2_t v37 = vtrn_u32(vreinterpret_u32_u16(u13.val[1]), vreinterpret_u32_u16(u57.val[1]));
+        vst1_u8(planes + 0 * ncells + c, vreinterpret_u8_u32(v04.val[0]));
+        vst1_u8(planes + 1 * ncells + c, vreinterpret_u8_u32(v15.val[0]));
+        vst1_u8(planes + 2 * ncells + c, vreinterpret_u8_u32(v26.val[0]));
+        vst1_u8(planes + 3 * ncells + c, vreinterpret_u8_u32(v37.val[0]));
+        vst1_u8(planes + 4 * ncells + c, vreinterpret_u8_u32(v04.val[1]));
+        vst1_u8(planes + 5 * ncells + c, vreinterpret_u8_u32(v15.val[1]));
+        vst1_u8(planes + 6 * ncells + c, vreinterpret_u8_u32(v26.val[1]));
+        vst1_u8(planes + 7 * ncells + c, vreinterpret_u8_u32(v37.val[1]));
+    }
+#endif
+    for (; c < ncells; c++) {
         const uint8_t *src = cells + 8 * c;
         for (int pl = 0; pl < 8; pl++) planes[(size_t)pl * ncells + c] = src[pl];
     }
@@ -376,28 +482,27 @@ static void *pool_worker(void *arg) {
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&pool.m);
-        while (!pool.head) pthread_cond_wait(&pool.c, &pool.m);
-        Task *tk = pool.head;
-        pool.head = tk->next;
+        while (!pool.head) { pool.idle++; pthread_cond_wait(&pool.c, &pool.m); pool.idle--; }
+        Job *j = pool.head;
+        pool.head = j->qnext;
         if (!pool.head) pool.tail = NULL;
+        pool.qlen--;
         pthread_mutex_unlock(&pool.m);
-        Job *j = tk->job;
-        free(tk);
         job_run(j);
     }
     return NULL;
 }
-
 static void pool_submit(Job *j) {
-    if (getenv("SD_NOPOOL")) { job_run(j); return; }
-    Task *tk = malloc(sizeof *tk);
-    if (!tk) { job_run(j); return; }   /* out of memory: compress right here */
-    tk->job = j; tk->next = NULL;
+    static int nopool = -1;
+    if (nopool < 0) nopool = getenv("SD_NOPOOL") != NULL;   /* read once, not per job */
+    if (nopool) { job_run(j); return; }
+    j->qnext = NULL;
     pthread_mutex_lock(&pool.m);
     if (!pool.started) {
-        long n = sysconf(_SC_NPROCESSORS_ONLN);
-        if (n < 1) n = 1;
-        if (n > 16) n = 16;
+        long n = sysconf(_SC_NPROCESSORS_ONLN) / 4;   /* a quarter of the cores, at least two: one cannot keep up, and more only take time from the parser */
+        if (n < 2) n = 2;
+        if (n > 8) n = 8;
+        if (cfg_compress_workers >= 0) n = cfg_compress_workers > 16 ? 16 : cfg_compress_workers;
         for (long i = 0; i < n; i++) {
             pthread_t th;
             pthread_attr_t at;
@@ -411,17 +516,20 @@ static void pool_submit(Job *j) {
     }
     int usable = pool.started > 0;
     if (usable) {
-        if (pool.tail) pool.tail->next = tk; else pool.head = tk;
-        pool.tail = tk;
-        pthread_cond_signal(&pool.c);
+        if (pool.tail) pool.tail->qnext = j; else pool.head = j;
+        pool.tail = j;
+        pool.qlen++;
+        /* Waking a sleeping worker is a system call; do it once for a handful of blocks, and only if someone is asleep. A job that
+         * waits is only a block that stays uncompressed a little longer: readers use the raw copy until it is done. */
+        if (pool.idle > 0 && pool.qlen >= 4) pthread_cond_broadcast(&pool.c);
     }
     pthread_mutex_unlock(&pool.m);
-    if (!usable) { free(tk); job_run(j); }
+    if (!usable) job_run(j);
 }
 
 /* ---- blocks ---------------------------------------------------------------------------------------- */
 
-static inline Block *blk(const Vt *t, int i) { return &t->blocks[(t->bhead + i) % t->bcap]; }
+static inline Block *blk(const Vt *t, int i) { return &t->blocks[(t->bhead + i) & (t->bcap - 1)]; }
 
 /* pick up a finished compression job */
 static void block_apply(Vt *t, Block *b) {
@@ -479,7 +587,7 @@ static void evict_oldest_block(Vt *t) {
     block_free_storage(t, b);
     t->raw_total -= b->raw_size;
     t->block_lines -= b->nlines;
-    t->bhead = (t->bhead + 1) % t->bcap;
+    t->bhead = (t->bhead + 1) & (t->bcap - 1);
     t->bcount--;
     if (t->bcount == 0) { spill_close(t); t->bhead = 0; }
 }
@@ -528,8 +636,8 @@ static void enforce_limits(Vt *t) {
         while (total_lines(t) > t->max_lines) {
             if (t->bcount) evict_oldest_block(t);
             else if (t->hcount) {
-                hist_release(t, t->hist[t->hhead]);
-                t->hhead = (t->hhead + 1) % t->hcap;
+                hist_release(t, &t->hist[t->hhead]);
+                t->hhead = (t->hhead + 1) & t->hmask;
                 t->hcount--;
             } else break;
         }
@@ -550,33 +658,58 @@ static void enforce_limits(Vt *t) {
     while (t->bcount && t->disk_bytes > t->disk_budget) evict_oldest_block(t);
 }
 
+/* Copy `len` cells. Lines are mostly short (a log line is tens of cells), where a call to memcpy costs more than the copy. */
+static inline void copy_cells(VtCell *dst, const VtCell *src, size_t len) {
+    if (len > 48) { memcpy(dst, src, len * sizeof(VtCell)); return; }
+    size_t i = 0;
+#ifdef __SSE2__
+    for (; i + 2 <= len; i += 2) { _mm_storeu_si128((__m128i *)(dst + i), _mm_loadu_si128((const __m128i *)(src + i))); __asm__ volatile("" ::: "memory"); }   /* the barrier keeps GCC from turning this back into a memcpy call */
+#endif
+    for (; i < len; i++) { dst[i] = src[i]; __asm__ volatile("" ::: "memory"); }
+}
+
 /* Pack the oldest BLOCK_LINES hot lines into a block. */
 static void pack_oldest(Vt *t) {
     int n = BLOCK_LINES;
     if (t->hcount < n) return;
     blocks_poll(t);
+    HEnt *first = &t->hist[t->hhead], *last = &t->hist[(t->hhead + n - 1) & t->hmask];
+    HSeg *g = first->seg;
+    /* the common case: the oldest lines are one complete segment, already in the packed layout */
+    bool whole = g->lines == BLOCK_LINES && g->live == BLOCK_LINES && last->seg == g && first->cells == g->cells && g != t->hseg;
     size_t ncells = 0;
-    for (int i = 0; i < n; i++) ncells += (size_t)t->hist[(t->hhead + i) % t->hcap]->len;
+    if (whole) ncells = g->used;
+    else for (int i = 0; i < n; i++) ncells += (size_t)t->hist[(t->hhead + i) & t->hmask].len;
     size_t raw_size = 2 * (size_t)n + 8 * ncells;
-    uint8_t *raw = malloc(raw_size);
+    uint8_t *raw = whole ? g->buf : malloc(raw_size);
     Job *j = malloc(sizeof *j);
     if (!raw || !j || raw_size > UINT32_MAX) {    /* cannot pack: drop the oldest line so memory stays bounded */
-        free(raw); free(j);
-        hist_release(t, t->hist[t->hhead]);
-        t->hhead = (t->hhead + 1) % t->hcap;
+        if (!whole) free(raw);
+        free(j);
+        hist_release(t, &t->hist[t->hhead]);
+        t->hhead = (t->hhead + 1) & t->hmask;
         t->hcount--;
         return;
     }
     uint8_t *lens = raw, *cells = raw + 2 * (size_t)n;
     for (int i = 0; i < n; i++) {
-        HLine *h = t->hist[(t->hhead + i) % t->hcap];
+        HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
         lens[2 * i] = (uint8_t)h->len;
         lens[2 * i + 1] = (uint8_t)((unsigned)h->len >> 8);
-        memcpy(cells, h->cells, (size_t)h->len * sizeof(VtCell));
-        cells += (size_t)h->len * sizeof(VtCell);
+        if (!whole) { copy_cells((VtCell *)cells, h->cells, (size_t)h->len); cells += (size_t)h->len * sizeof(VtCell); }
     }
-    for (int i = 0; i < n; i++) hist_release(t, t->hist[(t->hhead + i) % t->hcap]);
-    t->hhead = (t->hhead + n) % t->hcap;
+    if (whole) {   /* the segment's buffer becomes the job's raw bytes; shrink it to what is used */
+        uint8_t *small = realloc(raw, raw_size);
+        if (small) raw = small;
+        g->buf = NULL;
+        free(g);
+        for (int i = 0; i < n; i++) {
+            HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
+            if (h->meta.cache && t->cache_free) t->cache_free(h->meta.cache, t->user);
+            t->hot_bytes -= sizeof(HEnt) + (size_t)h->len * sizeof(VtCell);
+        }
+    } else for (int i = 0; i < n; i++) hist_release(t, &t->hist[(t->hhead + i) & t->hmask]);
+    t->hhead = (t->hhead + n) & t->hmask;
     t->hcount -= n;
 
     if (t->bcount == t->bcap) {   /* grow the block ring */
@@ -587,7 +720,7 @@ static void pack_oldest(Vt *t) {
         free(t->blocks);
         t->blocks = nb; t->bcap = ncap; t->bhead = 0;
     }
-    Block *b = &t->blocks[(t->bhead + t->bcount) % t->bcap];
+    Block *b = &t->blocks[(t->bhead + t->bcount) & (t->bcap - 1)];
     memset(b, 0, sizeof *b);
     b->id = t->next_block_id++;
     b->nlines = n;
@@ -611,33 +744,49 @@ static void pack_oldest(Vt *t) {
 }
 
 /* move the screen row `y` into the history (compact copy, trailing blanks trimmed) */
-static void hist_push(Vt *t, int y) {
-    if (t->max_lines == 0) return;
-    VtCell *src = rowp(t, y);
-    int len = rowm(t, y)->hw;
+/* append a line (trailing blanks are trimmed) to the scrollback; `meta` travels with it */
+static void hist_add(Vt *t, const VtCell *src, int hw, VtLineMeta meta) {
+    int len = hw;
     if (len > t->cols) len = t->cols;
     while (len > 0 && src[len - 1].cp == 0 && src[len - 1].sf == 0) len--;
-    HLine *h = malloc(sizeof(HLine) + (size_t)len * sizeof(VtCell));
-    if (!h) return;   /* out of memory: skip this line rather than fail */
-    h->len = len;
-    memcpy(h->cells, src, (size_t)len * sizeof(VtCell));
-    VtLineMeta *m = rowm(t, y);
-    h->meta = *m;          /* the renderer's cached node travels with the line */
-    h->meta.dirty = 0;
-    m->cache = NULL;
-    m->dirty = 1;
+    HSeg *g = t->hseg;
+    if (!g || g->lines >= BLOCK_LINES || g->used + (size_t)len > g->cap) {   /* start the next segment (an old one stays until its lines are gone) */
+        if (g && g->live == 0) { free(g->buf); free(g); }
+        g = seg_new(t);
+        if (!g) { if (meta.cache && t->cache_free) t->cache_free(meta.cache, t->user); return; }   /* out of memory: skip this line rather than fail */
+        t->hseg = g;
+    }
     if (t->hcount == t->hcap) {
         if (t->hcap >= HOT_KEEP + BLOCK_LINES) pack_oldest(t);
-        else { hist_release(t, t->hist[t->hhead]); t->hhead = (t->hhead + 1) % t->hcap; t->hcount--; }
+        else { hist_release(t, &t->hist[t->hhead]); t->hhead = (t->hhead + 1) & t->hmask; t->hcount--; }
     }
-    t->hist[(t->hhead + t->hcount) % t->hcap] = h;
+    g = t->hseg;   /* a release above may have reset the open segment: it is the same one, just emptied */
+    HEnt *e = &t->hist[(t->hhead + t->hcount) & t->hmask];
+    e->cells = g->cells + g->used;
+    e->len = len;
+    e->seg = g;
+    copy_cells(e->cells, src, (size_t)len);
+    g->used += (size_t)len; g->lines++; g->live++;
+    e->meta = meta;
     t->hcount++;
-    t->hot_bytes += sizeof(HLine) + (size_t)len * sizeof(VtCell);
-    enforce_limits(t);
+    t->hot_bytes += sizeof(HEnt) + (size_t)len * sizeof(VtCell);
+    /* the limits can only be crossed by a line count or a memory/disk budget: skip the call when none is near */
+    if ((t->max_lines > 0 && total_lines(t) > t->max_lines) || t->packed_bytes + t->pending_bytes > t->ram_budget || t->disk_bytes > t->disk_budget)
+        enforce_limits(t);
+}
+
+/* move the screen row `y` into the history */
+static void hist_push(Vt *t, int y) {
+    if (t->max_lines == 0) return;
+    VtLineMeta *m = rowm(t, y);
+    VtLineMeta meta = *m;   /* the renderer's cache travels with the line, and so does its "changed since drawn" flag */
+    m->cache = NULL;
+    m->dirty = 1;
+    hist_add(t, rowp(t, y), m->hw, meta);
 }
 
 void vt_clear_history(Vt *t) {
-    for (int i = 0; i < t->hcount; i++) hist_release(t, t->hist[(t->hhead + i) % t->hcap]);
+    for (int i = 0; i < t->hcount; i++) hist_release(t, &t->hist[(t->hhead + i) & t->hmask]);
     t->hhead = t->hcount = 0;
     while (t->bcount) evict_oldest_block(t);
     for (int i = 0; i < CACHE_ENTRIES; i++) if (t->cache[i]) cache_drop_id(t, t->cache[i]->id);
@@ -726,7 +875,7 @@ static int hist_lookup(Vt *t, int idx, VtCell **cells, int *len, VtLineMeta **me
     long k = -(long)idx - 1;
     if (k < 0 || k >= total_lines(t)) return 0;
     if (k < t->hcount) {
-        HLine *h = t->hist[(t->hhead + t->hcount - 1 - k) % t->hcap];
+        HEnt *h = &t->hist[(t->hhead + t->hcount - 1 - k) & t->hmask];
         if (cells) *cells = h->cells;
         if (len) *len = h->len < t->cols ? h->len : t->cols;
         if (meta) *meta = &h->meta;
@@ -754,13 +903,15 @@ void vt_set_history(Vt *t, int max_lines, size_t ram_budget, size_t disk_budget,
     if (want != t->hcap) {
         while (t->hcount > want) {   /* shrink: pack what can be packed, drop the rest */
             if (t->hcap >= HOT_KEEP + BLOCK_LINES && t->hcount >= BLOCK_LINES && max_lines != 0 && want >= HOT_KEEP + BLOCK_LINES) pack_oldest(t);
-            else { hist_release(t, t->hist[t->hhead]); t->hhead = (t->hhead + 1) % t->hcap; t->hcount--; }
+            else { hist_release(t, &t->hist[t->hhead]); t->hhead = (t->hhead + 1) & t->hmask; t->hcount--; }
         }
-        HLine **nh = calloc((size_t)want, sizeof(HLine *));
+        int sz = 1;
+        while (sz < want) sz <<= 1;
+        HEnt *nh = calloc((size_t)sz, sizeof(HEnt));
         if (nh) {
-            for (int i = 0; i < t->hcount; i++) nh[i] = t->hist[(t->hhead + i) % t->hcap];
+            for (int i = 0; i < t->hcount; i++) nh[i] = t->hist[(t->hhead + i) & t->hmask];   /* entries move, their cells do not */
             free(t->hist);
-            t->hist = nh; t->hcap = want; t->hhead = 0;
+            t->hist = nh; t->hcap = want; t->hhead = 0; t->hmask = sz - 1;
         }
     }
     enforce_limits(t);
@@ -801,6 +952,13 @@ static void region_up(Vt *t, int top, int bottom, int n) {
     if (n > span) n = span;
     if (n <= 0) return;
     int *ord = t->cur->order;
+    if (n == 1) {   /* the common case, one line feed: rotate the row order by one and blank the freed row */
+        int first = ord[top];
+        for (int i = top; i < bottom; i++) ord[i] = ord[i + 1];
+        ord[bottom] = first;
+        clear_row(t, bottom);
+        return;
+    }
     int tmp[n];
     memcpy(tmp, ord + top, (size_t)n * sizeof(int));
     memmove(ord + top, ord + top + n, (size_t)(span - n) * sizeof(int));
@@ -916,6 +1074,13 @@ static void put_cp(Vt *t, uint32_t cp) {
         }
         return;
     }
+    if (w == 2 && t->cx == t->cols - 1) {   /* a wide character does not fit in the last column */
+        if (!(t->modes & VT_M_AUTOWRAP)) return;
+        VtCell *last = rowp(t, t->cy);
+        last[t->cx].cp = 0; last[t->cx].sf = 0;   /* leave that cell blank and wrap, as xterm does */
+        dirty(t, t->cy);
+        t->cx = t->cols;
+    }
     wrap_if_needed(t, w);
     if ((t->modes & VT_M_INSERT)) insert_cells(t, w);
     VtCell *r = rowp(t, t->cy);
@@ -938,6 +1103,27 @@ static void put_cp(Vt *t, uint32_t cp) {
 /* length of the leading run of printable ASCII (0x20..0x7e): eight bytes per step */
 static inline size_t ascii_run(const uint8_t *p, size_t n) {
     size_t i = 0;
+#ifdef __SSE2__
+    /* 16 bytes at a time: the signed compare also catches bytes >= 0x80, so one mask finds the first non-printable */
+    const __m128i lo = _mm_set1_epi8(0x20), del = _mm_set1_epi8(0x7f);
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(p + i));
+        int m = _mm_movemask_epi8(_mm_or_si128(_mm_cmplt_epi8(v, lo), _mm_cmpeq_epi8(v, del)));
+        if (m) return i + (size_t)__builtin_ctz((unsigned)m);
+        i += 16;
+    }
+#endif
+#ifdef VT_NEON
+    {   /* a byte is printable ASCII when (b - 0x20) <= 0x5e as an unsigned number: one subtract and one compare cover both ends */
+        const uint8x16_t base = vdupq_n_u8(0x20), span = vdupq_n_u8(0x5e);
+        while (i + 16 <= n) {
+            uint8x16_t bad = vcgtq_u8(vsubq_u8(vld1q_u8(p + i), base), span);
+            uint64x2_t b64 = vreinterpretq_u64_u8(bad);
+            if (vgetq_lane_u64(b64, 0) | vgetq_lane_u64(b64, 1)) break;   /* the scalar loop below finds the exact byte */
+            i += 16;
+        }
+    }
+#endif
     const uint64_t ones = 0x0101010101010101ull, highs = 0x8080808080808080ull;
     while (i + 8 <= n) {
         uint64_t w;
@@ -952,6 +1138,178 @@ static inline size_t ascii_run(const uint8_t *p, size_t n) {
 }
 
 /* a run of printable ASCII: the hot path for ordinary output */
+static bool fast_paths = true;
+void vt_set_fast_paths(bool on) { fast_paths = on; }
+
+/* Width of the code points the bulk UTF-8 path handles itself: 1 (Latin, Greek, Cyrillic, box and block drawing), 2 (kana,
+ * CJK ideographs, Hangul syllables, fullwidth forms), or 0 for "let the general path decide" (combining marks, emoji, rarities). */
+/* width of every BMP code point, 0 meaning "not on the fast path" (combining, non-printing). Built once from vt_wcwidth,
+ * so the fast path can never disagree with the slow one. 64 KB, touched only where text actually uses it. */
+static uint8_t wtab[65536];
+static pthread_once_t wtab_once = PTHREAD_ONCE_INIT;
+static void wtab_build(void) {
+    for (uint32_t c = 0x20; c < 0x10000; c++) {
+        if (c >= 0xd800 && c <= 0xdfff) continue;
+        int w = vt_wcwidth(c);
+        wtab[c] = (uint8_t)(w == 1 || w == 2 ? w : 0);
+    }
+}
+
+/* A run of valid two- and three-byte sequences written straight into the row, without the per-character width lookup, wrap check
+ * and dirty bookkeeping of put_cp. Stops (consuming nothing more) at anything it does not handle: a sequence cut off by the end
+ * of the buffer, overlong or surrogate encodings, a width it does not know, or a character that needs to wrap. */
+static inline void fill_ascii(VtCell *dst, const uint8_t *p, size_t k, uint32_t sf) {
+    size_t i = 0;
+#ifdef __SSE2__
+    {   /* four characters per step: widen the bytes to 32-bit code points and interleave them with the style */
+        const __m128i zero = _mm_setzero_si128(), sfv = _mm_set1_epi32((int)sf);
+        for (; i + 4 <= k; i += 4) {
+            int w;
+            memcpy(&w, p + i, 4);
+            __m128i cp = _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(w), zero), zero);
+            _mm_storeu_si128((__m128i *)(dst + i), _mm_unpacklo_epi32(cp, sfv));
+            _mm_storeu_si128((__m128i *)(dst + i + 2), _mm_unpackhi_epi32(cp, sfv));
+        }
+    }
+#endif
+#ifdef VT_NEON
+    {   /* eight characters per step: widen the bytes to 32-bit code points and zip them with the style */
+        const uint32x4_t sfv = vdupq_n_u32(sf);
+        for (; i + 8 <= k; i += 8) {
+            uint16x8_t w16 = vmovl_u8(vld1_u8(p + i));
+            uint32x4x2_t a = vzipq_u32(vmovl_u16(vget_low_u16(w16)), sfv), b = vzipq_u32(vmovl_u16(vget_high_u16(w16)), sfv);
+            vst1q_u32((uint32_t *)(dst + i), a.val[0]);
+            vst1q_u32((uint32_t *)(dst + i + 2), a.val[1]);
+            vst1q_u32((uint32_t *)(dst + i + 4), b.val[0]);
+            vst1q_u32((uint32_t *)(dst + i + 6), b.val[1]);
+        }
+    }
+#endif
+    for (; i < k; i++) { dst[i].cp = p[i]; dst[i].sf = sf; }
+}
+
+#ifdef __SSE2__
+/* Write the first k (0..16) of sixteen printable ASCII bytes as cells and keep the old contents of the other cells, with no
+ * branch on k: runs of text are short and their lengths unpredictable, so a loop here costs a mispredict per run. */
+static inline void fill16(VtCell *dst, __m128i v, unsigned k, uint32_t sf) {
+    const __m128i z = _mm_setzero_si128(), sfv = _mm_set1_epi32((int)sf), kv = _mm_set1_epi32((int)k);
+    __m128i l8 = _mm_unpacklo_epi8(v, z), h8 = _mm_unpackhi_epi8(v, z);
+    __m128i c[4] = {_mm_unpacklo_epi16(l8, z), _mm_unpackhi_epi16(l8, z), _mm_unpacklo_epi16(h8, z), _mm_unpackhi_epi16(h8, z)};
+    for (int q = 0; q < 4; q++) {
+        __m128i a = _mm_unpacklo_epi32(c[q], sfv), b = _mm_unpackhi_epi32(c[q], sfv);
+        __m128i ma = _mm_cmpgt_epi32(kv, _mm_set_epi32(4 * q + 1, 4 * q + 1, 4 * q, 4 * q));
+        __m128i mb = _mm_cmpgt_epi32(kv, _mm_set_epi32(4 * q + 3, 4 * q + 3, 4 * q + 2, 4 * q + 2));
+        __m128i oa = _mm_loadu_si128((const __m128i *)(dst + 4 * q)), ob = _mm_loadu_si128((const __m128i *)(dst + 4 * q + 2));
+        _mm_storeu_si128((__m128i *)(dst + 4 * q), _mm_or_si128(_mm_and_si128(ma, a), _mm_andnot_si128(ma, oa)));
+        _mm_storeu_si128((__m128i *)(dst + 4 * q + 2), _mm_or_si128(_mm_and_si128(mb, b), _mm_andnot_si128(mb, ob)));
+    }
+}
+#endif
+
+/* length of a UTF-8 sequence by the top four bits of its first byte; 0 = not a lead byte */
+static const uint8_t U8LEN[16] = {1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4};
+
+/* A whole stretch of ordinary text in one loop: ASCII (eight bytes at a time), 2-, 3- and 4-byte UTF-8, tabs, CR and LF.
+ * It stops at anything else (escape sequences, other controls, a character that would wrap, odd widths) and the byte-at-a-time
+ * path carries on from there, so what it produces is exactly what that path would. Returns the bytes used. */
+static size_t utf8_run(Vt *t, const uint8_t *p, size_t n) {
+    if (!fast_paths || t->g[t->gl] == CS_GRAPHICS || (t->modes & VT_M_INSERT) || !(t->modes & VT_M_AUTOWRAP)) return 0;
+    if (t->cx > t->cols) return 0;
+    pthread_once(&wtab_once, wtab_build);
+    VtCell *r = rowp(t, t->cy);
+    const uint32_t sf = t->pen_style << 8;
+    const int cols = t->cols;
+    int cx = t->cx;
+    size_t i = 0;
+    uint32_t last = 0;
+    int wend = 0;   /* end of the furthest cell written on this row since the last flush (the cursor may have moved on by tab or CR) */
+#define META() do { if (wend) { VtLineMeta *lm_ = rowm(t, t->cy); lm_->dirty = 1; if (wend > lm_->hw) lm_->hw = (uint16_t)wend; t->last_cp = last; wend = 0; } } while (0)
+#define FLUSH() do { META(); t->cx = cx; } while (0)
+    while (i < n) {
+#ifdef __SSE2__
+        if (n - i >= 16 && cols - cx >= 16) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(p + i));
+            int m = _mm_movemask_epi8(_mm_or_si128(_mm_cmplt_epi8(v, _mm_set1_epi8(0x20)), _mm_cmpeq_epi8(v, _mm_set1_epi8(0x7f))));
+            unsigned k = m ? (unsigned)__builtin_ctz((unsigned)m) : 16u;
+            if (k) { fill16(r + cx, v, k, sf); cx += (int)k; i += k; last = p[i - 1]; wend = cx; }
+            if (!m) continue;
+        } else
+#endif
+        {
+            size_t room = (size_t)(cols - cx), lim = n - i < room ? n - i : room;
+            if (lim) {
+                size_t k = ascii_run(p + i, lim);
+                if (k) { fill_ascii(r + cx, p + i, k, sf); cx += (int)k; i += k; last = p[i - 1]; wend = cx; if (i >= n) break; }
+            }
+            if (i >= n) break;
+        }
+        uint8_t c = p[i];
+        uint32_t cp;
+        size_t len;
+        int w;
+        if (c < 0x80) {
+            if (c == 0x0d) {   /* the high-water mark must keep the furthest cell written on this row, not where the cursor ends up */
+                META();
+                cx = 0; i++; continue;
+            }
+            if (c == 0x0a) {   /* line feed: it may scroll, which moves the rows, so settle the row we are in first */
+                FLUSH();
+                do_linefeed(t);
+                r = rowp(t, t->cy); cx = t->cx; i++;
+                continue;
+            }
+            if (c == 0x09) {
+                int x = cx >= cols ? cols - 1 : cx, nx = cols - 1;
+                for (int k = x + 1; k < cols; k++) if (t->tabs[k]) { nx = k; break; }
+                cx = nx; i++;
+                continue;
+            }
+            break;   /* a printable byte with no room left (wrap), an escape, another control: the slow path */
+        }
+        if (n - i >= 4) {   /* branchless decode of a 2-, 3- or 4-byte sequence: which length it is, is random in real text */
+            uint32_t u;
+            memcpy(&u, p + i, 4);
+            uint32_t b0 = u & 0xff, b1 = (u >> 8) & 0xff, b2 = (u >> 16) & 0xff, b3 = u >> 24;
+            uint32_t L = U8LEN[b0 >> 4];
+            uint32_t c1 = b1 & 0x3f, c2 = b2 & 0x3f, c3 = b3 & 0x3f;
+            uint32_t cp2 = ((b0 & 0x1f) << 6) | c1, cp3 = ((b0 & 0x0f) << 12) | (c1 << 6) | c2, cp4 = ((b0 & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
+            cp = L == 2 ? cp2 : L == 3 ? cp3 : cp4;
+            uint32_t mn = L == 2 ? 0x80 : L == 3 ? 0x800 : 0x10000;
+            uint32_t ok = (L >= 2) & ((b1 & 0xc0) == 0x80) & ((L < 3) | ((b2 & 0xc0) == 0x80)) & ((L < 4) | ((b3 & 0xc0) == 0x80))
+                        & (cp >= mn) & (cp <= 0x10ffff) & ((cp - 0xd800) > 0x7ff);
+            if (!ok) break;
+            len = L;
+            if (__builtin_expect(cp >= 0x10000, 0)) { int vw = vt_wcwidth(cp); w = vw == 1 || vw == 2 ? vw : 0; }
+            else w = wtab[cp];
+        } else if (c >= 0xc2 && c <= 0xdf) {
+            if (i + 2 > n || (p[i + 1] & 0xc0) != 0x80) break;
+            cp = ((uint32_t)(c & 0x1f) << 6) | (p[i + 1] & 0x3f);
+            len = 2; w = wtab[cp];
+        } else if (c >= 0xe0 && c <= 0xef) {
+            if (i + 3 > n || (p[i + 1] & 0xc0) != 0x80 || (p[i + 2] & 0xc0) != 0x80) break;
+            cp = ((uint32_t)(c & 0x0f) << 12) | ((uint32_t)(p[i + 1] & 0x3f) << 6) | (p[i + 2] & 0x3f);
+            if (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff)) break;
+            len = 3; w = wtab[cp];
+        } else break;
+        if (!w || cx + w > cols) break;
+        r[cx].cp = cp;
+        r[cx].sf = sf | (w == 2 ? VT_F_WIDE : 0);
+        if (cx + 1 < cols) {   /* the tail cell of a wide character; a narrow one writes back what was there, so no branch on the width */
+            VtCell old = r[cx + 1];
+            r[cx + 1].cp = w == 2 ? 0 : old.cp;
+            r[cx + 1].sf = w == 2 ? (sf | VT_F_TAIL) : old.sf;
+        }
+        cx += w;
+        last = cp; wend = cx;
+        i += len;
+    }
+    FLUSH();
+#undef FLUSH
+#undef META
+    return i;
+}
+
+
 static void put_ascii(Vt *t, const uint8_t *p, size_t n) {
     if (t->g[t->gl] == CS_GRAPHICS || (t->modes & VT_M_INSERT) || !(t->modes & VT_M_AUTOWRAP)) {
         for (size_t i = 0; i < n; i++) put_cp(t, p[i]);
@@ -968,7 +1326,7 @@ static void put_ascii(Vt *t, const uint8_t *p, size_t n) {
         size_t room = (size_t)(t->cols - t->cx);
         size_t k = n < room ? n : room;
         VtCell *dst = r + t->cx;
-        for (size_t i = 0; i < k; i++) { dst[i].cp = p[i]; dst[i].sf = sf; }
+        fill_ascii(dst, p, k, sf);
         t->cx += (int)k;
         t->last_cp = p[k - 1];
         p += k;
@@ -1262,6 +1620,27 @@ static void osc_dispatch(Vt *t) {
     if (!semi) return;
     int code = atoi(t->osc);
     const char *text = semi + 1;
+    if (code == 7777) {
+        /* 7777;cat;TOKEN;PATH;OFFSET;LENGTH;FLAGS - a program asks the terminal to read PATH itself and print it here, in order.
+         * Refused unless the request carries this tab's secret token (only programs started in the tab know it). */
+        size_t tl = strlen(t->stream_token);
+        if (!tl || strncmp(text, "cat;", 4) != 0 || strncmp(text + 4, t->stream_token, tl) != 0 || text[4 + tl] != ';') return;
+        char tmp[OSC_MAX + 1];
+        snprintf(tmp, sizeof tmp, "%s", text + 5 + tl);
+        char *f[3] = {NULL, NULL, NULL};   /* offset, length, flags: split off from the right, so the path may hold anything else */
+        for (int k = 0; k < 3; k++) { char *sc = strrchr(tmp, ';'); if (!sc) return; *sc = 0; f[2 - k] = sc + 1; }
+        size_t on = 0;
+        for (const unsigned char *q = (const unsigned char *)tmp; *q && on < OSC_MAX; q++) {
+            if (*q == '%' && hexv((char)q[1]) >= 0 && hexv((char)q[2]) >= 0) { t->stream_path[on++] = (char)(hexv((char)q[1]) * 16 + hexv((char)q[2])); q += 2; }
+            else t->stream_path[on++] = (char)*q;
+        }
+        t->stream_path[on] = 0;
+        t->stream_off = strtoull(f[0], NULL, 10);
+        t->stream_len = strtoull(f[1], NULL, 10);
+        t->stream_flags = (unsigned)strtoul(f[2], NULL, 10);
+        t->stream_pending = t->stream_path[0] == '/';
+        return;
+    }
     if ((code == 0 || code == 2) && t->event_fn) t->event_fn(VT_EV_TITLE, text, t->user);
     else if (code == 7 && t->event_fn) {
         /* file://host/path -> /path, percent-decoded */
@@ -1309,8 +1688,8 @@ static inline size_t csi_fast(Vt *t, const uint8_t *p, size_t n) {
     int np = 0;
     int cur = 0;
     bool any = false, sub = false;
-    uint8_t subs[MAX_PARAMS];
-    int vals[MAX_PARAMS];
+    int *vals = t->par;       /* parsed straight into the terminal's own arrays: no staging copy */
+    uint8_t *subs = t->sub;
     for (; i < n; i++) {
         uint8_t c = p[i];
         if (c >= '0' && c <= '9') { cur = cur * 10 + (c - '0'); if (cur > 65535) cur = 65535; any = true; }
@@ -1320,8 +1699,6 @@ static inline size_t csi_fast(Vt *t, const uint8_t *p, size_t n) {
             cur = 0; any = true; sub = (c == ':');
         } else if (c >= 0x40 && c <= 0x7e) {
             if (any) { vals[np] = cur; subs[np] = sub; np++; }
-            memcpy(t->par, vals, (size_t)np * sizeof(int));
-            memcpy(t->sub, subs, (size_t)np);
             t->np = np;
             t->priv = 0;
             t->inter = 0;
@@ -1335,9 +1712,9 @@ static inline size_t csi_fast(Vt *t, const uint8_t *p, size_t n) {
     return 0;
 }
 
-void vt_feed(Vt *t, const uint8_t *p, size_t n) {
+static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
     size_t i = 0;
-    while (i < n) {
+    while (i < n && !t->stream_pending) {
         uint8_t c = p[i];
         switch (t->st) {
         case ST_GROUND:
@@ -1350,6 +1727,10 @@ void vt_feed(Vt *t, const uint8_t *p, size_t n) {
                 put_ascii(t, p + i, run);
                 i += run;
                 continue;
+            }
+            if (t->utf_need == 0 && c >= 0xc2 && c <= 0xef) {
+                size_t used = utf8_run(t, p + i, n - i);
+                if (used) { i += used; continue; }
             }
             i++;
             if (t->utf_need) {
@@ -1453,6 +1834,361 @@ void vt_feed(Vt *t, const uint8_t *p, size_t n) {
             continue;
         }
     }
+    return i;
+}
+
+
+/* ---- bulk text: lines of plain text built on several cores ---------------------------------------------------------------------------------
+ * A big batch of plain text (printable ASCII, UTF-8 whose widths are 1 or 2, tabs, CR LF) is the one case where a terminal's work is
+ * independent from line to line, so it can be spread over cores: workers turn lines into finished screen rows, and the parser thread only
+ * has to append the rows to the scrollback in order. Anything else (escape sequences, other controls, odd characters, a cursor that is not
+ * at the start of a blank bottom row, custom tab stops, a coloured erase) is left to the ordinary parser, which also takes over at the first
+ * line the workers do not understand. The result is exactly what the ordinary parser would have produced. */
+
+void vt_set_threads(int parse_workers, int compress_workers) { cfg_parse_workers = parse_workers; cfg_compress_workers = compress_workers; }
+
+static int parse_workers_count(void) {
+    if (cfg_parse_workers >= 0) return cfg_parse_workers > 16 ? 16 : cfg_parse_workers;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    int w = (int)(n / 2);   /* the other half of the cores is for drawing, reading, compressing and the rest of the system */
+    return w > 8 ? 8 : w;
+}
+
+#define BULK_MIN (128 * 1024)    /* smallest batch worth waking workers for */
+#define BULK_TASK_MIN (24 * 1024)
+
+typedef struct BTask {
+    struct BTask *next;
+    const uint8_t *p; size_t n;
+    int cols; uint32_t sf;
+    VtCell *cells; size_t ncells, ccap;      /* output: the cells of all rows, one row after the other (hw cells each) */
+    struct { uint32_t off; uint16_t hw; } *rows; int nrows, rcap;
+    size_t used;                             /* input bytes covered by complete lines that were built */
+    bool stopped;                            /* hit something it does not handle: the rest is for the ordinary parser */
+    int done;
+} BTask;
+
+static void btask_emit(BTask *tk, const VtCell *row, int hw) {
+    if (tk->ncells + (size_t)hw > tk->ccap) {
+        size_t nc = tk->ccap ? tk->ccap * 2 : 65536;
+        while (nc < tk->ncells + (size_t)hw) nc *= 2;
+        VtCell *p = realloc(tk->cells, nc * sizeof(VtCell));
+        if (!p) { tk->stopped = true; return; }
+        tk->cells = p; tk->ccap = nc;
+    }
+    if (tk->nrows == tk->rcap) {
+        int nr = tk->rcap ? tk->rcap * 2 : 4096;
+        void *p = realloc(tk->rows, (size_t)nr * sizeof *tk->rows);
+        if (!p) { tk->stopped = true; return; }
+        tk->rows = p; tk->rcap = nr;
+    }
+    tk->rows[tk->nrows].off = (uint32_t)tk->ncells; tk->rows[tk->nrows].hw = (uint16_t)hw; tk->nrows++;
+    copy_cells(tk->cells + tk->ncells, row, (size_t)hw);
+    tk->ncells += (size_t)hw;
+}
+
+/* Build the rows for the whole lines in tk->p[0..n). Lines end in CR LF and start at column 0 of a blank row. */
+static void btask_build(BTask *tk) {
+    const uint8_t *p = tk->p;
+    const size_t n = tk->n;
+    const int cols = tk->cols;
+    const uint32_t sf = tk->sf;
+    VtCell *row = calloc((size_t)cols + 4, sizeof(VtCell));
+    if (!row) { tk->stopped = true; return; }
+    int cx = 0, hw = 0;
+    size_t pos = 0, line_start = 0;
+    int line_rows = 0; size_t line_cells = 0;
+    while (pos < n && !tk->stopped) {
+        size_t room = (size_t)(cols - cx), lim = n - pos < room ? n - pos : room;
+        if (lim) {
+            size_t k = ascii_run(p + pos, lim);
+            if (k) { fill_ascii(row + cx, p + pos, k, sf); cx += (int)k; pos += k; hw = cx; if (pos >= n) break; }
+        }
+        uint8_t c = p[pos];
+        if (c >= 0x20 && c < 0x7f) {   /* the row is full: wrap (a pending wrap happens when the next character comes) */
+            btask_emit(tk, row, hw); memset(row, 0, (size_t)hw * sizeof(VtCell)); cx = 0; hw = 0;
+            continue;
+        }
+        if (c == '\r') {
+            if (pos + 1 >= n || p[pos + 1] != '\n') goto unsafe;
+            btask_emit(tk, row, hw); memset(row, 0, (size_t)hw * sizeof(VtCell)); cx = 0; hw = 0;
+            pos += 2;
+            line_start = pos; line_rows = tk->nrows; line_cells = tk->ncells;
+            continue;
+        }
+        if (c == '\t') {   /* the default tab stops, every eight columns */
+            int x = cx >= cols ? cols - 1 : cx, nx = (x / 8 + 1) * 8;
+            cx = nx < cols ? nx : cols - 1;
+            pos++;
+            continue;
+        }
+        if (c < 0x80) goto unsafe;
+        {
+            uint32_t cp, L;
+            int w;
+            if (n - pos >= 4) {
+                uint32_t u;
+                memcpy(&u, p + pos, 4);
+                uint32_t b0 = u & 0xff, b1 = (u >> 8) & 0xff, b2 = (u >> 16) & 0xff, b3 = u >> 24;
+                L = U8LEN[b0 >> 4];
+                uint32_t c1 = b1 & 0x3f, c2 = b2 & 0x3f, c3 = b3 & 0x3f;
+                uint32_t cp2 = ((b0 & 0x1f) << 6) | c1, cp3 = ((b0 & 0x0f) << 12) | (c1 << 6) | c2, cp4 = ((b0 & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
+                cp = L == 2 ? cp2 : L == 3 ? cp3 : cp4;
+                uint32_t mn = L == 2 ? 0x80 : L == 3 ? 0x800 : 0x10000;
+                uint32_t ok = (L >= 2) & ((b1 & 0xc0) == 0x80) & ((L < 3) | ((b2 & 0xc0) == 0x80)) & ((L < 4) | ((b3 & 0xc0) == 0x80))
+                            & (cp >= mn) & (cp <= 0x10ffff) & ((cp - 0xd800) > 0x7ff);
+                if (!ok) goto unsafe;
+                if (__builtin_expect(cp >= 0x10000, 0)) { int vw = vt_wcwidth(cp); w = vw == 1 || vw == 2 ? vw : 0; }
+                else w = wtab[cp];
+            } else goto unsafe;   /* a sequence cut short by the end of the batch: the ordinary parser has the rest of the data */
+            if (!w) goto unsafe;
+            if (cx + w > cols) {   /* no room: a wide character at the last column blanks that cell (whatever a tab left there), then the row wraps */
+                if (w == 2 && cx == cols - 1) { row[cx].cp = 0; row[cx].sf = 0; }
+                btask_emit(tk, row, hw); memset(row, 0, (size_t)hw * sizeof(VtCell)); cx = 0; hw = 0;
+            }
+            row[cx].cp = cp;
+            row[cx].sf = sf | (w == 2 ? VT_F_WIDE : 0);
+            if (w == 2) { row[cx + 1].cp = 0; row[cx + 1].sf = sf | VT_F_TAIL; }
+            cx += w; hw = cx;
+            pos += L;
+            continue;
+        }
+    unsafe:
+        tk->stopped = true;
+    }
+    if (tk->stopped) { tk->nrows = line_rows; tk->ncells = line_cells; tk->used = line_start; }
+    else tk->used = pos;
+    free(row);
+}
+
+static struct { pthread_mutex_t m; pthread_cond_t work, fin; BTask *q; int started; } bpool = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0};
+
+static void *bpool_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&bpool.m);
+        while (!bpool.q) pthread_cond_wait(&bpool.work, &bpool.m);
+        BTask *tk = bpool.q;
+        bpool.q = tk->next;
+        pthread_mutex_unlock(&bpool.m);
+        btask_build(tk);
+        pthread_mutex_lock(&bpool.m);
+        tk->done = 1;
+        pthread_cond_broadcast(&bpool.fin);
+        pthread_mutex_unlock(&bpool.m);
+    }
+    return NULL;
+}
+
+/* run tasks[0..n): the first on this thread, the others on the workers */
+static bool btasks_run(BTask *tk, int n) {
+    pthread_mutex_lock(&bpool.m);
+    if (!bpool.started) {
+        int w = parse_workers_count();
+        for (int i = 0; i < w; i++) {
+            pthread_t th;
+            pthread_attr_t at;
+            pthread_attr_init(&at);
+            pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            pthread_attr_setstacksize(&at, 256 * 1024);
+            if (pthread_create(&th, NULL, bpool_worker, NULL) == 0) bpool.started++;
+            pthread_attr_destroy(&at);
+        }
+        if (!bpool.started) bpool.started = -1;
+    }
+    bool usable = bpool.started > 0;
+    if (usable && n > 1) {
+        for (int i = n - 1; i >= 1; i--) { tk[i].next = bpool.q; bpool.q = &tk[i]; }
+        pthread_cond_broadcast(&bpool.work);
+    }
+    pthread_mutex_unlock(&bpool.m);
+    if (!usable) return false;
+    btask_build(&tk[0]);
+    tk[0].done = 1;
+    pthread_mutex_lock(&bpool.m);
+    for (int i = 1; i < n; i++) while (!tk[i].done) pthread_cond_wait(&bpool.fin, &bpool.m);
+    pthread_mutex_unlock(&bpool.m);
+    return true;
+}
+
+static bool bulk_state_ok(Vt *t) {
+    if (t->st != ST_GROUND || t->utf_need || t->cur != &t->main || t->top != 0 || t->bottom != t->rows - 1) return false;
+    if (!(t->modes & VT_M_AUTOWRAP) || (t->modes & VT_M_INSERT) || t->g[t->gl] == CS_GRAPHICS) return false;
+    if (t->cx != 0 || t->cy != t->rows - 1 || rowm(t, t->cy)->hw != 0 || erase_style(t) != 0 || t->stream_pending) return false;
+    for (int i = 0; i < t->cols; i++) if (t->tabs[i] != (i > 0 && i % 8 == 0)) return false;
+    return true;
+}
+
+/* Put the rows the tasks built where the ordinary parser would have left them: S = the old screen rows 0..rows-2 followed by the new
+ * rows; the first M of S (M = the number of new rows) go into the scrollback, the last rows-1 stay on the screen, the cursor is on a
+ * blank bottom row. */
+static void bulk_commit(Vt *t, BTask *tk, int ntasks) {
+    int rows = t->rows, cols = t->cols;
+    long M = 0;
+    for (int k = 0; k < ntasks; k++) M += tk[k].nrows;
+    if (M == 0) return;
+    long keep = rows - 1;
+    /* the old rows that stay on the screen move up: save them before their slots are overwritten */
+    long old_stay = M < keep ? keep - M : 0;
+    VtCell *saved = NULL; uint16_t *saved_hw = NULL;
+    if (old_stay) {
+        saved = malloc((size_t)old_stay * (size_t)cols * sizeof(VtCell)); saved_hw = malloc((size_t)old_stay * sizeof *saved_hw);
+        if (saved && saved_hw) for (long j = 0; j < old_stay; j++) {
+            int y = (int)(M + j);
+            memcpy(saved + j * cols, rowp(t, y), (size_t)cols * sizeof(VtCell));
+            saved_hw[j] = rowm(t, y)->hw;
+        }
+    }
+    long j = 0;
+    for (; j < M && j < keep; j++) hist_push(t, (int)j);   /* old screen rows scroll off first, with their renderer caches */
+    VtLineMeta fresh = {.dirty = 1, .hw = 0, .cache = NULL};
+    long hist_new = M > keep ? M - keep : 0;   /* the new rows that scroll off too (the last `keep` of them stay on the screen) */
+    long idx = 0;   /* index over the new rows */
+    for (int k = 0; k < ntasks && idx < hist_new; k++)
+        for (int r = 0; r < tk[k].nrows && idx < hist_new; r++, idx++) {
+            VtLineMeta m = fresh; m.hw = tk[k].rows[r].hw;
+            hist_add(t, tk[k].cells + tk[k].rows[r].off, tk[k].rows[r].hw, m);
+        }
+    /* the screen: first the old rows that stay (shifted up), then the newest new rows */
+    int y = 0;
+    for (long q = 0; q < old_stay && saved && saved_hw; q++, y++) {
+        VtCell *dst = rowp(t, y); VtLineMeta *m = rowm(t, y);
+        if (m->cache && t->cache_free) t->cache_free(m->cache, t->user);
+        m->cache = NULL;
+        memset(dst, 0, (size_t)cols * sizeof(VtCell));
+        memcpy(dst, saved + q * cols, (size_t)saved_hw[q] * sizeof(VtCell));
+        m->hw = saved_hw[q]; m->dirty = 1;
+    }
+    for (int k = 0; k < ntasks && y < rows - 1; k++)
+        for (int r = 0; r < tk[k].nrows && y < rows - 1; r++) {
+            long gidx = 0; for (int kk = 0; kk < k; kk++) gidx += tk[kk].nrows; gidx += r;
+            if (gidx < hist_new) continue;   /* went to the scrollback */
+            VtCell *dst = rowp(t, y); VtLineMeta *m = rowm(t, y);
+            if (m->cache && t->cache_free) t->cache_free(m->cache, t->user);
+            m->cache = NULL;
+            memset(dst, 0, (size_t)cols * sizeof(VtCell));
+            copy_cells(dst, tk[k].cells + tk[k].rows[r].off, tk[k].rows[r].hw);
+            m->hw = tk[k].rows[r].hw; m->dirty = 1;
+            y++;
+        }
+    {   /* the cursor row: blank */
+        VtCell *dst = rowp(t, rows - 1); VtLineMeta *m = rowm(t, rows - 1);
+        if (m->cache && t->cache_free) t->cache_free(m->cache, t->user);
+        m->cache = NULL;
+        memset(dst, 0, (size_t)cols * sizeof(VtCell));
+        m->hw = 0; m->dirty = 1;
+    }
+    t->cx = 0; t->cy = rows - 1;
+    free(saved); free(saved_hw);
+}
+
+/* try to take the whole lines in p[0..n) in bulk; returns the bytes consumed (0 = not applicable or nothing to gain) */
+static size_t bulk_region(Vt *t, const uint8_t *p, size_t n) {
+    int workers = parse_workers_count();
+    if (workers <= 0 || n < BULK_MIN) return 0;
+    pthread_once(&wtab_once, wtab_build);
+    int ntasks = (int)(n / BULK_TASK_MIN);
+    if (ntasks > workers + 1) ntasks = workers + 1;
+    if (ntasks < 2) return 0;
+    BTask *tk = calloc((size_t)ntasks, sizeof *tk);
+    if (!tk) return 0;
+    size_t start = 0;
+    int built = 0;
+    for (int k = 0; k < ntasks; k++) {   /* split at line ends */
+        size_t end = n;
+        if (k < ntasks - 1) {
+            size_t target = n * (size_t)(k + 1) / (size_t)ntasks;
+            const uint8_t *nl = target > start ? memchr(p + target, '\n', n - target) : NULL;
+            end = nl ? (size_t)(nl - p) + 1 : n;
+        }
+        if (end <= start) continue;
+        tk[built].p = p + start; tk[built].n = end - start; tk[built].cols = t->cols; tk[built].sf = t->pen_style << 8;
+        built++;
+        start = end;
+        if (start >= n) break;
+    }
+    size_t consumed = 0;
+    if (built >= 2 && btasks_run(tk, built)) {
+        int use = 0;
+        for (int k = 0; k < built; k++) {
+            consumed += tk[k].used;
+            use++;
+            if (tk[k].stopped) break;
+        }
+        bulk_commit(t, tk, use);
+    }
+    for (int k = 0; k < ntasks; k++) { free(tk[k].cells); free(tk[k].rows); }
+    free(tk);
+    return consumed;
+}
+
+static size_t feed_bulk(Vt *t, const uint8_t *p, size_t n) {
+    size_t i = 0;
+    bool bulk_off = false;
+    while (i < n) {
+        if (!bulk_off && n - i >= BULK_MIN) {
+            /* get the cursor to the start of a blank bottom row the ordinary way: a screenful of lines at most */
+            for (int guard = 0; i < n && !bulk_state_ok(t) && guard < t->rows + 4; guard++) {
+                const uint8_t *nl = memchr(p + i, '\n', n - i);
+                size_t upto = nl ? (size_t)(nl - p) + 1 : n;
+                size_t used = feed_serial(t, p + i, upto - i);
+                i += used;
+                if (used < upto - (i - used)) return i;   /* a file-streaming request stopped the parser */
+                if (!nl) break;
+            }
+            if (i < n && n - i >= BULK_MIN && bulk_state_ok(t)) {
+                size_t end = n;
+                const uint8_t *esc = memchr(p + i, 0x1b, n - i);   /* escape sequences are the ordinary parser's: bulk only up to the line that holds the first */
+                if (esc) { const uint8_t *ls = esc; while (ls > p + i && ls[-1] != '\n') ls--; end = (size_t)(ls - p); }
+                const uint8_t *last = end > i ? memrchr(p + i, '\n', end - i) : NULL;
+                if (last && last > p + i && last[-1] == '\r' && (size_t)(last - p) + 1 - i >= BULK_MIN / 2) {
+                    size_t used = bulk_region(t, p + i, (size_t)(last - p) + 1 - i);
+                    if (used) { i += used; if (used < (size_t)(last - p) + 1 - i + used) bulk_off = true; continue; }
+                }
+            }
+            bulk_off = true;
+        }
+        size_t used = feed_serial(t, p + i, n - i);
+        i += used;
+        break;
+    }
+    return i;
+}
+
+static double mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec; }
+
+/* Spreading text over cores pays only when the ordinary parser is slow for that kind of text (lots of non-ASCII, short lines); for long
+ * plain-ASCII lines it is already fast and the hand-over costs more than it saves. Rather than guess, time both on big batches and use
+ * the one that is faster here, looking at the other again every so often because the kind of output changes. */
+size_t vt_feed_stream(Vt *t, const uint8_t *p, size_t n) {
+    if (n < BULK_MIN || !fast_paths || parse_workers_count() <= 0) return feed_serial(t, p, n);
+    bool use_bulk;
+    if (t->rate_bulk == 0) use_bulk = true;
+    else if (t->rate_serial == 0) use_bulk = false;
+    else { use_bulk = t->rate_bulk >= t->rate_serial; if (++t->batch_no % 16 == 0) use_bulk = !use_bulk; }
+    double t0 = mono_ns();
+    size_t used = use_bulk ? feed_bulk(t, p, n) : feed_serial(t, p, n);
+    double dt = mono_ns() - t0;
+    if (use_bulk && !t->bulk_warm) { t->bulk_warm = true; return used; }   /* the first batch pays for starting the workers and touching fresh memory: not a fair sample */
+    if (dt > 0 && used >= BULK_MIN / 2) {
+        double r = (double)used / dt;
+        double *rate = use_bulk ? &t->rate_bulk : &t->rate_serial;
+        *rate = *rate == 0 ? r : *rate * 0.7 + r * 0.3;
+    }
+    return used;
+}
+
+void vt_feed(Vt *t, const uint8_t *p, size_t n) { vt_feed_stream(t, p, n); }
+
+void vt_set_stream_token(Vt *t, const char *token) { snprintf(t->stream_token, sizeof t->stream_token, "%s", token ? token : ""); }
+
+bool vt_take_stream(Vt *t, char *path, size_t cap, uint64_t *off, uint64_t *len, unsigned *flags) {
+    if (!t->stream_pending) return false;
+    t->stream_pending = false;
+    snprintf(path, cap, "%s", t->stream_path);
+    *off = t->stream_off; *len = t->stream_len; *flags = t->stream_flags;
+    return true;
 }
 
 /* ---- lifecycle ---------------------------------------------------------------------------------- */
@@ -1484,7 +2220,21 @@ void vt_reset(Vt *t) {
     reset_tabs(t);
 }
 
+#ifdef __GLIBC__
+/* Scrollback allocates and frees a block of line records every 128 lines. With glibc's defaults the heap is trimmed and regrown (brk, and
+ * a page fault for every page touched again) over and over; holding on to a few MB removes that: +30% on line-heavy output. */
+static void malloc_once(void) {
+    mallopt(M_TRIM_THRESHOLD, 8 << 20);
+    mallopt(M_TOP_PAD, 3 << 20);
+    mallopt(M_MMAP_THRESHOLD, 4 << 20);
+}
+static pthread_once_t malloc_tuned = PTHREAD_ONCE_INIT;
+#endif
+
 Vt *vt_new(int cols, int rows, int scrollback) {
+#ifdef __GLIBC__
+    pthread_once(&malloc_tuned, malloc_once);
+#endif
     Vt *t = calloc(1, sizeof *t);
     if (cols < 2) cols = 2;
     if (rows < 2) rows = 2;
@@ -1495,7 +2245,7 @@ Vt *vt_new(int cols, int rows, int scrollback) {
     t->spill = true;
     t->max_lines = scrollback < 0 ? -1 : scrollback;
     t->hcap = (scrollback < 0 || scrollback > HOT_KEEP + BLOCK_LINES) ? HOT_KEEP + BLOCK_LINES : (scrollback > 0 ? scrollback : 1);
-    t->hist = calloc((size_t)t->hcap, sizeof(HLine *));
+    { int sz = 1; while (sz < t->hcap) sz <<= 1; t->hmask = sz - 1; t->hist = calloc((size_t)sz, sizeof(HEnt)); }
     style_table_init(t);
     scr_alloc(&t->main, cols, rows);
     scr_alloc(&t->alt, cols, rows);
@@ -1507,6 +2257,7 @@ Vt *vt_new(int cols, int rows, int scrollback) {
 void vt_free(Vt *t) {
     if (!t) return;
     vt_clear_history(t);
+    if (t->hseg) { free(t->hseg->buf); free(t->hseg); }
     free(t->hist);
     free(t->blocks);
     spill_close(t);
@@ -1571,7 +2322,7 @@ void vt_resize(Vt *t, int cols, int rows) {
 
 void vt_mark_all_dirty(Vt *t) {
     for (int i = 0; i < t->rows; i++) { t->main.meta[i].dirty = 1; t->alt.meta[i].dirty = 1; }
-    for (int i = 0; i < t->hcount; i++) t->hist[(t->hhead + i) % t->hcap]->meta.dirty = 1;
+    for (int i = 0; i < t->hcount; i++) t->hist[(t->hhead + i) & t->hmask].meta.dirty = 1;
     for (int i = 0; i < CACHE_ENTRIES; i++)
         if (t->cache[i]) for (int k = 0; k < t->cache[i]->nlines; k++) t->cache[i]->meta[k].dirty = 1;
 }
@@ -1611,5 +2362,5 @@ size_t vt_memory_used(const Vt *t) {
     n += 2 * ((size_t)t->cols * (size_t)t->rows * sizeof(VtCell) + (size_t)t->rows * (sizeof(VtLineMeta) + sizeof(int)));
     VtHistoryStats h;
     vt_history_stats(t, &h);
-    return n + (size_t)t->hcap * sizeof(HLine *) + h.hot_bytes + h.packed_bytes + h.cache_bytes + (size_t)t->bcap * sizeof(Block);
+    return n + (size_t)(t->hmask + 1) * sizeof(HEnt) + h.hot_bytes + h.packed_bytes + h.cache_bytes + (size_t)t->bcap * sizeof(Block);
 }

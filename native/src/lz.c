@@ -33,7 +33,14 @@ size_t sd_lz_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap) {
             /* extend the match backwards over pending literals, then forwards */
             while (ip > anchor && ref > src && ip[-1] == ref[-1]) { ip--; ref--; }
             const uint8_t *mp = ip + MIN_MATCH, *rp = ref + MIN_MATCH;
-            while (mp < matchlimit && *mp == *rp) { mp++; rp++; }
+            /* shuffled terminal data is mostly long runs: compare eight bytes at a time */
+            while (mp + 8 <= matchlimit) {
+                uint64_t a, b;
+                memcpy(&a, mp, 8); memcpy(&b, rp, 8);
+                if (a != b) { mp += (size_t)__builtin_ctzll(a ^ b) >> 3; rp = NULL; break; }
+                mp += 8; rp += 8;
+            }
+            if (rp) while (mp < matchlimit && *mp == *rp) { mp++; rp++; }
             size_t lit = (size_t)(ip - anchor), mlen = (size_t)(mp - ip) - MIN_MATCH;
             uint8_t *token = op++;
             if (lit >= 15) { *token = 15 << 4; op = put_len(op, lit - 15); } else *token = (uint8_t)(lit << 4);

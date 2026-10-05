@@ -1,0 +1,6 @@
+bytes=805306369
+wall_ms=53162
+gb_per_s=0.014
+cpu_s=53.10
+mb_per_cpu_s=14
+rss_mb=16

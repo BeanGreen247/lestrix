@@ -1,0 +1,193 @@
+#!/bin/bash
+# benchmark - the Lestrix terminal benchmark.
+#
+# Runs the same tests in Lestrix and every other installed terminal, one after another, and writes a summary table:
+#   1. everyday workloads: a 107 MB log, 40 MB of colour text, 30 MB of Unicode, `seq 1 4000000`, 1,500 full-screen redraws
+#   2. big files of random text, listed with cat/head: 128 MB, 256 MB, 512 MB, 768 MB, 1 GB and 2 GB
+#   3. refterm's stress files: 1 GB of random letters with no newline (one endless wrapped line) and 1 GB with a newline about every 27
+#      characters (the "-longline" and "-manyline" tests of Casey Muratori's refterm)
+#   4. start-up time, resting and peak memory, idle CPU
+# Each terminal's window opens on your screen, prints the total sink time and speed of every test, and closes itself.
+# Leave the windows alone while a run is going. The 2 GB test takes minutes in the slower terminals.
+#
+# usage: ./benchmark [--terminals "lestrix alacritty ..."] [--sizes "128 256 512 768 1024 2048"] [--no-workloads] [--no-sizes] [--no-refterm] [--refterm-mb MB]
+#                    [--quick] [--open browser|editor|terminal] [--dir DIR] [--results DIR] [--flags "lestrix flags"] [--summary-only]
+#   --quick          only the 128 MB and 256 MB files
+#   --open           when done, show summary.md in the browser (a private window with a throw-away profile; everything temporary is
+#                    deleted when you close it), the default text editor (xdg-open) or the terminal editor ($VISUAL/$EDITOR)
+#   --dir            where the test file goes (default ~/.cache/lestrix-bench, on disk). Only one test file exists at a time: it is made
+#                    just before its test and deleted right after, so it needs room for the largest one (2 GB) and nothing stays in memory
+#   --flags          extra flags for Lestrix, e.g. --flags "--max-fps 0 --read-delay 0"
+here=$(cd "$(dirname "$0")" && pwd)
+dir=${XDG_CACHE_HOME:-$HOME/.cache}/lestrix-bench; results=$here/bench/results
+[ -w "$here/bench" ] || results=${XDG_STATE_HOME:-$HOME/.local/state}/lestrix/bench-results   # installed copy: results go to the user's state dir
+lx=${LESTRIX_BIN:-$here/build/lestrix}; [ -x "$lx" ] || lx=$(command -v lestrix)
+lxcat_bin=$here/build/lxcat; [ -x "$lxcat_bin" ] || lxcat_bin=$(dirname "$lx")/lxcat; [ -x "$lxcat_bin" ] || lxcat_bin=$(command -v lxcat)
+openmode=""
+terms="lestrix lestrix-lxcat alacritty kitty xterm gnome xfce4 mate"; sizes="128 256 512 768 1024 2048"
+workloads=1; bigfiles=1; refterm=1; refmb=1024; summary_only=0; flags=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --terminals) terms=$2; shift ;; --sizes) sizes=$2; shift ;; --no-workloads) workloads=0 ;; --no-refterm) refterm=0 ;; --refterm-mb) refmb=$2; shift ;; --no-sizes) bigfiles=0 ;;
+    --quick) sizes="128 256"; refmb=128 ;; --dir) dir=$2; shift ;; --results) results=$2; shift ;; --flags) flags=$2; shift ;;
+    --summary-only) summary_only=1 ;; --open) openmode=$2; shift ;; -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option $1 (see --help)"; exit 2 ;;
+  esac; shift
+done
+
+summarise() {
+python3 - "$results" <<'PY'
+import os, sys
+root = sys.argv[1]
+terms = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
+def rd(p):
+    r = {}
+    try:
+        for l in open(p):
+            if "=" in l: k, v = l.strip().split("=", 1); r[k] = v
+    except OSError: pass
+    return r
+data = {t: {f[:-4]: rd(os.path.join(root, t, f)) for f in os.listdir(os.path.join(root, t)) if f.endswith(".txt")} for t in terms}
+order = ["log", "colour", "unicode", "seq", "redraw", "longline", "manyline"]
+sizes = sorted({k for t in data.values() for k in t if k.startswith("random-")}, key=lambda s: int(s.split("-")[1][:-2]))
+def table(title, rows, cell):
+    out = ["### " + title, "", "| | " + " | ".join(terms) + " |", "|---|" + "---|" * len(terms)]
+    for r in rows:
+        vals = [cell(data[t].get(r, {})) for t in terms]
+        nums = [float(v.split()[0]) if v not in ("-",) else 1e18 for v in vals]
+        best = min(nums)
+        out.append("| " + r + " | " + " | ".join(("**%s**" % v) if n == best and best < 1e18 else v for v, n in zip(vals, nums)) + " |")
+    return "\n".join(out) + "\n"
+out = ["# Benchmark results", ""]
+wk = [w for w in order if any(w in data[t] for t in terms)]
+if wk:
+    out.append(table("Total sink time, everyday workloads (seconds, lower is better)", wk, lambda r: "%.2f" % (int(r["wall_ms"]) / 1000) if "wall_ms" in r else "-"))
+    out.append(table("CPU used, everyday workloads (seconds)", wk, lambda r: r.get("cpu_s", "-")))
+if sizes:
+    out.append(table("Total sink time, random-text files (seconds)", sizes, lambda r: "%.2f" % (int(r["wall_ms"]) / 1000) if "wall_ms" in r else "-"))
+    out.append("### Speed, random-text files (GB/s, higher is better)\n\n| | " + " | ".join(terms) + " |\n|---|" + "---|" * len(terms))
+    for s in sizes:
+        vals = [data[t].get(s, {}).get("gb_per_s", "-") for t in terms]
+        nums = [float(v) if v != "-" else -1 for v in vals]
+        out.append("| " + s + " | " + " | ".join(("**%s**" % v) if n == max(nums) and n > 0 else v for v, n in zip(vals, nums)) + " |")
+    out.append("")
+    out.append(table("CPU used, random-text files (seconds)", sizes, lambda r: r.get("cpu_s", "-")))
+meta = {t: rd(os.path.join(root, t, "_meta.txt")) for t in terms}
+out.append("### Start-up, memory, idle\n\n| | " + " | ".join(terms) + " |\n|---|" + "---|" * len(terms))
+for k, label in (("startup_s", "Start-up to first prompt (s)"), ("rss_rest_mb", "Memory at rest (MB)"), ("rss_peak_mb", "Peak memory (MB)"), ("idle_cpu_s", "Idle CPU over 6 s (s)")):
+    out.append("| " + label + " | " + " | ".join(meta[t].get(k, "-") for t in terms) + " |")
+open(os.path.join(root, "summary.md"), "w").write("\n".join(out) + "\n")
+print("\n".join(out))
+PY
+}
+
+# Open FILE in a private window of a separate browser instance with a throw-away profile, wait until it is closed, then delete the profile.
+private_browser() {
+  local url="file://$1" prof="$view/profile" b
+  for b in google-chrome google-chrome-stable chromium chromium-browser brave-browser; do
+    if command -v "$b" >/dev/null 2>&1; then
+      echo "opening the results in a private $b window; close it to clean up"
+      "$b" --user-data-dir="$prof" --incognito --no-first-run --no-default-browser-check --new-window "$url" >/dev/null 2>&1
+      return 0
+    fi
+  done
+  if command -v microsoft-edge >/dev/null 2>&1; then
+    microsoft-edge --user-data-dir="$prof" --inprivate --no-first-run --new-window "$url" >/dev/null 2>&1; return 0
+  fi
+  if command -v firefox >/dev/null 2>&1; then
+    mkdir -p "$prof"; echo "opening the results in a private Firefox window; close it to clean up"
+    firefox --new-instance --profile "$prof" --private-window "$url" >/dev/null 2>&1; return 0
+  fi
+  echo "no browser with a private mode found; the results are in $results/summary.md"
+}
+
+show_results() {
+  [ -n "$openmode" ] || return 0
+  local md=$results/summary.md
+  view=$(mktemp -d "${TMPDIR:-/tmp}/lestrix-bench-view.XXXXXX")
+  case $openmode in
+    browser)
+      python3 - "$md" "$view/summary.html" <<'PY'
+import html, sys
+md, outpath = sys.argv[1], sys.argv[2]
+out, rows = [], []
+def flush():
+    global rows
+    if rows:
+        out.append("<table>")
+        for i, r in enumerate(rows):
+            tag = "th" if i == 0 else "td"
+            out.append("<tr>" + "".join("<%s>%s</%s>" % (tag, c.replace("**", "").strip() if False else html.escape(c.strip()).replace("**", ""), tag) for c in r) + "</tr>")
+        out.append("</table>"); rows = []
+for line in open(md):
+    line = line.rstrip("\n")
+    if line.startswith("|"):
+        cells = line.strip("|").split("|")
+        if not all(set(c.strip()) <= set("-") for c in cells): rows.append(cells)
+        continue
+    flush()
+    if line.startswith("# "): out.append("<h1>%s</h1>" % html.escape(line[2:]))
+    elif line.startswith("### "): out.append("<h3>%s</h3>" % html.escape(line[4:]))
+page = ("<!doctype html><meta charset=utf-8><title>Lestrix benchmark</title><style>body{font:15px system-ui;margin:2em auto;max-width:60em;padding:0 1em}"
+        "table{border-collapse:collapse;margin:.5em 0 1.5em}td,th{border:1px solid #8884;padding:.3em .7em;text-align:right}th:first-child,td:first-child{text-align:left}"
+        "@media(prefers-color-scheme:dark){body{background:#161616;color:#ddd}}</style>" + "\n".join(out))
+open(outpath, "w").write(page)
+PY
+      private_browser "$view/summary.html" ;;
+    editor) xdg-open "$md" >/dev/null 2>&1 || ${VISUAL:-${EDITOR:-$(command -v nano || command -v vi)}} "$md" ;;
+    terminal) ${VISUAL:-${EDITOR:-$(command -v nano || command -v vi)}} "$md" ;;
+  esac
+}
+
+view=""
+cleanup_view() { [ -n "$view" ] && [ -d "$view" ] && rm -rf "$view"; view=""; }
+# run.sh deletes each test file as soon as its test is done; this removes what could be left behind (an interrupted test, the generator binary)
+cleanup_files() {
+  rm -f "$dir"/test-*.txt "$dir/gen_random"; rmdir "$dir" 2>/dev/null
+  rm -rf "${TMPDIR:-/tmp}/lestrix-bench-cfg"
+}
+trap 'cleanup_view' EXIT
+trap 'cleanup_view; cleanup_files; exit 130' INT TERM
+
+if [ "$summary_only" = 1 ]; then summarise; show_results; exit 0; fi
+
+mkdir -p "$dir" "$results"
+genr=$here/build/gen_random
+if [ ! -x "$genr" ]; then genr=$dir/gen_random; [ -x "$genr" ] || cc -O2 -o "$genr" "$here/bench/gen_random.c" || { echo "need a C compiler to build the test-file generator"; exit 1; }; fi
+[ -x "$lx" ] || { echo "cannot find the lestrix binary (set LESTRIX_BIN)"; exit 1; }
+specs=()   # what to run; run.sh makes each test's file when it gets to it and deletes it afterwards
+[ "$workloads" = 1 ] && for w in log colour unicode seq redraw; do specs+=("w:$w"); done
+[ "$bigfiles" = 1 ] && for s in $sizes; do specs+=("r:$s"); done
+[ "$refterm" = 1 ] && for m in longline manyline; do specs+=("t:$m:$refmb"); done
+mkdir -p "$dir"
+export LESTRIX_BENCH_DIR=$dir LESTRIX_BENCH_GENR=$genr LESTRIX_BENCH_GENW=$here/bench/gen_workloads.py
+
+run="$here/bench/run.sh"
+launch() {
+  export LESTRIX_BENCH_OUT=$results LESTRIX_BENCH_T0=$(date +%s.%N)
+  case $1 in
+    lestrix-lxcat) LESTRIX_BENCH_LXCAT="$lxcat_bin" XDG_CONFIG_HOME=${TMPDIR:-/tmp}/lestrix-bench-cfg exec "$lx" $flags -e "$run" lestrix-lxcat "${specs[@]}" ;;
+    lestrix)   XDG_CONFIG_HOME=${TMPDIR:-/tmp}/lestrix-bench-cfg exec "$lx" --no-fastcat $flags -e "$run" lestrix "${specs[@]}" ;;
+    alacritty) exec alacritty -o window.dimensions.columns=200 -o window.dimensions.lines=50 -e "$run" alacritty "${specs[@]}" ;;
+    kitty)     exec kitty -o initial_window_width=200c -o initial_window_height=50c "$run" kitty "${specs[@]}" ;;
+    xterm)     exec xterm -geometry 200x50 -e "$run" xterm "${specs[@]}" ;;
+    gnome)     exec gnome-terminal --wait --geometry=200x50 -- "$run" gnome "${specs[@]}" ;;
+    xfce4)     exec xfce4-terminal --geometry=200x50 -x "$run" xfce4 "${specs[@]}" ;;
+    mate)      exec mate-terminal --geometry=200x50 -x "$run" mate "${specs[@]}" ;;
+  esac
+}
+have() { case $1 in lestrix|lestrix-lxcat) return 0 ;; gnome) command -v gnome-terminal >/dev/null ;; xfce4) command -v xfce4-terminal >/dev/null ;; mate) command -v mate-terminal >/dev/null ;; *) command -v "$1" >/dev/null ;; esac; }
+for t in $terms; do
+  have "$t" || { echo "skip $t (not installed)"; continue; }
+  echo "== $t"
+  rm -rf "${results:?}/$t"
+  launch "$t" >/dev/null 2>&1 &
+  p=$!
+  until grep -q done=1 "$results/$t/_meta.txt" 2>/dev/null; do sleep 2; kill -0 $p 2>/dev/null || break; done
+  for i in 1 2 3 4 5 6; do kill -0 $p 2>/dev/null || break; sleep 1; done   # it closes itself; only force it if it did not
+  kill $p 2>/dev/null; wait $p 2>/dev/null
+done
+summarise
+echo; echo "written to $results/summary.md"
+cleanup_files
+show_results
