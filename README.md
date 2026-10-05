@@ -32,22 +32,21 @@ You need a system with OpenGL 3.3, OpenGL ES 3.0 or ES 2.0 (any GPU from the las
 ```bash
 git clone https://github.com/BeanGreen247/lestrix.git
 cd lestrix
-./install.sh             # a full-screen installer (dialog or whiptail): pick the edition, the options, then confirm
+./install.sh             # a full-screen installer (dialog or whiptail): pick the options, then confirm
 ```
 
-The installer asks what you want (install, update or remove), which edition (the **native** edition, recommended: the fast C program; or the **Python/Qt** edition, which needs no compiler and also runs on Windows and macOS), and a few options: install the missing system packages, make Lestrix the default terminal, install system-wide instead of into your home folder, and run the test suite. Nothing changes until you confirm on the last screen. Without `dialog` or `whiptail`, or with `--plain`, it asks plain questions in the terminal. To skip the questions:
+The installer asks what you want (install, update or remove) and a few options: install the missing system packages, make Lestrix the default terminal, install system-wide instead of into your home folder, and run the test suite. Nothing changes until you confirm on the last screen. Without `dialog` or `whiptail`, or with `--plain`, it asks plain questions in the terminal. To skip the questions:
 
 ```bash
-./install.sh --native --yes --deps       # native edition, install the build packages, default settings
-./install.sh --python --yes              # the Python/Qt edition
-./install.sh --native --prefix /usr/local --no-default-terminal
-./install.sh --uninstall                 # asks which edition (--native / --python picks one, --purge also deletes your saved data)
+./install.sh --yes --deps                # install the build packages, build, install with the default settings
+./install.sh --yes --prefix /usr/local --no-default-terminal
+./install.sh --uninstall                 # --purge also deletes your saved data
 ./install.sh --dry-run                   # show what would be run, change nothing
 ```
 
-Both editions provide the same `lestrix` command, so installing one replaces the other. The native installer is `native/install.sh` and the Python one is `install-python.sh`; the dialog installer calls them. Run it from the application menu or with `lestrix`; it is safe to re-run, it rebuilds and replaces the installed copy. `--no-deps` never touches system packages.
+Lestrix runs on Linux (X11 or Wayland, through SDL2); there is no Windows or macOS build yet. The installer calls `native/install.sh`, which does the build and the install and can be used directly. It is safe to re-run: it rebuilds and replaces the installed copy. `--no-deps` never touches system packages.
 
-By default it also sets Lestrix as the default terminal, with settings that need no privileges where possible: the first entry in `~/.config/xdg-terminals.list` (the xdg-terminal-exec convention), GNOME's default-terminal setting, Xfce's preferred terminal, and KDE's `TerminalApplication`; on Debian and Ubuntu it also registers the `x-terminal-emulator` alternative, which needs `sudo`. It prints each thing it changed, and uninstalling gives them back (only entries that point at Lestrix are touched). The native edition also installs `lxcat`, the fast `cat` described below.
+By default it also sets Lestrix as the default terminal, with settings that need no privileges where possible: the first entry in `~/.config/xdg-terminals.list` (the xdg-terminal-exec convention), GNOME's default-terminal setting, Xfce's preferred terminal, and KDE's `TerminalApplication`; on Debian and Ubuntu it also registers the `x-terminal-emulator` alternative, which needs `sudo`. It prints each thing it changed, and uninstalling gives them back (only entries that point at Lestrix are touched). It also installs `lxcat`, the fast `cat` described below.
 
 **Uninstall**
 
@@ -70,7 +69,7 @@ Connections live in `~/.config/lestrix/connections.json`. No passwords are saved
 
 ## Under the hood
 
-The repository holds two implementations. The **native edition** in `native/` is plain C (GNU C11, not C++): its own terminal engine, its own widget toolkit, drawing and text rendering on SDL2 (windowing and input) and OpenGL 3.3, FreeType and fontconfig for fonts, and `libcurl` for FTP. The Python/Qt version in `lestrix/` is the earlier prototype where the features were worked out.
+The program lives in `native/` and is plain C (GNU C11, not C++): its own terminal engine, its own widget toolkit, drawing and text rendering on SDL2 (windowing and input) and OpenGL (3.3, ES 3.0 or ES 2.0), FreeType and fontconfig for fonts, and `libcurl` for FTP. (An earlier Python/Qt prototype where the features were worked out was removed in 0.2.2; it is still in the git history before commit `26beddf`.)
 
 ### Speed is a feature
 
@@ -315,7 +314,7 @@ Protocols: SSH with the system `ssh` (agent, keys, ProxyJump, X11 all work), SFT
 
 Run `make test` in `native/` for the core, compressor and parser tests under ASan/UBSan and TSan, a 1500-stream comparison with pyte, SFTP, FTP and the speed gate.
 
-## Features (both editions)
+## Features
 
 - **One sidebar, two tabs.** *Sessions* holds your saved connections (searchable, grouped, with a live up/down dot). *Files* is the SFTP browser for the SSH tab you are in.
 - **File browser follows your shell.** Tick *Follow terminal path* and the browser jumps to wherever you `cd`. Drag files in to upload, right-click to download, rename, delete.
@@ -329,34 +328,6 @@ Run `make test` in `native/` for the core, compressor and parser tests under ASa
 - **GPU rendering** through OpenGL, redrawing at most once per frame, with an automatic software fallback.
 - Acts as a terminal app: it takes `-e command` like `x-terminal-emulator`, and can open a local shell on startup.
 
-## Python edition
-
-You need Python 3.10 or newer and the OpenSSH client (`ssh`, and ideally `sftp` and `scp`).
-
-**Linux and macOS**
-
-```bash
-git clone https://github.com/BeanGreen247/lestrix.git
-cd lestrix
-./install-python.sh        # per-user install, adds a menu entry (an app bundle on macOS)
-```
-
-The installer works on Debian/Ubuntu, Fedora, RHEL/Rocky/Alma, Arch and openSUSE. It finds or installs Python 3.10+, installs the Qt system libraries (it asks first, and does not ask when run as root), sets up a private virtualenv, and adds a menu entry. It is safe to re-run: running it again after a `git pull` updates the existing install in place and keeps your saved connections.
-
-Flags: `--system-deps` installs missing system packages without asking, `--no-system-deps` never touches them and just reports what is missing, `--set-default` makes Lestrix the system `x-terminal-emulator` on Debian/Ubuntu, `--uninstall` removes it. Alpine (musl) is not supported because the Qt wheels need glibc.
-
-**Windows** (PowerShell)
-
-```powershell
-.\install.ps1
-```
-
-**By hand**
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install . && .venv/bin/lestrix
-```
-
 ## Use it
 
 | Action | How |
@@ -366,7 +337,7 @@ python3 -m venv .venv && .venv/bin/pip install . && .venv/bin/lestrix
 | Local shell | `Ctrl+Shift+T`, or File > New local shell as... to pick bash, zsh, fish |
 | Switch sidebar tab | `Ctrl+Shift+B` toggles Sessions / Files; click a vertical tab on the rail to open it, click it again to fold it |
 | Rename or recolor a tab | Right-click the tab, or double-click it to rename |
-| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Cmd+C` / `Cmd+V` on macOS), middle click pastes |
+| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V`, middle click pastes |
 | Scrollback | Mouse wheel or `Shift+PageUp` / `Shift+PageDown` |
 | Font size | `Ctrl+=` and `Ctrl+-` |
 | Hide / show sidebar | `Ctrl+B`. The pin button at the top of the rail docks the panel beside the terminal (pinned) or lets it slide out over the terminal without resizing it (unpinned, closes on a click in the terminal or `Esc`) |
@@ -388,10 +359,6 @@ The terminal's `ssh` runs as an OpenSSH ControlMaster. The file browser talks ov
 
 Set **X11** to *X11 forwarding (-X)* or *Trusted X11 forwarding (-Y)* in the connection dialog, then start a graphical program in the session.
 
-- Linux: works out of the box.
-- macOS: install [XQuartz](https://www.xquartz.org/) first.
-- Windows: run an X server such as [VcXsrv](https://sourceforge.net/projects/vcxsrv/) and set `DISPLAY`.
-
 The server needs `X11Forwarding yes` in its `sshd_config`.
 
 ### Matching the fleetwm window manager
@@ -404,7 +371,7 @@ Lestrix needs OpenGL 3.3. On a machine without a GPU driver, Mesa's software ras
 
 ## Develop
 
-The native edition's tests, all in one go:
+The tests, all in one go:
 
 ```bash
 cd native
@@ -416,22 +383,12 @@ cd native
 
 It covers the terminal engine under ASan/UBSan (and against pyte), the UTF-8 fast-path fuzz test, the compressor, the engine under ThreadSanitizer, the store, transfer and FTP tests, the speed gate, and a window test (a real window driven by scripted input, under xvfb when there is no display). The exit status is 0 only if everything that ran passed.
 
-The Python edition:
-
-```bash
-.venv/bin/pip install -e '.[dev]'
-QT_QPA_PLATFORM=offscreen .venv/bin/pytest
-```
-
-The SFTP tests run against `ssh localhost` when it works without a password, and are skipped otherwise.
-
 ## Known limits
 
-- The file browser is disabled on Windows: its OpenSSH has no ControlMaster, so there is no shared connection to ride on.
+- Linux only for now: there is no Windows or macOS build (the file browser also needs OpenSSH's ControlMaster, which Windows' OpenSSH lacks).
 - Follow-path polling needs a Linux server (`/proc`); on others it relies on the shell sending `OSC 7`.
-- Sixel and image protocols are not supported, and the terminal engine ([pyte](https://github.com/selectel/pyte)) ignores a few rare escape sequences.
-- zsh and fish support was written against their documented behavior; the automated tests only cover bash and sh.
-- The Windows installer and terminal backend (ConPTY through `pywinpty`) are untested.
+- Sixel and image protocols are not supported.
+- Wayland goes through SDL's Wayland driver and has not been tested here (only X11).
 
 ## Support
 
