@@ -31,19 +31,29 @@ You need a system with OpenGL 3.3, OpenGL ES 3.0 or ES 2.0 (any GPU from the las
 
 ```bash
 git clone https://github.com/BeanGreen247/lestrix.git
-cd lestrix/native
-./install.sh --deps      # installs build packages, builds, installs to ~/.local, adds a menu entry, makes Lestrix the default terminal
+cd lestrix
+./install.sh             # a full-screen installer (dialog or whiptail): pick the edition, the options, then confirm
 ```
 
-Run it from the application menu or with `lestrix`. The installer is safe to re-run: it rebuilds and replaces the installed copy. `--prefix /usr/local` installs system-wide, `--no-deps` never touches system packages and `--no-default-terminal` leaves your terminal settings alone.
+The installer asks what you want (install, update or remove), which edition (the **native** edition, recommended: the fast C program; or the **Python/Qt** edition, which needs no compiler and also runs on Windows and macOS), and a few options: install the missing system packages, make Lestrix the default terminal, install system-wide instead of into your home folder, and run the test suite. Nothing changes until you confirm on the last screen. Without `dialog` or `whiptail`, or with `--plain`, it asks plain questions in the terminal. To skip the questions:
 
-By default it also sets Lestrix as the default terminal, with settings that need no privileges where possible: the first entry in `~/.config/xdg-terminals.list` (the xdg-terminal-exec convention), GNOME's default-terminal setting, Xfce's preferred terminal, and KDE's `TerminalApplication`; on Debian and Ubuntu it also registers the `x-terminal-emulator` alternative, which needs `sudo`. It prints each thing it changed, and `./uninstall.sh` gives them back (only entries that point at Lestrix are touched). It also installs `lxcat`, the fast `cat` described below.
+```bash
+./install.sh --native --yes --deps       # native edition, install the build packages, default settings
+./install.sh --python --yes              # the Python/Qt edition
+./install.sh --native --prefix /usr/local --no-default-terminal
+./install.sh --uninstall                 # asks which edition (--native / --python picks one, --purge also deletes your saved data)
+./install.sh --dry-run                   # show what would be run, change nothing
+```
+
+Both editions provide the same `lestrix` command, so installing one replaces the other. The native installer is `native/install.sh` and the Python one is `install-python.sh`; the dialog installer calls them. Run it from the application menu or with `lestrix`; it is safe to re-run, it rebuilds and replaces the installed copy. `--no-deps` never touches system packages.
+
+By default it also sets Lestrix as the default terminal, with settings that need no privileges where possible: the first entry in `~/.config/xdg-terminals.list` (the xdg-terminal-exec convention), GNOME's default-terminal setting, Xfce's preferred terminal, and KDE's `TerminalApplication`; on Debian and Ubuntu it also registers the `x-terminal-emulator` alternative, which needs `sudo`. It prints each thing it changed, and uninstalling gives them back (only entries that point at Lestrix are touched). The native edition also installs `lxcat`, the fast `cat` described below.
 
 **Uninstall**
 
 ```bash
-./uninstall.sh           # removes the binary, menu entry, icon and build output; keeps your connections
-./uninstall.sh --purge   # also deletes saved connections, settings and leftover history files
+./install.sh --uninstall # or ./native/uninstall.sh: removes the binary, menu entry, icon and build output; keeps your connections
+./install.sh --uninstall --purge   # also deletes saved connections, settings and leftover history files
 ```
 
 ## Using it
@@ -328,7 +338,7 @@ You need Python 3.10 or newer and the OpenSSH client (`ssh`, and ideally `sftp` 
 ```bash
 git clone https://github.com/BeanGreen247/lestrix.git
 cd lestrix
-./install.sh                # per-user install, adds a menu entry (an app bundle on macOS)
+./install-python.sh        # per-user install, adds a menu entry (an app bundle on macOS)
 ```
 
 The installer works on Debian/Ubuntu, Fedora, RHEL/Rocky/Alma, Arch and openSUSE. It finds or installs Python 3.10+, installs the Qt system libraries (it asks first, and does not ask when run as root), sets up a private virtualenv, and adds a menu entry. It is safe to re-run: running it again after a `git pull` updates the existing install in place and keeps your saved connections.
