@@ -1,26 +1,31 @@
 #!/bin/bash
-# benchmark - the Lestrix terminal benchmark.
-#
-# Runs the same tests in Lestrix and every other installed terminal, one after another, and writes a summary table:
-#   1. everyday workloads: a 107 MB log, 40 MB of colour text, 30 MB of Unicode, `seq 1 4000000`, 1,500 full-screen redraws
-#   2. big files of random text, listed with cat/head: 128 MB, 256 MB, 512 MB, 768 MB, 1 GB and 2 GB
-#   3. refterm's stress files: 1 GB of random letters with no newline (one endless wrapped line) and 1 GB with a newline about every 27
-#      characters (the "-longline" and "-manyline" tests of Casey Muratori's refterm)
-#   4. start-up time, resting and peak memory, idle CPU
-# Each terminal's window opens on your screen, prints the total sink time and speed of every test, and closes itself.
-# Leave the windows alone while a run is going. The 2 GB test takes minutes in the slower terminals.
-#
-# usage: ./benchmark [--terminals "lestrix alacritty ..."] [--sizes "128 256 512 768 1024 2048"] [--no-workloads] [--no-sizes] [--no-refterm] [--refterm-mb MB]
-#                    [--quick] [--open browser|editor|terminal] [--dir DIR] [--results DIR] [--flags "lestrix flags"] [--summary-only]
-#   --quick          only the 128 MB and 256 MB files
-#   --open           when done, show summary.md in the browser (a private window with a throw-away profile; everything temporary is
-#                    deleted when you close it), the default text editor (xdg-open) or the terminal editor ($VISUAL/$EDITOR)
-#   --dir            where the test file goes (default ~/.cache/lestrix-bench, on disk). Only one test file exists at a time: it is made
-#                    just before its test and deleted right after, so it needs room for the largest one (2 GB) and nothing stays in memory
-#   --flags          extra flags for Lestrix, e.g. --flags "--max-fps 0 --read-delay 0"
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
+usage() {
+    cat <<'USAGE'
+benchmark - the Lestrix terminal benchmark.
+
+Runs the same tests in Lestrix and every other installed terminal, one after another, and writes a summary table:
+  1. everyday workloads: a 107 MB log, 40 MB of colour text, 30 MB of Unicode, `seq 1 4000000`, 1,500 full-screen redraws
+  2. big files of random text, listed with cat/head: 128 MB, 256 MB, 512 MB, 768 MB, 1 GB and 2 GB
+  3. refterm's stress files: 1 GB of random letters with no newline (one endless wrapped line) and 1 GB with a newline about every 27
+     characters (the "-longline" and "-manyline" tests of Casey Muratori's refterm)
+  4. start-up time, resting and peak memory, idle CPU
+Each terminal's window opens on your screen, prints the total sink time and speed of every test, and closes itself.
+Leave the windows alone while a run is going. The 2 GB test takes minutes in the slower terminals.
+
+usage: ./benchmark [--terminals "lestrix alacritty ..."] [--sizes "128 256 512 768 1024 2048"] [--no-workloads] [--no-sizes] [--no-refterm] [--refterm-mb MB]
+                   [--quick] [--open browser|editor|terminal] [--dir DIR] [--results DIR] [--flags "lestrix flags"] [--summary-only]
+  --quick          only the 128 MB and 256 MB files
+  --open           when done, show summary.md in the browser (a private window with a throw-away profile; everything temporary is
+                   deleted when you close it), the default text editor (xdg-open) or the terminal editor ($VISUAL/$EDITOR)
+  --dir            where the test file goes (default ~/.cache/lestrix-bench, on disk). Only one test file exists at a time: it is made
+USAGE
+}
 here=$(cd "$(dirname "$0")" && pwd)
 dir=${XDG_CACHE_HOME:-$HOME/.cache}/lestrix-bench; results=$here/bench/results
-[ -w "$here/bench" ] || results=${XDG_STATE_HOME:-$HOME/.local/state}/lestrix/bench-results   # installed copy: results go to the user's state dir
+[ -w "$here/bench" ] || results=${XDG_STATE_HOME:-$HOME/.local/state}/lestrix/bench-results
 lx=${LESTRIX_BIN:-$here/build/lestrix}; [ -x "$lx" ] || lx=$(command -v lestrix)
 lxcat_bin=$here/build/lxcat; [ -x "$lxcat_bin" ] || lxcat_bin=$(dirname "$lx")/lxcat; [ -x "$lxcat_bin" ] || lxcat_bin=$(command -v lxcat)
 openmode=""
@@ -30,7 +35,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --terminals) terms=$2; shift ;; --sizes) sizes=$2; shift ;; --no-workloads) workloads=0 ;; --no-refterm) refterm=0 ;; --refterm-mb) refmb=$2; shift ;; --no-sizes) bigfiles=0 ;;
     --quick) sizes="128 256"; refmb=128 ;; --dir) dir=$2; shift ;; --results) results=$2; shift ;; --flags) flags=$2; shift ;;
-    --summary-only) summary_only=1 ;; --open) openmode=$2; shift ;; -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --summary-only) summary_only=1 ;; --open) openmode=$2; shift ;; -h|--help) usage; exit 0 ;;
     *) echo "unknown option $1 (see --help)"; exit 2 ;;
   esac; shift
 done
@@ -58,7 +63,25 @@ def table(title, rows, cell):
         best = min(nums)
         out.append("| " + r + " | " + " | ".join(("**%s**" % v) if n == best and best < 1e18 else v for v, n in zip(vals, nums)) + " |")
     return "\n".join(out) + "\n"
-out = ["# Benchmark results", ""]
+def sysfs(path):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return ""
+
+def cpu_model():
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown CPU"
+
+gov = sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") or "unknown"
+epp = sysfs("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")
+drv = sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver")
+out = ["# Benchmark results", "", "Machine: %s, %d threads, CPU governor `%s`%s%s" % (cpu_model(), os.cpu_count() or 0, gov, (" (energy preference `%s`)" % epp) if epp else "", (", driver `%s`" % drv) if drv else ""), ""]
 wk = [w for w in order if any(w in data[t] for t in terms)]
 if wk:
     out.append(table("Total sink time, everyday workloads (seconds, lower is better)", wk, lambda r: "%.2f" % (int(r["wall_ms"]) / 1000) if "wall_ms" in r else "-"))
@@ -78,10 +101,11 @@ for k, label in (("startup_s", "Start-up to first prompt (s)"), ("rss_rest_mb", 
     out.append("| " + label + " | " + " | ".join(meta[t].get(k, "-") for t in terms) + " |")
 open(os.path.join(root, "summary.md"), "w").write("\n".join(out) + "\n")
 print("\n".join(out))
+
+
 PY
 }
 
-# Open FILE in a private window of a separate browser instance with a throw-away profile, wait until it is closed, then delete the profile.
 private_browser() {
   local url="file://$1" prof="$view/profile" b
   for b in google-chrome google-chrome-stable chromium chromium-browser brave-browser; do
@@ -132,6 +156,8 @@ page = ("<!doctype html><meta charset=utf-8><title>Lestrix benchmark</title><sty
         "table{border-collapse:collapse;margin:.5em 0 1.5em}td,th{border:1px solid #8884;padding:.3em .7em;text-align:right}th:first-child,td:first-child{text-align:left}"
         "@media(prefers-color-scheme:dark){body{background:#161616;color:#ddd}}</style>" + "\n".join(out))
 open(outpath, "w").write(page)
+
+
 PY
       private_browser "$view/summary.html" ;;
     editor) xdg-open "$md" >/dev/null 2>&1 || ${VISUAL:-${EDITOR:-$(command -v nano || command -v vi)}} "$md" ;;
@@ -141,7 +167,6 @@ PY
 
 view=""
 cleanup_view() { [ -n "$view" ] && [ -d "$view" ] && rm -rf "$view"; view=""; }
-# run.sh deletes each test file as soon as its test is done; this removes what could be left behind (an interrupted test, the generator binary)
 cleanup_files() {
   rm -f "$dir"/test-*.txt "$dir/gen_random"; rmdir "$dir" 2>/dev/null
   rm -rf "${TMPDIR:-/tmp}/lestrix-bench-cfg"
@@ -155,7 +180,7 @@ mkdir -p "$dir" "$results"
 genr=$here/build/gen_random
 if [ ! -x "$genr" ]; then genr=$dir/gen_random; [ -x "$genr" ] || cc -O2 -o "$genr" "$here/bench/gen_random.c" || { echo "need a C compiler to build the test-file generator"; exit 1; }; fi
 [ -x "$lx" ] || { echo "cannot find the lestrix binary (set LESTRIX_BIN)"; exit 1; }
-specs=()   # what to run; run.sh makes each test's file when it gets to it and deletes it afterwards
+specs=()
 [ "$workloads" = 1 ] && for w in log colour unicode seq redraw; do specs+=("w:$w"); done
 [ "$bigfiles" = 1 ] && for s in $sizes; do specs+=("r:$s"); done
 [ "$refterm" = 1 ] && for m in longline manyline; do specs+=("t:$m:$refmb"); done
@@ -184,7 +209,7 @@ for t in $terms; do
   launch "$t" >/dev/null 2>&1 &
   p=$!
   until grep -q done=1 "$results/$t/_meta.txt" 2>/dev/null; do sleep 2; kill -0 $p 2>/dev/null || break; done
-  for i in 1 2 3 4 5 6; do kill -0 $p 2>/dev/null || break; sleep 1; done   # it closes itself; only force it if it did not
+  for i in 1 2 3 4 5 6; do kill -0 $p 2>/dev/null || break; sleep 1; done
   kill $p 2>/dev/null; wait $p 2>/dev/null
 done
 summarise

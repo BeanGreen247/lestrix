@@ -1,4 +1,8 @@
-/* Unit tests for the terminal core: behaviour where it follows xterm rather than pyte. */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "../src/vt.h"
 
 #include <stdio.h>
@@ -14,13 +18,12 @@ typedef int gboolean;
 
 static void feed(Vt *t, const char *s) { vt_feed(t, (const uint8_t *)s, strlen(s)); }
 
-/* row text, trailing blanks trimmed */
 static void row_text(Vt *t, int idx, char *out, size_t cap) {
     int len = 0;
     VtCell *l = vt_line(t, idx, &len);
     size_t o = 0;
     for (int x = 0; l && x < vt_cols(t) && o + 4 < cap; x++) {
-        if (x >= len) { out[o++] = ' '; continue; }   /* history lines are stored trimmed */
+        if (x >= len) { out[o++] = ' '; continue; }
         if (VT_CELL_FLAGS(l[x]) & VT_F_TAIL) continue;
         uint32_t c = VT_CELL_CH(l[x]) ? VT_CELL_CH(l[x]) : ' ';
         if (c < 0x80) out[o++] = (char)c;
@@ -47,7 +50,7 @@ static void test_basic_and_wrap(void) {
     feed(t, "hello\r\nworld");
     ROW(t, 0, "hello"); ROW(t, 1, "world");
     CHECK(vt_cursor_x(t) == 5 && vt_cursor_y(t) == 1);
-    feed(t, "0123456789AB");  /* wraps */
+    feed(t, "0123456789AB");
     ROW(t, 1, "world01234"); ROW(t, 2, "56789AB");
     vt_free(t);
 }
@@ -55,7 +58,6 @@ static void test_basic_and_wrap(void) {
 static void test_scrollback_ring(void) {
     Vt *t = vt_new(8, 3, 5);
     for (int i = 0; i < 12; i++) { char b[16]; snprintf(b, sizeof b, "L%d\r\n", i); feed(t, b); }
-    /* 12 lines + the blank cursor line: screen shows L10,L11,blank; history keeps only the newest 5 */
     ROW(t, 0, "L10"); ROW(t, 1, "L11"); ROW(t, 2, "");
     CHECK(vt_history_count(t) == 5);
     ROW(t, -1, "L9"); ROW(t, -5, "L5");
@@ -66,22 +68,22 @@ static void test_scrollback_ring(void) {
 static void test_insert_delete_lines(void) {
     Vt *t = vt_new(6, 5, 20);
     feed(t, "a\r\nb\r\nc\r\nd\r\ne");
-    feed(t, "\x1b[2;1H\x1b[L");   /* IL at row 2 */
+    feed(t, "\x1b[2;1H\x1b[L");
     ROW(t, 0, "a"); ROW(t, 1, ""); ROW(t, 2, "b"); ROW(t, 3, "c"); ROW(t, 4, "d");
-    CHECK(vt_history_count(t) == 0); /* region edits never reach scrollback */
-    feed(t, "\x1b[M");             /* DL */
+    CHECK(vt_history_count(t) == 0);
+    feed(t, "\x1b[M");
     ROW(t, 1, "b"); ROW(t, 2, "c"); ROW(t, 3, "d"); ROW(t, 4, "");
     vt_free(t);
 }
 
 static void test_edit_chars_at_pending_wrap(void) {
     Vt *t = vt_new(5, 2, 0);
-    feed(t, "abcde");                 /* cursor now pending-wrap past column 5 */
-    feed(t, "\x1b[P");                /* DCH deletes the last cell, like xterm */
+    feed(t, "abcde");
+    feed(t, "\x1b[P");
     ROW(t, 0, "abcd");
-    feed(t, "\x1b[1;2H\x1b[2@");      /* ICH 2 at column 2 */
+    feed(t, "\x1b[1;2H\x1b[2@");
     ROW(t, 0, "a  bc");
-    feed(t, "\x1b[1;1H\x1b[3X");      /* ECH 3 */
+    feed(t, "\x1b[1;1H\x1b[3X");
     ROW(t, 0, "   bc");
     feed(t, "\x1b[K");
     ROW(t, 0, "");
@@ -91,12 +93,12 @@ static void test_edit_chars_at_pending_wrap(void) {
 static void test_scroll_region(void) {
     Vt *t = vt_new(6, 5, 20);
     feed(t, "1\r\n2\r\n3\r\n4\r\n5");
-    feed(t, "\x1b[2;4r");            /* region rows 2-4, cursor homes */
+    feed(t, "\x1b[2;4r");
     CHECK(vt_cursor_x(t) == 0 && vt_cursor_y(t) == 0);
-    feed(t, "\x1b[4;1H\n");           /* LF at the bottom margin scrolls the region only */
+    feed(t, "\x1b[4;1H\n");
     ROW(t, 0, "1"); ROW(t, 1, "3"); ROW(t, 2, "4"); ROW(t, 3, ""); ROW(t, 4, "5");
     CHECK(vt_history_count(t) == 0);
-    feed(t, "\x1b[2;1H\x1bM");        /* RI at the top margin scrolls down */
+    feed(t, "\x1b[2;1H\x1bM");
     ROW(t, 1, ""); ROW(t, 2, "3"); ROW(t, 3, "4");
     vt_free(t);
 }
@@ -108,7 +110,7 @@ static void test_save_restore(void) {
     feed(t, "X");
     VtCell *l = vt_line(t, 1, NULL);
     CHECK(VT_CELL_CH(l[4]) == 'X' && vt_style(t, VT_CELL_STYLE(l[4]))->fg == VT_COLOR_IDX(1));
-    feed(t, "\x1b" "8\x1b" "8");      /* restoring twice is fine */
+    feed(t, "\x1b" "8\x1b" "8");
     CHECK(vt_cursor_x(t) == 4 && vt_cursor_y(t) == 1);
     vt_free(t);
 }
@@ -144,12 +146,11 @@ static void test_colours(void) {
 
 static void test_wide_and_combining(void) {
     Vt *t = vt_new(10, 2, 0);
-    feed(t, "\xe6\xbc\xa2" "a" "e\xcc\x81");           /* wide, a, e + U+0301 */
+    feed(t, "\xe6\xbc\xa2" "a" "e\xcc\x81");
     VtCell *l = vt_line(t, 0, NULL);
     CHECK((VT_CELL_FLAGS(l[0]) & VT_F_WIDE) && VT_CELL_CH(l[0]) == 0x6f22 && (VT_CELL_FLAGS(l[1]) & VT_F_TAIL));
     CHECK(VT_CELL_CH(l[2]) == 'a' && VT_CELL_CH(l[3]) == 'e' && vt_comb_char(t, VT_CELL_COMB(l[3])) == 0x301);
     CHECK(vt_cursor_x(t) == 4);
-    /* a combining mark at the end of a line does not wrap */
     feed(t, "\r\n12345678" "9" "e\xcc\x81");
     CHECK(vt_cursor_y(t) == 1 && vt_cursor_x(t) == 10);
     vt_free(t);
@@ -193,7 +194,7 @@ static void test_modes(void) {
 static void test_resize(void) {
     Vt *t = vt_new(10, 4, 20);
     feed(t, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
-    vt_resize(t, 6, 3);                   /* cursor stays visible; top rows move to history */
+    vt_resize(t, 6, 3);
     ROW(t, 2, "five");
     CHECK(vt_cursor_y(t) == 2);
     CHECK(vt_history_count(t) >= 2);
@@ -209,7 +210,7 @@ static void test_utf8_split_and_invalid(void) {
     vt_feed(t, (const uint8_t *)"\xa2z", 2);
     VtCell *l = vt_line(t, 0, NULL);
     CHECK(VT_CELL_CH(l[0]) == 0x6f22 && VT_CELL_CH(l[2]) == 'z');
-    feed(t, "\xff!");                      /* invalid byte becomes U+FFFD */
+    feed(t, "\xff!");
     CHECK(VT_CELL_CH(l[3]) == 0xFFFD && VT_CELL_CH(l[4]) == '!');
     vt_free(t);
 }
@@ -228,17 +229,15 @@ static void test_compact_history_and_styles(void) {
     CHECK(vt_history_count(t) == 1000);
     int len = 0;
     VtCell *h = vt_line(t, -1, &len);
-    CHECK(h && len == 41);                          /* trailing blanks are not stored */
+    CHECK(h && len == 41);
     size_t used = vt_memory_used(t);
-    CHECK(used < 1000 * (41 * sizeof(VtCell) + 64) + 200 * 1024);   /* ~330 KB, not 1000 * 200 cells */
-    /* identical attributes share one style id */
+    CHECK(used < 1000 * (41 * sizeof(VtCell) + 64) + 200 * 1024);
     feed(t, "\x1b[31mA\x1b[0m\x1b[31mB\x1b[0mC");
     VtCell *l = vt_line(t, vt_cursor_y(t), NULL);
     CHECK(VT_CELL_STYLE(l[0]) == VT_CELL_STYLE(l[1]) && VT_CELL_STYLE(l[1]) != VT_CELL_STYLE(l[2]));
     CHECK(VT_CELL_STYLE(l[2]) == 0);
-    /* a cell with a coloured background survives trimming when it is the last one on its line */
     feed(t, "\r\n\x1b[44m \x1b[0m");
-    for (int i = 0; i < 15; i++) feed(t, "\r\n");   /* push it into history */
+    for (int i = 0; i < 15; i++) feed(t, "\r\n");
     gboolean found = FALSE;
     for (int k = 1; k <= 20; k++) {
         h = vt_line(t, -k, &len);
@@ -253,14 +252,13 @@ static void test_scroll_keeps_caches_attached(void) {
     feed(t, "a\r\nb\r\nc");
     VtLineMeta *m1 = vt_line_meta(t, 1);
     m1->dirty = 0;
-    feed(t, "\r\nd");                              /* row 1 ("b") becomes row 0 */
+    feed(t, "\r\nd");
     VtLineMeta *now = vt_line_meta(t, 0);
-    CHECK(now == m1 && now->dirty == 0);            /* the moved line was not touched, so a renderer cache stays valid */
+    CHECK(now == m1 && now->dirty == 0);
     vt_free(t);
 }
 
 
-/* line number N of a numbered flood is stored in history; check a few at every depth */
 static void check_numbered(Vt *t, int fed, int rows, const char *what) {
     long H = vt_history_count(t);
     int bad = 0;
@@ -279,14 +277,14 @@ static void feed_numbered(Vt *t, int from, int to) {
 }
 
 static void test_history_blocks_roundtrip(void) {
-    Vt *t = vt_new(40, 5, -1);                       /* unlimited */
+    Vt *t = vt_new(40, 5, -1);
     feed_numbered(t, 0, 20000);
     VtHistoryStats st;
     vt_history_stats(t, &st);
     CHECK(st.lines == vt_history_count(t) && st.lines == 20000 - 4);
     CHECK(st.hot_lines <= 1152 && st.block_count > 100);
     check_numbered(t, 20000, 5, "unlimited");
-    CHECK(st.hot_bytes + st.packed_bytes < 20000 * 64);    /* far less than 20000 uncompressed lines */
+    CHECK(st.hot_bytes + st.packed_bytes < 20000 * 64);
     vt_free(t);
 }
 
@@ -294,36 +292,36 @@ static void test_history_limit_and_runtime_change(void) {
     Vt *t = vt_new(40, 5, 3000);
     feed_numbered(t, 0, 10000);
     long n = vt_history_count(t);
-    CHECK(n <= 3000 && n >= 3000 - 128);     /* whole blocks are dropped, so it never exceeds the limit */
+    CHECK(n <= 3000 && n >= 3000 - 128);
     check_numbered(t, 10000, 5, "limited");
-    vt_set_history(t, 500, 0, 0, true);               /* shrink at runtime */
+    vt_set_history(t, 500, 0, 0, true);
     n = vt_history_count(t);
     CHECK(n <= 500 && n >= 500 - 128);
     check_numbered(t, 10000, 5, "shrunk");
-    vt_set_history(t, -1, 0, 0, true);                /* then lift the limit */
+    vt_set_history(t, -1, 0, 0, true);
     feed_numbered(t, 10000, 30000);
     check_numbered(t, 30000, 5, "lifted");
-    vt_set_history(t, 0, 0, 0, true);                 /* and turn history off */
+    vt_set_history(t, 0, 0, 0, true);
     CHECK(vt_history_count(t) == 0);
     vt_free(t);
 }
 
 static void test_history_spill_to_disk(void) {
     Vt *t = vt_new(60, 5, -1);
-    vt_set_history(t, -1, 8 * 1024, 64u << 20, true);   /* 8 KB of memory for packed history */
+    vt_set_history(t, -1, 8 * 1024, 64u << 20, true);
     feed_numbered(t, 0, 60000);
-    for (int i = 0; i < 200; i++) { usleep(2000); vt_compact(t); }   /* let background jobs finish and spill */
+    for (int i = 0; i < 200; i++) { usleep(2000); vt_compact(t); }
     VtHistoryStats st;
     vt_history_stats(t, &st);
     CHECK(st.disk_bytes > 0);
-    CHECK(st.packed_bytes <= 8 * 1024 + 64 * 1024);       /* the newest blocks may still be pending */
-    check_numbered(t, 60000, 5, "spilled");              /* deep lines come back from the file */
+    CHECK(st.packed_bytes <= 8 * 1024 + 64 * 1024);
+    check_numbered(t, 60000, 5, "spilled");
     vt_free(t);
 }
 
 static void test_history_budgets_bound_memory(void) {
     Vt *t = vt_new(60, 5, -1);
-    vt_set_history(t, -1, 16 * 1024, 32 * 1024, true);    /* tiny memory and disk budgets: old lines must be dropped */
+    vt_set_history(t, -1, 16 * 1024, 32 * 1024, true);
     feed_numbered(t, 0, 80000);
     for (int i = 0; i < 100; i++) { usleep(2000); vt_compact(t); }
     VtHistoryStats st;
@@ -333,11 +331,11 @@ static void test_history_budgets_bound_memory(void) {
     CHECK(vt_history_count(t) > 0);
     char got[64];
     row_text(t, -1, got, sizeof got);
-    CHECK(strcmp(got, "L79995") == 0);                    /* the newest line is intact */
+    CHECK(strcmp(got, "L79995") == 0);
     vt_free(t);
 
     t = vt_new(60, 5, -1);
-    vt_set_history(t, -1, 16 * 1024, 1u << 30, false);    /* no spill: memory stays within budget by dropping */
+    vt_set_history(t, -1, 16 * 1024, 1u << 30, false);
     feed_numbered(t, 0, 80000);
     for (int i = 0; i < 100; i++) { usleep(2000); vt_compact(t); }
     vt_history_stats(t, &st);
@@ -346,7 +344,6 @@ static void test_history_budgets_bound_memory(void) {
 }
 
 static void test_budget_holds_under_flood(void) {
-    /* regression: jobs finish out of order; the memory budget must still hold and old blocks must move to disk */
     Vt *t = vt_new(80, 10, -1);
     vt_set_history(t, -1, 256 * 1024, 256u << 20, true);
     size_t worst = 0;
@@ -364,7 +361,7 @@ static void test_budget_holds_under_flood(void) {
     VtHistoryStats st;
     vt_history_stats(t, &st);
     CHECK(st.disk_bytes > 0);
-    CHECK(st.packed_bytes <= 256 * 1024 + 9 * 1024 * 1024);   /* budget plus the bounded backlog of raw blocks */
+    CHECK(st.packed_bytes <= 256 * 1024 + 9 * 1024 * 1024);
     CHECK(worst <= 256 * 1024 + 9 * 1024 * 1024);
     CHECK(st.lines == 400000 - 9);
     vt_free(t);
@@ -400,24 +397,23 @@ static void test_stream_requests(void) {
     char path[4200]; uint64_t off, len; unsigned flags;
     const char *good = "ab\x1b]7777;cat;s3cret;/tmp/a%3Bb%25c;5;9;3\acd";
     Vt *t = vt_new(40, 5, 100);
-    vt_feed(t, (const uint8_t *)good, strlen(good));   /* no token set: refused, parsing carries on */
+    vt_feed(t, (const uint8_t *)good, strlen(good));
     CHECK(!vt_take_stream(t, path, sizeof path, &off, &len, &flags));
     vt_set_stream_token(t, "s3cret");
     size_t used = vt_feed_stream(t, (const uint8_t *)good, strlen(good));
-    CHECK(used < strlen(good));   /* stopped right after the request */
+    CHECK(used < strlen(good));
     CHECK(vt_take_stream(t, path, sizeof path, &off, &len, &flags));
     CHECK(strcmp(path, "/tmp/a;b%c") == 0 && off == 5 && len == 9 && flags == 3);
     CHECK(!vt_take_stream(t, path, sizeof path, &off, &len, &flags));
-    vt_feed(t, (const uint8_t *)good + used, strlen(good) - used);   /* the rest still parses: "cd" */
+    vt_feed(t, (const uint8_t *)good + used, strlen(good) - used);
     const char *bad_token = "\x1b]7777;cat;wrong;/tmp/x;0;0;0\a", *relative = "\x1b]7777;cat;s3cret;rel/x;0;0;0\a";
     vt_feed_stream(t, (const uint8_t *)bad_token, strlen(bad_token));
     CHECK(!vt_take_stream(t, path, sizeof path, &off, &len, &flags));
-    vt_feed_stream(t, (const uint8_t *)relative, strlen(relative));   /* only absolute paths */
+    vt_feed_stream(t, (const uint8_t *)relative, strlen(relative));
     CHECK(!vt_take_stream(t, path, sizeof path, &off, &len, &flags));
     vt_free(t);
 }
 
-/* history segments: lines survive being packed whole (zero-copy), packed from a partly released segment, and a width change in between */
 static void test_history_segments(void) {
     Vt *t = vt_new(40, 5, 1400);
     char line[64];
@@ -428,7 +424,7 @@ static void test_history_segments(void) {
         vt_feed(t, (const uint8_t *)line, (size_t)n);
     }
     int hc = vt_history_count(t);
-    CHECK(hc <= 1300 && hc > 1300 - 129);   // whole blocks are dropped when the limit is crossed
+    CHECK(hc <= 1300 && hc > 1300 - 129);
     int bad = 0;
     for (int k = 1; k <= hc; k++) {
         int len = 0;

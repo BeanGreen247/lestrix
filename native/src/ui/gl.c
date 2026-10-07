@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "gl.h"
 
 GlKind sd_gl_kind = GLK_CORE;
@@ -15,7 +20,7 @@ int sd_gl_load(GlKind kind) {
     LOAD(CreateShader); LOAD(ShaderSource); LOAD(CompileShader); LOAD(GetShaderiv); LOAD(GetShaderInfoLog);
     LOAD(CreateProgram); LOAD(AttachShader); LOAD(LinkProgram); LOAD(GetProgramiv); LOAD(GetProgramInfoLog);
     LOAD(UseProgram); LOAD(DeleteShader); LOAD(DeleteProgram); LOAD(GetUniformLocation); LOAD(Uniform1i); LOAD(Uniform2f);
-    int need_vao = kind != GLK_ES2;   /* OpenGL ES 2 has neither vertex array objects nor instancing: that path expands quads on the CPU */
+    int need_vao = kind != GLK_ES2;
     { int before = bad; LOAD(GenVertexArrays); LOAD(BindVertexArray); LOAD(VertexAttribDivisor); LOAD(DrawArraysInstanced); if (!need_vao) bad = before; }
     LOAD(GenBuffers); LOAD(BindBuffer); LOAD(BufferData); LOAD(BufferSubData);
     LOAD(EnableVertexAttribArray); LOAD(VertexAttribPointer); 

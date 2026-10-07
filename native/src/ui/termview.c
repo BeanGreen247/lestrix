@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "termview.h"
 #include "workpool.h"
 
@@ -6,9 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- procedural glyphs: box drawing and block elements are exact rectangles, so they join across cells ------- */
-
-/* arms per U+2500..257F as four digits L R U D: 0 none, 1 light, 2 heavy, 3 double; a/b/c are the diagonals */
 static const char BOX[] = "11002200001100221100220000110022110022000011002201010201010202021001200110022002011002100120022010102010102020200111021101210112012202210212022210112011102110121022202120122022110121011201220111022102120222021110211012102210112021201220222011112111121122111121111211222121122121121212222122122122122222221100220000110022330000330301010303033001100330030310013003303010103030300311013303333011103330333301110333033310113033303311113333330101100110100110aaaabbbbcccc100000100100000120000020020000021200001221000021";
 
 static void fill(uint8_t *b, int w, int h, int x0, int y0, int x1, int y1) {
@@ -34,7 +36,7 @@ static bool proc_bits(uint32_t cp, int w, int h, uint8_t *b) {
         } else if (cp == 0x2594) fill(b, w, h, 0, 0, w, h / 8 ? h / 8 : 1);
         else if (cp == 0x2595) fill(b, w, h, w - (w / 8 ? w / 8 : 1), 0, w, h);
         else {
-            static const unsigned char quad[] = {4, 8, 1, 13, 9, 7, 11, 2, 6, 14};   /* UL=1 UR=2 LL=4 LR=8 */
+            static const unsigned char quad[] = {4, 8, 1, 13, 9, 7, 11, 2, 6, 14};
             unsigned m = quad[cp - 0x2596];
             int mx = w / 2, my = h / 2;
             if (m & 1) fill(b, w, h, 0, 0, mx, my);
@@ -46,7 +48,7 @@ static bool proc_bits(uint32_t cp, int w, int h, uint8_t *b) {
     }
     if (cp < 0x2500 || cp > 0x257f) return false;
     const char *e = BOX + (cp - 0x2500) * 4;
-    if (e[0] >= 'a') {   /* diagonals */
+    if (e[0] >= 'a') {
         for (int x = 0; x < w; x++) {
             int y1 = (int)lround((double)x * (h - 1) / (w > 1 ? w - 1 : 1)), y2 = h - 1 - y1;
             for (int d = 0; d < 2; d++) {
@@ -66,22 +68,20 @@ static bool proc_bits(uint32_t cp, int w, int h, uint8_t *b) {
         if (!kind) continue;
         int t = kind == 2 ? t2 : t1;
         for (int line = 0; line < (kind == 3 ? 2 : 1); line++) {
-            int off = kind == 3 ? (line ? gap : -gap) : 0;   /* double: two strokes either side of the middle */
+            int off = kind == 3 ? (line ? gap : -gap) : 0;
             int xs = cx - t / 2 + off;
             int ext_x = kind == 3 ? gap + t1 : t, ext_y = kind == 3 ? gap + t1 : t;
             (void)ext_x; (void)ext_y;
             switch (arm) {
-            case 0: fill(b, w, h, 0, cy - t / 2 + off, cx + t - t / 2 + (kind == 3 ? gap : 0), cy - t / 2 + off + t); break;   /* left */
-            case 1: fill(b, w, h, cx - t / 2 - (kind == 3 ? gap : 0), cy - t / 2 + off, w, cy - t / 2 + off + t); break;      /* right */
-            case 2: fill(b, w, h, xs, 0, xs + t, cy + t - t / 2 + (kind == 3 ? gap : 0)); break;                             /* up */
-            case 3: fill(b, w, h, xs, cy - t / 2 - (kind == 3 ? gap : 0), xs + t, h); break;                                 /* down */
+            case 0: fill(b, w, h, 0, cy - t / 2 + off, cx + t - t / 2 + (kind == 3 ? gap : 0), cy - t / 2 + off + t); break;
+            case 1: fill(b, w, h, cx - t / 2 - (kind == 3 ? gap : 0), cy - t / 2 + off, w, cy - t / 2 + off + t); break;
+            case 2: fill(b, w, h, xs, 0, xs + t, cy + t - t / 2 + (kind == 3 ? gap : 0)); break;
+            case 3: fill(b, w, h, xs, cy - t / 2 - (kind == 3 ? gap : 0), xs + t, h); break;
             }
         }
     }
     return true;
 }
-
-/* ---- row cache ------------------------------------------------------------------------------------------- */
 
 typedef struct { uint32_t gen, fontid, epoch; int cols; int n, cap; RInst v[]; } RowCache;
 
@@ -93,7 +93,6 @@ typedef struct {
 
 static void copy_free(RowCopy *c) { free(c->cells); free(c->styles); free(c->ids); free(c->comb); memset(c, 0, sizeof *c); }
 
-/* the lock is held */
 static void copy_row(Vt *vt, int idx, RowCopy *o) {
     int len = 0;
     VtCell *line = vt_line(vt, idx, &len);
@@ -155,7 +154,6 @@ static void out_add(Out *o, const RInst *i) {
     o->v[o->n++] = *i;
 }
 
-/* instances for one row, relative to the row's top-left corner */
 static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCopy *c, Out *o, bool peek, bool *miss) {
     Atlas *a = r_atlas(r);
     int cw = font_cell_w(f), ch = font_cell_h(f), asc = font_ascent(f);
@@ -191,7 +189,7 @@ static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCop
                 bool proc = (cp >= 0x2500 && cp <= 0x259f) && wcells == 1;
                 if (proc) {
                     g = atlas_find_custom(a, fid, cp);
-                    if (!g && peek) { *miss = true; goto abandon; }   /* making it needs the texture: the drawing thread redoes this row */
+                    if (!g && peek) { *miss = true; goto abandon; }
                     if (!g) {
                         if (!procbuf) procbuf = malloc((size_t)cw * ch);
                         proc_bits(cp, cw, ch, procbuf);
@@ -216,7 +214,7 @@ static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCop
         x += wcells;
     }
     if (bg_start >= 0) { r_make_rect(r, &inst, (float)(bg_start * cw), 0, (float)((bg_end - bg_start) * cw), (float)ch, bg_col); out_add(o, &inst); }
-    for (int i = 0; i < fgl.n; i++) out_add(o, &fgl.v[i]);   /* backgrounds first, then everything drawn over them */
+    for (int i = 0; i < fgl.n; i++) out_add(o, &fgl.v[i]);
 abandon:
     free(fgl.v);
     free(procbuf);
@@ -292,7 +290,7 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
 
         Out outs[MAX_ROWS];
         memset(outs, 0, sizeof outs);
-        {   /* the rows are independent: helper threads build them from the atlas as it is, the drawing thread redoes any row that needs a glyph made */
+        {
             int todo[MAX_ROWS], nt = 0;
             for (int row = 0; row < rows; row++) if (need[row]) todo[nt++] = row;
             bool missed[MAX_ROWS];
@@ -311,7 +309,7 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
             for (int k = 0; k < nt; k++) copy_free(&copies[todo[k]]);
         }
         bool reset = atlas_generation(a) != gen0;
-        if (reset && attempt == 0) {   /* the atlas filled up and was cleared while building: every quad made so far is stale */
+        if (reset && attempt == 0) {
             for (int row = 0; row < rows; row++) free(outs[row].v);
             tcore_lock(t);
             vt_mark_all_dirty(vt);
@@ -323,9 +321,9 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
         for (int row = 0; row < rows; row++) {
             if (!need[row]) continue;
             VtLineMeta *m = metas[row];
-            if (m && !m->dirty && !reset) {   /* unchanged since it was copied: keep the instances for the next frame */
+            if (m && !m->dirty && !reset) {
                 RowCache *rc = m->cache;
-                if (rc && rc->cap >= outs[row].n && rc->cap <= outs[row].n + 64) sd_cache.row_recycle++;   /* same block reused: no free/malloc */
+                if (rc && rc->cap >= outs[row].n && rc->cap <= outs[row].n + 64) sd_cache.row_recycle++;
                 else {
                     int cap = outs[row].n + 16;
                     RowCache *nr = malloc(sizeof(RowCache) + (size_t)cap * sizeof(RInst));
@@ -342,7 +340,6 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
         break;
     }
 
-    /* selection */
     int ai, ac, bi, bc;
     if (tcore_selection(t, &ai, &ac, &bi, &bc)) {
         for (int row = 0; row < rows; row++) {
@@ -352,7 +349,6 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
             r_rect(r, ox + (float)(lo * cw), oy + (float)(row * ch), (float)((hi - lo + 1) * cw), (float)ch, pal->sel);
         }
     }
-    /* cursor */
     if (cursor_x >= 0 && cursor_y >= 0 && cursor_y < rows) {
         float cx = ox + (float)(cursor_x * cw), cy = oy + (float)(cursor_y * ch);
         uint32_t col = (pal->cursor & 0x00ffffffu) | (217u << 24);
@@ -364,7 +360,7 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
             else if (cursor_style == 5 || cursor_style == 6) r_rect(r, cx, cy, 2, (float)ch, col);
             else {
                 r_rect(r, cx, cy, (float)cw, (float)ch, col);
-                uint32_t cp = VT_CELL_CH(cur_cell);   /* the character under a block cursor is drawn in the background colour */
+                uint32_t cp = VT_CELL_CH(cur_cell);
                 if (cp > 0x20) {
                     const AtlasGlyph *g = atlas_glyph(a, f, cp, 0);
                     if (g && !g->blank) { RInst i; r_make_glyph(r, &i, g, cx, cy + (float)font_ascent(f), pal->bg); r_push(r, &i, 1); }

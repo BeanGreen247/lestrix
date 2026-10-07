@@ -1,4 +1,8 @@
-/* uitheme.h - colours, with no toolkit types. The same theme table as the GTK build. */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #ifndef SD_UITHEME_H
 #define SD_UITHEME_H
 #include <stdbool.h>
@@ -16,7 +20,7 @@ typedef struct {
 extern const UiTheme UI_THEMES[];
 extern const int UI_THEME_COUNT;
 const UiTheme *ui_theme_find(const char *name);
-uint32_t ui_rgba(const char *hex, int alpha);              /* "#rrggbb" */
-uint32_t ui_mix(uint32_t a, uint32_t b, double f);          /* blend toward b */
+uint32_t ui_rgba(const char *hex, int alpha);
+uint32_t ui_mix(uint32_t a, uint32_t b, double f);
 void ui_palette(TermPalette *p, const UiTheme *t, const char *accent);
 #endif

@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "uitheme.h"
 
 #include <stdio.h>
@@ -29,7 +34,6 @@ const UiTheme UI_THEMES[] = {
      {"#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5",
       "#586e75", "#cb4b16", "#93a1a1", "#a58a2a", "#839496", "#6c71c4", "#35b8ae", "#fdf6e3"},
      "#859900", "#dc322f", "#268bd2", "#dc322f"},
-    /* fleetwm's five themes: its bg_primary / bg_secondary / fg_primary / accent, with terminal palettes to match */
     {"fleetwm Dark", true, "#181825", "#1e1e2e", "#181825", "#cdd6f4", "#89b4fa", "#1e1e2e", "#cdd6f4",
      {"#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de",
       "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#a6adc8"},
@@ -60,7 +64,7 @@ const UiTheme *ui_theme_find(const char *name) {
 }
 
 uint32_t ui_rgba(const char *hex, int alpha) {
-    unsigned r = 255, g = 0, b = 255;   /* a bad colour shows up as magenta */
+    unsigned r = 255, g = 0, b = 255;
     if (hex && *hex == '#' && strlen(hex) >= 7) sscanf(hex + 1, "%2x%2x%2x", &r, &g, &b);
     return RGBA(r, g, b, alpha);
 }

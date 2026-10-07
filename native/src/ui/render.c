@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "render.h"
 
 #include <stdio.h>
@@ -6,9 +11,8 @@
 
 #include "gl.h"
 
-/* OpenGL ES 2 has no instancing, so each quad becomes four vertices of this shape */
 typedef struct { float x, y, u, v; uint32_t rgba; float lx, ly, sw, sh, ar, ab; } V2;
-#define MAXQ 16384   /* quads per draw call: 4 * MAXQ vertices must fit 16-bit indices */
+#define MAXQ 16384
 
 struct Renderer {
     Atlas *atlas;
@@ -22,7 +26,6 @@ struct Renderer {
     int clip_on, cx, cy, cw, ch;
 };
 
-/* the shared fragment body: plain glyph/rectangle quads, plus rounded and outlined rectangles from a signed distance */
 #define SDF_BODY \
     "  float a = TEX(u_atlas, v_uv).r;\n" \
     "  if (v_aux.x + v_aux.y > 0.0) {\n" \
@@ -35,7 +38,6 @@ struct Renderer {
     "    a *= cov;\n" \
     "  }\n"
 
-/* desktop OpenGL 3.3 core and OpenGL ES 3.0 share one source apart from the first lines */
 static const char *VS3 =
     "layout(location=0) in vec4 a_rect;\n"
     "layout(location=1) in vec4 a_uv;\n"
@@ -62,7 +64,6 @@ static const char *FS3 =
     "  o = vec4(v_col.rgb, v_col.a * a);\n"
     "}\n";
 
-/* OpenGL ES 2.0 (Raspberry Pi 2/3, Mali-T6xx): attributes and varyings, no gl_VertexID, per-vertex data */
 static const char *VS2 =
     "#version 100\n"
     "attribute vec2 a_pos; attribute vec2 a_uv; attribute vec4 a_col; attribute vec2 a_local; attribute vec2 a_size; attribute vec2 a_aux;\n"
@@ -99,7 +100,6 @@ static GLuint compile(GLenum kind, const char *src) {
     return s;
 }
 
-/* the GLSL version line for the desktop 3.3 core and ES 3.0 variants */
 static const char *glsl_head(void) {
     return sd_gl_kind == GLK_ES3 ? "#version 300 es\nprecision highp float;\nprecision highp int;\n" : "#version 330 core\n";
 }
@@ -131,7 +131,7 @@ Renderer *r_new(Atlas *a) {
     r->prog = gl.CreateProgram();
     gl.AttachShader(r->prog, vs);
     gl.AttachShader(r->prog, fs);
-    if (sd_gl_kind == GLK_ES2) {   /* no layout(location=...) in GLSL ES 1.00 */
+    if (sd_gl_kind == GLK_ES2) {
         static const char *const names[] = {"a_pos", "a_uv", "a_col", "a_local", "a_size", "a_aux"};
         for (GLuint i = 0; i < 6; i++) gl.BindAttribLocation(r->prog, i, names[i]);
     }
@@ -145,7 +145,6 @@ Renderer *r_new(Atlas *a) {
     r->u_atlas = gl.GetUniformLocation(r->prog, "u_atlas");
     gl.GenBuffers(1, &r->vbo);
     if (sd_gl_kind == GLK_ES2) {
-        /* a fixed index pattern for MAXQ quads: two triangles each over the four corners (0,0) (1,0) (0,1) (1,1) */
         uint16_t *idx = malloc((size_t)MAXQ * 6 * sizeof *idx);
         r->v2 = malloc((size_t)MAXQ * 4 * sizeof *r->v2);
         if (!idx || !r->v2) { free(idx); free(r->v2); free(r); return NULL; }
@@ -198,7 +197,6 @@ void r_begin(Renderer *r, int w, int h, uint32_t clear_rgba) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
-/* OpenGL ES 2: no instancing, so every instance is expanded into four vertices and drawn with an index pattern */
 static void flush_es2(Renderer *r) {
     gl.BindBuffer(GL_ARRAY_BUFFER, r->vbo);
     gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, r->ibo);
@@ -242,7 +240,7 @@ void r_flush(Renderer *r) {
     gl.BindBuffer(GL_ARRAY_BUFFER, r->vbo);
     size_t bytes = r->n * sizeof(RInst);
     if (bytes > r->vbo_cap) { r->vbo_cap = bytes * 2; gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)r->vbo_cap, NULL, GL_STREAM_DRAW); }
-    else gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)r->vbo_cap, NULL, GL_STREAM_DRAW);   /* orphan the old storage */
+    else gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)r->vbo_cap, NULL, GL_STREAM_DRAW);
     gl.BufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)bytes, r->buf);
     gl.DrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)r->n);
     r->n = 0;
@@ -290,7 +288,7 @@ void r_make_rect(Renderer *r, RInst *o, float x, float y, float w, float h, uint
     uint16_t wx, wy;
     atlas_white(r->atlas, &wx, &wy);
     float inv = 65535.f / (float)atlas_size(r->atlas);
-    uint16_t u = (uint16_t)((wx + 1) * inv), v = (uint16_t)((wy + 1) * inv);   /* the middle of the 2x2 white block */
+    uint16_t u = (uint16_t)((wx + 1) * inv), v = (uint16_t)((wy + 1) * inv);
     *o = (RInst){x, y, w, h, u, v, u, v, rgba, 0};
 }
 
@@ -301,7 +299,6 @@ void r_make_glyph(Renderer *r, RInst *o, const AtlasGlyph *g, float pen_x, float
                  (uint16_t)((g->x + g->w) * inv + 0.5f), (uint16_t)((g->y + g->h) * inv + 0.5f), rgba, 0};
 }
 
-/* radius and border width in pixels (0..255); border 0 = filled */
 void r_rrect(Renderer *r, float x, float y, float w, float h, uint32_t rgba, int radius, int border) {
     RInst i;
     r_make_rect(r, &i, x, y, w, h, rgba);

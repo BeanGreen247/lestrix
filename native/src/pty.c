@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #define _GNU_SOURCE
 #include <stdbool.h>
 #include "pty.h"
@@ -13,8 +18,6 @@
 
 extern char **environ;
 
-/* The environment is built before fork(): other threads may be running, and the child must not
- * touch the allocator or other locks between fork and exec. */
 static char **build_env(char *const extra[]) {
     size_t n = 0;
     while (environ && environ[n]) n++;
@@ -25,7 +28,7 @@ static char **build_env(char *const extra[]) {
     for (size_t i = 0; i < n; i++) {
         const char *e = environ[i];
         if (!strncmp(e, "TERM=", 5) || !strncmp(e, "COLORTERM=", 10)) continue;
-        bool shadowed = false;   /* an extra variable with the same name replaces the inherited one (getenv would find the first) */
+        bool shadowed = false;
         for (size_t x = 0; extra && extra[x] && !shadowed; x++) {
             const char *eq = strchr(extra[x], '=');
             if (eq && !strncmp(e, extra[x], (size_t)(eq - extra[x] + 1))) shadowed = true;
@@ -52,7 +55,7 @@ int sd_pty_spawn(SdPty *p, char *const argv[], const char *cwd, char *const extr
     }
     if (pid == 0) {
         signal(SIGPIPE, SIG_DFL);
-        if (cwd && chdir(cwd) != 0) { /* fall back to the inherited directory */ }
+        if (cwd && chdir(cwd) != 0) {  }
         execvpe(argv[0], argv, env);
         _exit(127);
     }

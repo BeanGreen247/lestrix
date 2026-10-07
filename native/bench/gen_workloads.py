@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
 """Writes the everyday benchmark files used by `benchmark`: a log, colour-heavy text, Unicode text, `seq` output and
 full-screen redraws. Deterministic: the same bytes every time, so every terminal is shown identical output.
 usage: gen_workloads.py DIR [NAME...]   (NAME: log colour unicode seq redraw; default all)"""

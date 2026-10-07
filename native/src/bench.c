@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #define _DEFAULT_SOURCE
 #include "bench.h"
 
@@ -34,7 +39,7 @@ static double feed_all(const char *data, size_t len, int scrollback, size_t *mem
     double t0 = now();
     for (size_t i = 0; i < len; i += 65536) vt_feed(t, (const uint8_t *)data + i, len - i < 65536 ? len - i : 65536);
     double dt = now() - t0;
-    if (ratio) {   /* let the workers finish, then compare packed size with what the lines would take as they are */
+    if (ratio) {
         usleep(100000);
         vt_compact(t);
         VtHistoryStats st;
@@ -64,7 +69,6 @@ int sd_benchmark(FILE *out, double megabytes) {
     r = feed_all(colour, clen, 10000, &mem, &lines, NULL);
     fprintf(out, "  colour-heavy output, 10,000-line scrollback %6.0f MB/s   (%.1f MB for %ld lines)\n", r, (double)mem / 1e6, lines);
 
-    /* raw compressor speed on terminal-shaped data (the app runs one job per core) */
     size_t n = 4096 * 16, ncells = n * 8;
     uint8_t *cells = calloc(ncells, 1), *sh = malloc(ncells), *comp = malloc(sd_lz_bound(ncells));
     for (size_t i = 0; i < n; i++) { cells[i * 8] = (uint8_t)(' ' + (i * 7 + (i >> 5)) % 90); cells[i * 8 + 4] = (uint8_t)((i / 40) % 3); }

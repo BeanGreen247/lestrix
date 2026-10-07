@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Lestrix installer: a full-screen dialog installer (falls back to whiptail, then to plain questions) that installs, updates or
-# removes Lestrix. It builds the C program in native/ (SDL2/OpenGL) with native/install.sh and can make it the default terminal.
-#   ./install.sh                     the dialog installer (asks what you want)
-#   ./install.sh --yes               no questions: install with the defaults
-#   ./install.sh --uninstall         remove Lestrix (--purge also deletes saved connections and settings)
-#   --prefix DIR                     install under DIR (default /usr/local, which uses sudo; ~/.local is for your user only)
-#   --deps / --no-deps               install missing system packages / never touch them
-#   --default-terminal / --no-default-terminal   make Lestrix the default terminal (default: yes)
-#   --plain                          no dialog, ask plain questions in the terminal
-#   --dry-run                        show what would be run, change nothing
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
+usage() {
+    cat <<'USAGE'
+Lestrix installer: a full-screen dialog installer (falls back to whiptail, then to plain questions) that installs, updates or
+removes Lestrix. It builds the C program in native/ (SDL2/OpenGL) with native/install.sh and can make it the default terminal.
+  ./install.sh                     the dialog installer (asks what you want)
+  ./install.sh --yes               no questions: install with the defaults
+  ./install.sh --uninstall         remove Lestrix (--purge also deletes saved connections and settings)
+  --prefix DIR                     install under DIR (default /usr/local, which uses sudo; ~/.local is for your user only)
+  --deps / --no-deps               install missing system packages / never touch them
+  --default-terminal / --no-default-terminal   make Lestrix the default terminal (default: yes)
+  --plain                          no dialog, ask plain questions in the terminal
+  --dry-run                        show what would be run, change nothing
+USAGE
+}
 set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +35,7 @@ while [ $# -gt 0 ]; do
     --default-terminal) DEFTERM=yes ;;
     --no-default-terminal) DEFTERM=no ;;
     --purge) PURGE=1 ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -38,14 +45,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
-# ---- which interface -------------------------------------------------------------------------------------------------------------------------
 OS=$(uname -s)
 PM=""; for c in apt-get dnf yum pacman zypper brew; do have "$c" && { PM="$c"; break; }; done
 TUI=""
 pick_tui() { TUI=""; if have dialog; then TUI=dialog; elif have whiptail; then TUI=whiptail; fi; }
 if [ "$PLAIN" = 0 ] && [ "$YES" = 0 ] && [ -t 0 ] && [ -t 1 ]; then
   pick_tui
-  if [ -z "$TUI" ] && [ -n "$PM" ]; then   # the installer is a dialog program: offer to fetch dialog (the only question asked in plain text)
+  if [ -z "$TUI" ] && [ -n "$PM" ]; then
     printf 'The full-screen installer needs the "dialog" program, which is not installed.\nInstall it now with %s? [Y/n] ' "$PM"
     read -r ans
     case "${ans:-y}" in
@@ -62,14 +68,13 @@ BACKTITLE="Lestrix installer"
 TERM_ROWS=$(tput lines 2>/dev/null || echo 24); TERM_COLS=$(tput cols 2>/dev/null || echo 80)
 H=$(( TERM_ROWS > 28 ? 24 : TERM_ROWS - 4 )); W=$(( TERM_COLS > 90 ? 76 : TERM_COLS - 4 ))
 
-# dialog and whiptail write their answer to stderr; 3>&1 1>&2 2>&3 swaps it into the command substitution
-ui_msg() {   # title text
+ui_msg() {
   case "$TUI" in
     dialog|whiptail) $TUI --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" "$H" "$W" ;;
     *) printf '\n== %s ==\n%s\n' "$1" "$2" ;;
   esac
 }
-ui_yesno() {   # title text [default yes|no] -> status 0 = yes
+ui_yesno() {
   local def=${3:-yes}
   case "$TUI" in
     dialog) local d=(); [ "$def" = no ] && d=(--defaultno); dialog --backtitle "$BACKTITLE" --title "$1" "${d[@]}" --yesno "$2" "$H" "$W" ;;
@@ -80,7 +85,7 @@ ui_yesno() {   # title text [default yes|no] -> status 0 = yes
       case "${a:-}" in [Yy]*) return 0 ;; [Nn]*) return 1 ;; *) [ "$def" = yes ] ;; esac ;;
   esac
 }
-ui_radio() {   # title text tag desc on|off ... -> prints the chosen tag
+ui_radio() {
   local title=$1 text=$2; shift 2
   case "$TUI" in
     dialog|whiptail)
@@ -96,7 +101,7 @@ ui_radio() {   # title text tag desc on|off ... -> prints the chosen tag
       a=${a:-$def}; echo "${tags[$((a - 1))]:-${tags[$((def - 1))]}}" ;;
   esac
 }
-ui_check() {   # title text tag desc on|off ... -> prints the chosen tags, one per line
+ui_check() {
   local title=$1 text=$2; shift 2
   case "$TUI" in
     dialog|whiptail)
@@ -113,17 +118,15 @@ ui_check() {   # title text tag desc on|off ... -> prints the chosen tags, one p
       else for n in $a; do echo "${tags[$((n - 1))]:-}"; done; fi ;;
   esac
 }
-ui_input() {   # title text default -> prints the text typed
+ui_input() {
   case "$TUI" in
     dialog|whiptail) $TUI --backtitle "$BACKTITLE" --title "$1" --inputbox "$2" 10 "$W" "$3" 3>&1 1>&2 2>&3 ;;
     *) [ "$INTERACTIVE" = 0 ] && { echo "$3"; return 0; }; local a; printf '\n%s\n%s [%s]: ' "$1" "$2" "$3" >&2; read -r a; echo "${a:-$3}" ;;
   esac
 }
-chosen() { printf '%s\n' "$1" | grep -qx "$2"; }   # chosen "$list" tag
+chosen() { printf '%s\n' "$1" | grep -qx "$2"; }
 
-# run a command in a folder: in the dialog interface its output scrolls inside a dialog box (programbox), otherwise it goes to the terminal;
-# with --dry-run only the command is shown
-step() {   # title folder command args...
+step() {
   local title=$1 d=$2; shift 2
   if [ "$DRY" = 1 ]; then echo "[dry run] (cd $d && $*)"; return 0; fi
   if [ -z "$TUI" ]; then ( cd "$d" && "$@" ); return; fi
@@ -132,7 +135,7 @@ step() {   # title folder command args...
     dialog)
       ( cd "$d" && "$@" < /dev/null 2>&1; echo $? > "$rcf" ) | sed -u 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
         | dialog --backtitle "$BACKTITLE" --title "$title" --programbox "$H" "$W" ;;
-    whiptail)   # whiptail has no live output box: work behind a notice, then show what was printed
+    whiptail)
       local log; log=$(mktemp)
       whiptail --backtitle "$BACKTITLE" --title "$title" --infobox "Working, please wait...\n\nThis can take a minute or two." 9 "$W"
       ( cd "$d" && "$@" < /dev/null > "$log" 2>&1; echo $? > "$rcf" )
@@ -143,7 +146,6 @@ step() {   # title folder command args...
   local rc; rc=$(cat "$rcf" 2>/dev/null); rm -f "$rcf"; return "${rc:-1}"
 }
 
-# sudo asks for its password on the terminal, which would tear the dialog screen: ask for it in a dialog box once and keep it warm
 SUDO_KEEPALIVE=""
 ensure_sudo() {
   [ "$DRY" = 1 ] && return 0
@@ -164,7 +166,6 @@ ensure_sudo() {
   done
   return 1
 }
-# on the way out: stop the sudo keepalive and, after a dialog session, clear the screen so nothing of the installer is left in the terminal
 cleanup() {
   [ -n "$SUDO_KEEPALIVE" ] && kill "$SUDO_KEEPALIVE" 2>/dev/null
   if [ -n "$TUI" ] && [ "$DRY" = 0 ]; then clear 2>/dev/null || printf '\033[H\033[2J\033[3J'; fi
@@ -172,20 +173,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---- what is installed now --------------------------------------------------------------------------------------------------------------------
 BINPATH="$(command -v lestrix 2>/dev/null || true)"
 [ -z "$BINPATH" ] && [ -e "$HOME/.local/bin/lestrix" ] && BINPATH="$HOME/.local/bin/lestrix"
 CURRENT_TEXT="Lestrix is not installed yet."
 [ -n "$BINPATH" ] && CURRENT_TEXT="Lestrix is installed ($BINPATH); installing again updates it."
 
-# ---- platform -----------------------------------------------------------------------------------------------------------------------------------
 if [ "$OS" != Linux ]; then
   MSG="Lestrix has no build for $OS yet: the program uses Linux system calls (pty handling, /proc, epoll-style readers). Only Linux (X11 or Wayland) is supported for now, so nothing was changed."
   if [ -n "$TUI" ]; then ui_msg "Not supported on $OS yet" "$MSG"; else echo "$MSG" >&2; fi
   exit 1
 fi
 
-# ---- choose what to do ------------------------------------------------------------------------------------------------------------------------
 if [ -z "$ACTION" ]; then
   if [ "$INTERACTIVE" = 1 ]; then
     ui_msg "Welcome to Lestrix" "SSH sessions, SFTP/FTP and local shells in one window.\n\n$CURRENT_TEXT\n\nThis installer can install, update or remove Lestrix. Nothing is changed until you confirm on the last screen."
@@ -199,7 +197,6 @@ if [ -z "$ACTION" ]; then
 fi
 { [ "$ACTION" = quit ] || [ -z "$ACTION" ]; } && { echo "Nothing changed."; exit 0; }
 
-# ---- uninstall ------------------------------------------------------------------------------------------------------------------------------------
 if [ "$ACTION" = uninstall ]; then
   if [ "$INTERACTIVE" = 1 ] && [ "$PURGE" = 0 ]; then
     ui_yesno "Saved data" "Also delete your saved connections, settings and leftover history files?\n\nChoose No to keep them (recommended)." no && PURGE=1
@@ -216,7 +213,6 @@ if [ "$ACTION" = uninstall ]; then
   exit $rc
 fi
 
-# ---- install: options -------------------------------------------------------------------------------------------------------------------------
 RUN_TESTS=0; TEST_FAILED=0
 if [ "$INTERACTIVE" = 1 ]; then
   DEPS_ON=on; have gcc && have make && pkg-config --exists sdl2 freetype2 fontconfig glib-2.0 libcurl 2>/dev/null && DEPS_ON=off
@@ -233,9 +229,8 @@ else
   [ -z "$DEPS" ] && DEPS=ask
 fi
 [ -z "$DEFTERM" ] && DEFTERM=yes
-[ -z "$PREFIX" ] && PREFIX=/usr/local   # system-wide by default: every user of the machine gets it
+[ -z "$PREFIX" ] && PREFIX=/usr/local
 
-# ---- confirm --------------------------------------------------------------------------------------------------------------------------------------
 SUMMARY="Install to:        $PREFIX
 System packages:   ${DEPS}
 Default terminal:  ${DEFTERM}
@@ -247,7 +242,6 @@ else
   say "Installing Lestrix"
 fi
 
-# ---- run ------------------------------------------------------------------------------------------------------------------------------------
 rc=0
 a=()
 case "$DEPS" in yes) a+=(--deps) ;; no) a+=(--no-deps) ;; esac

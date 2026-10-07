@@ -1,4 +1,8 @@
-/* filespane.c - the remote file browser (SFTP / ssh fallbacks / FTP), drawn with the toolkit. */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
@@ -26,7 +30,7 @@ struct FilesPane {
     bool want_path_sync;
 };
 
-static GPtrArray *live;   /* every pane that exists: dialogs hold plain pointers and check here first */
+static GPtrArray *live;
 
 static bool pane_ok(FilesPane *f) { return live && f && g_ptr_array_find(live, f, NULL); }
 
@@ -51,8 +55,6 @@ static char *join(const char *dir, const char *name) {
     if (g_str_equal(dir, "/")) return g_strconcat("/", name, NULL);
     return g_str_has_suffix(dir, "/") ? g_strconcat(dir, name, NULL) : g_strconcat(dir, "/", name, NULL);
 }
-
-/* ---- tasks: one struct for every background operation --------------------------------------------------------------- */
 
 enum { K_LIST, K_READY, K_CWD, K_MKDIR, K_RENAME, K_DELETE, K_DOWNLOAD, K_UPLOAD };
 typedef struct { char *path; bool is_dir; } Item;
@@ -123,7 +125,6 @@ static int ent_cmp(const void *x, const void *y) {
 static void sort_entries(FilesPane *f) {
     cmp_col = f->sort_col; cmp_desc = f->sort_desc;
     if (f->n) {
-        /* keep the selection by name across the sort */
         qsort(f->ent, (size_t)f->n, sizeof *f->ent, ent_cmp);
     }
 }
@@ -203,8 +204,6 @@ static void navigate_to(FilesPane *f, const char *path) {
     task_run(t);
 }
 
-/* ---- life cycle -------------------------------------------------------------------------------------------------------------- */
-
 FilesPane *files_new(App *a, SdXfer *x, bool follow) {
     FilesPane *f = g_new0(FilesPane, 1);
     f->app = a; f->xfer = x; f->alive = true;
@@ -223,7 +222,7 @@ void files_free(FilesPane *f) {
     if (!f) return;
     g_ptr_array_remove(live, f);
     f->alive = false;
-    if (!f->refs) pane_free(f);   /* otherwise the last finishing job frees it */
+    if (!f->refs) pane_free(f);
 }
 
 bool files_follow(const FilesPane *f) { return f->follow; }
@@ -263,8 +262,6 @@ void files_tick(App *a, FilesPane *f) {
         }
     }
 }
-
-/* ---- operations ----------------------------------------------------------------------------------------------------------------- */
 
 static GPtrArray *selected(FilesPane *f) {
     GPtrArray *out = g_ptr_array_new();
@@ -399,7 +396,7 @@ static void activate(App *a, FilesPane *f, int i) {
     if (!f->path) return;
     SdEntry *e = f->ent[i];
     char *target = join(f->path, e->name);
-    if (e->is_dir || e->is_link) navigate_to(f, target);   /* a symlink to a file just fails to list and reports it */
+    if (e->is_dir || e->is_link) navigate_to(f, target);
     else {
         GPtrArray *one = g_ptr_array_new();
         g_ptr_array_add(one, e);
@@ -410,8 +407,6 @@ static void activate(App *a, FilesPane *f, int i) {
     g_free(target);
     (void)a;
 }
-
-/* ---- drawing ---------------------------------------------------------------------------------------------------------------------- */
 
 enum { M_DOWNLOAD = 1, M_UPLOAD, M_RENAME, M_DELETE, M_MKDIR, M_REFRESH, M_COPYPATH };
 #define MENU_TAG 900
@@ -440,7 +435,6 @@ void files_draw(App *a, FilesPane *f, Rect r) {
     }
     ui_rect(u, r, c->bg1);
     float pad = P(8), y = r.y + pad, bh = P(30);
-    /* toolbar */
     if (ui_icon_button(u, R(r.x + pad, y, bh, bh), IC_UP, "Parent folder", 0) && f->path && !g_str_equal(f->path, "/")) {
         char *up = g_path_get_dirname(f->path); navigate_to(f, up); g_free(up);
     }
@@ -458,7 +452,6 @@ void files_draw(App *a, FilesPane *f, Rect r) {
         if (ui_checkbox(u, R(r.x + pad, y, r.w - 2 * pad, P(24)), "Follow terminal path", &v)) { f->follow = v; if (v) f->next_poll = 0; app_settings_save(a); }
         y += P(28);
     }
-    /* header */
     float nameW = r.w - 2 * pad - P(86) - P(130);
     Rect hdr = R(r.x + pad, y, r.w - 2 * pad, P(24));
     ui_rect(u, hdr, c->bg2);
@@ -469,7 +462,7 @@ void files_draw(App *a, FilesPane *f, Rect r) {
         Rect hr = R(i == 0 ? hdr.x : hx[i] - P(6), hdr.y, i == 0 ? nameW : hw[i] + P(6), hdr.h);
         if (ui_hover(u, hr) && ui_mouse_pressed(u, 1, hr)) {
             if (f->sort_col == i) f->sort_desc = !f->sort_desc; else { f->sort_col = i; f->sort_desc = false; }
-            GPtrArray *keep = selected(f);   /* the selection follows the entries, not the rows */
+            GPtrArray *keep = selected(f);
             sort_entries(f);
             for (int k = 0; k < f->n; k++) f->sel[k] = g_ptr_array_find(keep, f->ent[k], NULL);
             g_ptr_array_free(keep, TRUE);
@@ -479,7 +472,6 @@ void files_draw(App *a, FilesPane *f, Rect r) {
         ui_text_fit(u, R(hx[i], hdr.y, hw[i], hdr.h), lab, c->muted, i == 1 ? 2 : 0);
     }
     y += hdr.h;
-    /* list */
     float sh = P(26);
     Rect list = R(r.x + pad, y, r.w - 2 * pad, r.y + r.h - y - P(28));
     float lh = P(26);
@@ -501,7 +493,7 @@ void files_draw(App *a, FilesPane *f, Rect r) {
         if (hov && (ui_mouse_pressed(u, 1, row) || ui_mouse_pressed(u, 3, row))) {
             bool right_click = ui_mouse_pressed(u, 3, row);
             int mods = SDL_GetModState();
-            if (right_click && f->sel[i]) { /* keep the multi-selection for the menu */ }
+            if (right_click && f->sel[i]) {  }
             else if (mods & KMOD_CTRL) f->sel[i] = !f->sel[i];
             else if ((mods & KMOD_SHIFT) && f->last_click >= 0) {
                 int lo = f->last_click < i ? f->last_click : i, hi = f->last_click < i ? i : f->last_click;
@@ -535,7 +527,6 @@ void files_draw(App *a, FilesPane *f, Rect r) {
         };
         ui_menu_open(u, ui_mx(u), ui_my(u), it, 3, MENU_TAG);
     }
-    /* keyboard: Delete, F2 when nothing else owns the keyboard is handled by the app; here only the pane's own shortcuts */
     (void)sh;
     ui_text_fit(u, R(r.x + pad, r.y + r.h - P(26), r.w - 2 * pad, P(24)), f->status, c->muted, 0);
 }

@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Removes everything the native Lestrix installer created.
-#   ./uninstall.sh                 remove the app, menu entry, icon and build output
-#   ./uninstall.sh --purge         also delete saved connections, settings and leftover history files
-#   ./uninstall.sh --prefix DIR    uninstall from DIR instead of looking in /usr/local, ~/.local and /usr
-#   ./uninstall.sh --yes           do not ask before --purge deletes your data
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -23,7 +21,6 @@ say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 removed=0
 
-# rm_path PATH: delete a file or directory, using sudo only when the user cannot write there
 rm_path() {
   [ -e "$1" ] || [ -L "$1" ] || return 0
   if rm -rf "$1" 2>/dev/null; then :
@@ -32,7 +29,6 @@ rm_path() {
   echo "  removed $1"; removed=$((removed + 1))
 }
 
-# Give the default-terminal settings back (only entries that point at Lestrix are touched)
 say "Releasing the default-terminal settings"
 cfgd="${XDG_CONFIG_HOME:-$HOME/.config}"
 if [ -f "$cfgd/xdg-terminals.list" ] && grep -qx 'lestrix.desktop' "$cfgd/xdg-terminals.list"; then
@@ -55,6 +51,7 @@ for p in "${PREFIXES[@]}"; do
   rm_path "$p/bin/lestrix"
   rm_path "$p/bin/lxcat"
   rm_path "$p/share/applications/lestrix.desktop"
+  rm_path "$p/share/applications/lestrix-lite.desktop"
   for sz in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do rm_path "$p/share/icons/hicolor/$sz/apps/lestrix.png"; done
   rm_path "$p/share/icons/hicolor/scalable/apps/lestrix.svg"
   have update-desktop-database && [ -d "$p/share/applications" ] && update-desktop-database "$p/share/applications" 2>/dev/null
@@ -62,7 +59,6 @@ for p in "${PREFIXES[@]}"; do
 done
 rm_path build
 
-# Spill files are unlinked while in use; only a crash can leave a named one behind.
 for d in "${TMPDIR:-/tmp}" /tmp /var/tmp "${XDG_RUNTIME_DIR:-/nonexistent}"; do
   for f in "$d"/lestrix-hist-*; do [ -e "$f" ] && rm_path "$f"; done
 done

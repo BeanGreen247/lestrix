@@ -1,11 +1,16 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "lz.h"
 
 #include <string.h>
 
 #define HASH_BITS 13
 #define MIN_MATCH 4
-#define LAST_LITERALS 5   /* the format ends every block with a few literals */
-#define MF_LIMIT 12       /* no match may start within the last 12 bytes */
+#define LAST_LITERALS 5
+#define MF_LIMIT 12
 
 static inline uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline uint32_t hash4(uint32_t v) { return (v * 2654435761u) >> (32 - HASH_BITS); }
@@ -17,7 +22,7 @@ static inline uint8_t *put_len(uint8_t *op, size_t len) {
 }
 
 size_t sd_lz_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap) {
-    if (cap < sd_lz_bound(n)) return 0;   /* callers size the buffer with sd_lz_bound() */
+    if (cap < sd_lz_bound(n)) return 0;
     uint8_t *op = dst;
     const uint8_t *ip = src, *anchor = src, *end = src + n;
     if (n > MF_LIMIT + 1) {
@@ -30,10 +35,8 @@ size_t sd_lz_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap) {
             const uint8_t *ref = src + table[h];
             table[h] = (uint32_t)(ip - src);
             if (ref >= ip || ip - ref > 65535 || rd32(ref) != seq || ref == ip) { ip++; continue; }
-            /* extend the match backwards over pending literals, then forwards */
             while (ip > anchor && ref > src && ip[-1] == ref[-1]) { ip--; ref--; }
             const uint8_t *mp = ip + MIN_MATCH, *rp = ref + MIN_MATCH;
-            /* shuffled terminal data is mostly long runs: compare eight bytes at a time */
             while (mp + 8 <= matchlimit) {
                 uint64_t a, b;
                 memcpy(&a, mp, 8); memcpy(&b, rp, 8);
@@ -77,7 +80,7 @@ int sd_lz_decompress(const uint8_t *src, size_t n, uint8_t *dst, size_t raw) {
         memcpy(op, ip, lit);
         ip += lit;
         op += lit;
-        if (ip == iend) break;   /* the last sequence has literals only */
+        if (ip == iend) break;
         if (iend - ip < 2) return 0;
         size_t off = (size_t)ip[0] | ((size_t)ip[1] << 8);
         ip += 2;
@@ -91,7 +94,7 @@ int sd_lz_decompress(const uint8_t *src, size_t n, uint8_t *dst, size_t raw) {
         if (mlen > (size_t)(oend - op)) return 0;
         const uint8_t *m = op - off;
         if (off >= mlen) { memcpy(op, m, mlen); op += mlen; }
-        else for (size_t i = 0; i < mlen; i++) *op++ = m[i];   /* overlapping copy repeats the pattern */
+        else for (size_t i = 0; i < mlen; i++) *op++ = m[i];
     }
     return op == oend;
 }

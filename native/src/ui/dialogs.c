@@ -1,11 +1,14 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <string.h>
 #include <stdlib.h>
 
 #include "app.h"
 
 #define P(v) S(a->ui, (v))
-
-/* ---- stack and frame ---------------------------------------------------------------------------------------------------------- */
 
 void dlg_push(App *a, Dialog *d) {
     if (a->ndialogs < 4) a->dialogs[a->ndialogs++] = d;
@@ -46,8 +49,6 @@ Rect dlg_frame(App *a, const char *title, float w, float h) {
 
 static bool esc(App *a) { return ui_key(a->ui, SDLK_ESCAPE, 0); }
 
-/* ---- text prompt -------------------------------------------------------------------------------------------------------------------- */
-
 typedef struct { Dialog d; char title[160], label[160]; char buf[256]; UiText in; bool password, focused; TextCb cb; void *user; } TextDlg;
 
 static void text_draw(App *a, Dialog *d) {
@@ -75,8 +76,6 @@ void dlg_text(App *a, const char *title, const char *label, const char *initial,
     t->d.draw = text_draw;
     dlg_push(a, &t->d);
 }
-
-/* ---- confirm and message ------------------------------------------------------------------------------------------------------------- */
 
 typedef struct { Dialog d; char title[160], msg[512], ok[40]; ConfirmCb cb; void *user; } ConfirmDlg;
 
@@ -153,8 +152,6 @@ void dlg_about(App *a) {
     dlg_message(a, "About Lestrix", msg);
 }
 
-/* ---- colour ---------------------------------------------------------------------------------------------------------------------- */
-
 typedef struct { Dialog d; char title[120]; char buf[16]; UiText in; bool focused; TextCb cb; void *user; } ColorDlg;
 
 static const char *SWATCHES[] = {"#ef5350", "#ff9800", "#ffca28", "#66bb6a", "#26a69a", "#26c6da", "#42a5f5", "#7e57c2", "#ba68c8", "#ec407a"};
@@ -191,8 +188,6 @@ void dlg_color(App *a, const char *title, const char *initial, TextCb cb, void *
     c->d.draw = color_draw;
     dlg_push(a, &c->d);
 }
-
-/* ---- file picker ---------------------------------------------------------------------------------------------------------------- */
 
 typedef struct { char *name; bool dir; } PEntry;
 
@@ -333,15 +328,13 @@ void dlg_pick_file(App *a, const char *title, bool folder, bool multi, const cha
     dlg_push(a, &p->d);
 }
 
-/* ---- connection editor ---------------------------------------------------------------------------------------------------------- */
-
 #define NF 8
 typedef struct {
     Dialog d;
     SdConn *conn;
     bool is_new;
     char b[NF][320]; char port_b[12];
-    UiText f[NF], port;          /* name group host user key remote options + (unused) */
+    UiText f[NF], port;
     int proto, x11;
     bool focused, error;
 } ConnDlg;
@@ -419,14 +412,13 @@ static void conn_draw(App *a, Dialog *d) {
         y += rowh;
     }
     if (c->error) ui_text(a->ui, r.x, y - P(4), "Name and host are required.", col->red);
-    /* Tab moves between fields */
     if (ui_key(a->ui, SDLK_TAB, 0) || ui_key(a->ui, SDLK_TAB, KMOD_SHIFT)) {
         int cur = -1;
         for (int i = 0; i < no; i++) if (ui_input_focused(a->ui, order[i])) cur = i;
         bool back = ui_key(a->ui, SDLK_TAB, KMOD_SHIFT);
         int nx = cur < 0 ? 0 : (cur + (back ? no - 1 : 1)) % no;
         ui_input_focus(a->ui, order[nx]);
-        order[nx]->anchor = 0;   /* tabbing into a field selects its text, as in any form */
+        order[nx]->anchor = 0;
         order[nx]->caret = order[nx]->len;
     }
     float by = r.y + r.h - P(32);
@@ -459,7 +451,7 @@ void dlg_conn_editor(App *a, const SdConn *conn, bool copy_of_live) {
     ConnDlg *c = calloc(1, sizeof *c);
     c->conn = conn ? sd_conn_copy(conn) : sd_conn_new();
     c->is_new = !conn || copy_of_live;
-    if (conn && copy_of_live) {   /* live ssh-config hosts are read-only: edit a saved copy */
+    if (conn && copy_of_live) {
         char *id = g_uuid_string_random();
         sd_conn_set(&c->conn->id, g_strdelimit(id, "-", 'x'));
         g_free(id);

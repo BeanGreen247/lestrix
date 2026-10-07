@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +26,6 @@ static void roundtrip(const uint8_t *data, size_t n, const char *what, size_t *o
 }
 
 int main(void) {
-    /* sizes around the format's limits, with random, repetitive and mixed content */
     for (size_t n = 0; n < 300; n++) {
         uint8_t *b = malloc(n + 1);
         for (size_t i = 0; i < n; i++) b[i] = (uint8_t)(rnd() % 4);
@@ -41,7 +45,6 @@ int main(void) {
         roundtrip(b, n, "large", NULL);
         free(b);
     }
-    /* terminal-shaped data compresses a lot */
     size_t n = 8 * 4000;
     uint8_t *cells = calloc(n, 1);
     for (size_t i = 0; i < 4000; i++) { cells[i * 8] = (uint8_t)('a' + i % 26); cells[i * 8 + 4] = 1; }
@@ -50,7 +53,6 @@ int main(void) {
     CHECK(cs < n / 2);
     free(cells);
 
-    /* corrupt input must fail cleanly (run under ASan/UBSan) */
     uint8_t *src = malloc(5000), *c = malloc(sd_lz_bound(5000)), *d = malloc(5000);
     for (int i = 0; i < 5000; i++) src[i] = (uint8_t)((i * 7) ^ (i >> 3));
     size_t csz = sd_lz_compress(src, 5000, c, sd_lz_bound(5000));
@@ -60,11 +62,11 @@ int main(void) {
         int flips = 1 + (int)(rnd() % 4);
         for (int f = 0; f < flips; f++) m[rnd() % csz] ^= (uint8_t)(1u << (rnd() % 8));
         size_t cut = (trial % 3 == 0) ? rnd() % csz : csz;
-        (void)sd_lz_decompress(m, cut, d, 5000);   /* result is irrelevant, it must simply not crash */
+        (void)sd_lz_decompress(m, cut, d, 5000);
         free(m);
     }
     CHECK(sd_lz_decompress(c, csz - 1, d, 5000) == 0 || 1);
-    CHECK(sd_lz_decompress(c, csz, d, 4999) == 0);   /* wrong size is rejected */
+    CHECK(sd_lz_decompress(c, csz, d, 4999) == 0);
     free(src); free(c); free(d);
 
     printf("%d checks, %d failures\n", checks, failures);

@@ -1,10 +1,8 @@
-/* gen_random.c - writes the benchmark file: SIZE bytes (default 1 GiB) of random printable ASCII, symbols, tabs,
- * and some multi-byte UTF-8, in lines of random length. The same seed always gives the same bytes, so every
- * terminal is shown identical output. No escape sequences: it measures printing text, not emulating control codes.
- * usage: gen_random OUTFILE [MiB] [seed] [mode]
- * mode text (default): the mixed text above.
- * mode longline / manyline: refterm's two stress files - random a-z with no newline at all (one endless wrapped line), or random
- *   a-z plus newline (a line break about every 27 characters). */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,16 +29,16 @@ int main(int argc, char **argv) {
         n = 0;
         while (n < BUF) {
             uint64_t r = rnd();
-            if (longline || manyline) {   /* refterm: a-z, and for manyline a 27th symbol that is a newline */
+            if (longline || manyline) {
                 unsigned pick = (unsigned)((r >> 20) % (manyline ? 27 : 26));
                 b[n++] = pick == 26 ? '\n' : (char)('a' + pick);
                 continue;
             }
             unsigned k = (unsigned)(r & 0xff);
             if (col >= linelen) { b[n++] = '\n'; col = 0; linelen = 1 + (int)((r >> 8) % 160); continue; }
-            if (k < 8) { b[n++] = '\t'; col += 8; }                                   /* ~3% tabs */
-            else if (k < 20) { const char *w = wide[(r >> 16) % (sizeof wide / sizeof *wide)]; size_t l = strlen(w); memcpy(b + n, w, l); n += l; col += 1; }   /* ~5% UTF-8 */
-            else { b[n++] = (char)(0x20 + (r >> 24) % 95); col++; }                  /* letters, digits, symbols */
+            if (k < 8) { b[n++] = '\t'; col += 8; }
+            else if (k < 20) { const char *w = wide[(r >> 16) % (sizeof wide / sizeof *wide)]; size_t l = strlen(w); memcpy(b + n, w, l); n += l; col += 1; }
+            else { b[n++] = (char)(0x20 + (r >> 24) % 95); col++; }
         }
         size_t w = done + n > total ? total - done : n;
         if (fwrite(b, 1, w, f) != w) { perror("write"); return 1; }

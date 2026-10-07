@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "fleetwm.h"
 
 #include <glib.h>
@@ -20,7 +25,6 @@ static char *theme_file(void) {
     return r;
 }
 
-/* the accent fleetwm-settings extracts from the wallpaper lives in themes/accent.css as an @define-color override */
 static char *accent_file(void) {
     char *u = g_build_filename(g_get_user_config_dir(), "fleetwm", "themes", "accent.css", NULL);
     char *cands[] = {u, "/etc/xdg/fleetwm/themes/accent.css", "/usr/local/etc/xdg/fleetwm/themes/accent.css", NULL};
@@ -41,7 +45,6 @@ double fleetwm_stamp(void) {
     return m > n ? m : n;
 }
 
-/* key = "value"   # comment  ->  value */
 static bool toml_get(const char *text, const char *key, char *out, size_t cap) {
     size_t kl = strlen(key);
     for (const char *p = text; p && *p;) {

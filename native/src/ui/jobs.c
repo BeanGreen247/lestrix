@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "jobs.h"
 
 #include <pthread.h>
@@ -46,7 +51,6 @@ void jobs_shutdown(void) {
     quitting = 1;
     pthread_cond_broadcast(&cv);
     pthread_mutex_unlock(&mu);
-    /* workers may be inside a long blocking call: do not wait for them at exit */
     for (int i = 0; i < started; i++) pthread_detach(workers[i]);
 }
 

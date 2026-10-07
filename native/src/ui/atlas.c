@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "atlas.h"
 
 #include <stdlib.h>
@@ -7,7 +12,6 @@
 
 typedef struct { uint32_t font, cp; uint8_t style, used; AtlasGlyph g; } Entry;
 
-/* one 8-bit channel: OpenGL 3 and ES 3 have R8; OpenGL ES 2 only has luminance (the shader reads the red channel either way) */
 static inline GLenum atlas_format(void) { return sd_gl_kind == GLK_ES2 ? GL_LUMINANCE : GL_RED; }
 static inline GLint atlas_internal(void) { return sd_gl_kind == GLK_ES2 ? GL_LUMINANCE : GL_R8; }
 
@@ -15,12 +19,10 @@ struct Atlas {
     GLuint tex;
     int size;
     uint32_t generation;
-    int shelf_y, shelf_h, pen_x;        /* the shelf being filled */
+    int shelf_y, shelf_h, pen_x;
     Entry *tab;
     uint32_t cap, count;
     uint16_t white_x, white_y;
-    /* ASCII lookup table: [style][code point] straight to the glyph, no hashing and no key compare. Entries are tagged with the
-     * atlas generation and font id, so a cleared atlas or a font/size change invalidates them all at once. */
     struct { const AtlasGlyph *g; uint32_t gen, font; } ascii[4][128];
 };
 
@@ -28,25 +30,32 @@ struct Atlas {
 
 CacheStats sd_cache;
 
+uint32_t atlas_count(const Atlas *a) { return a->count; }
+
+int atlas_ascii_filled(const Atlas *a) {
+    int n = 0;
+    for (int s = 0; s < 4; s++) for (int c = 0; c < 128; c++) if (a->ascii[s][c].g && a->ascii[s][c].gen == a->generation) n++;
+    return n;
+}
+
 static void atlas_reset(Atlas *a) {
     sd_cache.glyph_recycle += a->count;
     memset(a->tab, 0, (size_t)a->cap * sizeof *a->tab);
     a->count = 0;
     a->shelf_y = 2; a->shelf_h = 0; a->pen_x = 0;
     a->generation++;
-    /* texel block (0,0)-(2,2) is solid white */
     static const uint8_t white[4] = {255, 255, 255, 255};
     glBindTexture(GL_TEXTURE_2D, a->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, atlas_format(), GL_UNSIGNED_BYTE, white);
-    a->pen_x = 4;   /* leave the corner to the white block */
+    a->pen_x = 4;
     a->shelf_h = 2;
 }
 
 Atlas *atlas_new(int size) {
     GLint maxtex = 0;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxtex);
-    if (maxtex > 0 && size > maxtex) size = maxtex;   /* small GPUs (VideoCore IV tops out at 2048) */
+    if (maxtex > 0 && size > maxtex) size = maxtex;
     Atlas *a = calloc(1, sizeof *a);
     if (!a) return NULL;
     a->size = size;
@@ -56,7 +65,6 @@ Atlas *atlas_new(int size) {
     glGenTextures(1, &a->tex);
     glBindTexture(GL_TEXTURE_2D, a->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    /* storage only: nothing in the atlas is sampled before it has been written, so there is no need to upload zeros */
     glTexImage2D(GL_TEXTURE_2D, 0, atlas_internal(), size, size, 0, atlas_format(), GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -96,7 +104,6 @@ static Entry *lookup(Atlas *a, uint32_t font, uint32_t cp, uint8_t style, bool *
     return NULL;
 }
 
-/* room for a w*h block (plus one texel of padding around it); false when the atlas is full */
 static bool place(Atlas *a, int w, int h, int *ox, int *oy) {
     int pw = w + 1, ph = h + 1;
     if (pw > a->size || ph > a->size) return false;
@@ -118,7 +125,7 @@ static const AtlasGlyph *insert(Atlas *a, uint32_t font, uint32_t cp, uint8_t st
     int ox = 0, oy = 0;
     bool blank = !bits || w <= 0 || h <= 0;
     if (!blank && !place(a, w, h, &ox, &oy)) {
-        atlas_reset(a);   /* full: start over rather than overwrite anything still in use */
+        atlas_reset(a);
         if (!place(a, w, h, &ox, &oy)) return NULL;
     }
     bool found;
@@ -155,11 +162,10 @@ static const AtlasGlyph *atlas_glyph_slow(Atlas *a, Font *f, uint32_t fid, uint3
     if (found && valid(a, &e->g)) { sd_cache.glyph_hit++; return &e->g; }
     sd_cache.glyph_miss++;
     GlyphBmp b;
-    font_glyph(f, cp, style, &b);   /* a missing glyph is cached as blank so it is not looked up again */
+    font_glyph(f, cp, style, &b);
     return insert(a, fid, cp, (uint8_t)style, b.buf, b.w, b.h, b.left, b.top, b.adv);
 }
 
-/* read-only lookup for threads that must not touch the texture: the glyph if it is already in the atlas, otherwise NULL */
 const AtlasGlyph *atlas_peek(const Atlas *a, uint32_t fid, uint32_t cp, int style) {
     if (cp < 128 && (unsigned)style < 4) {
         const __typeof__(a->ascii[0][0]) *slot = &a->ascii[style][cp];

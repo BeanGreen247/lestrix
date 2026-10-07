@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "ui.h"
 
 #include <math.h>
@@ -40,19 +45,15 @@ struct Ui {
     int want_cursor;
     SDL_Cursor *cursors[3];
     SDL_Cursor *cur_set;
-    /* tooltip */
     char tip[256];
     Rect tip_r;
     uint64_t tip_id, tip_prev;
     double tip_since;
     bool tip_shown_this_frame;
-    /* clip stack */
     Rect clips[MAX_CLIPS];
     int nclips;
-    /* scroll */
     Rect sc_view; float sc_content; float *sc_off; bool sc_active;
     uint64_t sc_drag; float sc_drag_dy;
-    /* menu */
     bool menu_open;
     float menu_x, menu_y;
     UiMenuItem *menu_items; int menu_n; int menu_tag;
@@ -60,9 +61,8 @@ struct Ui {
     int menu_hover;
     float menu_w;
     double menu_opened_at;
+    bool motion_matters;
 };
-
-/* ---- utf-8 --------------------------------------------------------------------------------------------- */
 
 static uint32_t next_cp(const char **p) {
     const unsigned char *s = (const unsigned char *)*p;
@@ -83,8 +83,6 @@ static int prev_boundary(const char *s, int i) {
     while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80) i--;
     return i;
 }
-
-/* ---- setup ------------------------------------------------------------------------------------------------ */
 
 Ui *ui_new(Renderer *r, void *font, void *mono, float scale) {
     Ui *u = calloc(1, sizeof *u);
@@ -111,9 +109,27 @@ const UiColors *ui_colors(const Ui *u) { return &u->c; }
 float ui_scale(const Ui *u) { return u->scale; }
 float S(const Ui *u, float v) { return (float)floor(v * u->scale + 0.5); }
 
+float ui_ptr_x = -1, ui_ptr_y = -1;
+Rect ui_hits[UI_MAX_HITS];
+int ui_nhits;
+bool ui_hits_on, ui_hits_full;
+
+bool ui_motion_matters(const Ui *u) { return u->motion_matters; }
+
+static bool pointer_move_matters(const Ui *u, float nx, float ny) {
+    if (ui_hits_full || u->down[1] || u->down[2] || u->down[3] || u->menu_open) return true;
+    for (int i = 0; i < ui_nhits; i++) if (rect_has(ui_hits[i], u->mx, u->my) != rect_has(ui_hits[i], nx, ny)) return true;
+    return false;
+}
+
 void ui_event(Ui *u, const SDL_Event *e) {
     switch (e->type) {
-    case SDL_MOUSEMOTION: u->mx = e->motion.x * u->scale; u->my = e->motion.y * u->scale; break;
+    case SDL_MOUSEMOTION: {
+        float nx = e->motion.x * u->scale, ny = e->motion.y * u->scale;
+        u->motion_matters = pointer_move_matters(u, nx, ny);
+        u->mx = nx; u->my = ny;
+        break;
+    }
     case SDL_MOUSEBUTTONDOWN:
         u->mx = e->button.x * u->scale; u->my = e->button.y * u->scale;
         if (e->button.button < 4) { u->down[e->button.button] = true; u->pressed[e->button.button] = true; }
@@ -145,6 +161,7 @@ void ui_begin(Ui *u, int w, int h, double now) {
     u->nclips = 0;
     u->tip_shown_this_frame = false;
     u->input_claimed = false;
+    ui_ptr_x = u->mx; ui_ptr_y = u->my; ui_nhits = 0; ui_hits_full = false; ui_hits_on = true;
 }
 
 void ui_set_blocked(Ui *u, bool b) { u->blocked = b; }
@@ -179,8 +196,6 @@ void ui_want_frames(Ui *u, double seconds) { if (u->now + seconds > u->want_unti
 SDL_Cursor *ui_wanted_cursor(Ui *u) { return u->cursors[u->want_cursor]; }
 void ui_set_cursor(Ui *u, int kind) { if (kind >= 0 && kind < 3) u->want_cursor = kind; }
 
-/* ---- drawing -------------------------------------------------------------------------------------------------- */
-
 void ui_rect(Ui *u, Rect r, uint32_t c) { if (r.w > 0 && r.h > 0) r_rect(u->r, r.x, r.y, r.w, r.h, c); }
 void ui_rrect(Ui *u, Rect r, uint32_t c, float radius) {
     if (r.w <= 0 || r.h <= 0) return;
@@ -203,8 +218,6 @@ void ui_unclip(Ui *u) {
     if (u->nclips > 0) { Rect r = u->clips[u->nclips - 1]; r_clip(u->r, (int)r.x, (int)r.y, (int)r.w, (int)r.h); }
     else r_clip_off(u->r);
 }
-
-/* ---- text ----------------------------------------------------------------------------------------------------------- */
 
 float ui_line_h(const Ui *u) { return (float)font_cell_h(u->font); }
 
@@ -282,7 +295,6 @@ float ui_text_font_w(Ui *u, void *font, int style, const char *s) {
     return w;
 }
 
-/* vertical text: the string is laid out normally into a bitmap, then turned a quarter turn; keyed on the text and font */
 float ui_text_vertical_len(Ui *u, const char *s) { return ui_text_w(u, s) * 0.84f + (float)(strlen(s)) * S(u, 1.2f); }
 
 void ui_text_vertical(Ui *u, Rect r, const char *s, uint32_t color) {
@@ -309,7 +321,6 @@ void ui_text_vertical(Ui *u, Rect r, const char *s, uint32_t color) {
                 pen += b.adv + S(u, 1.2f);
             }
         }
-        /* quarter turn so the text reads bottom to top: (x, y) -> (y, W - 1 - x) */
         uint8_t *dst = calloc((size_t)W * H, 1);
         for (int yy = 0; yy < H; yy++) for (int xx = 0; xx < W; xx++) dst[(size_t)(W - 1 - xx) * H + yy] = src[(size_t)yy * W + xx];
         g = atlas_custom(a, fid, key, dst, H, W);
@@ -323,9 +334,7 @@ void ui_text_vertical(Ui *u, Rect r, const char *s, uint32_t color) {
     r_push(u->r, &i, 1);
 }
 
-/* ---- icons: tiny vector drawings rasterised once into the atlas ------------------------------------------------------- */
-
-typedef struct { char k; float a, b, c, d, e, f; } Prim;   /* l line  r rect outline  R filled rect  o circle outline  O filled circle  t filled triangle */
+typedef struct { char k; float a, b, c, d, e, f; } Prim;
 
 static float sd_seg(float px, float py, float ax, float ay, float bx, float by) {
     float pax = px - ax, pay = py - ay, bax = bx - ax, bay = by - ay;
@@ -435,11 +444,9 @@ void ui_icon(Ui *u, UiIcon ic, Rect r, uint32_t color) {
     if (!g || g->blank) return;
     RInst i;
     r_make_glyph(u->r, &i, g, (float)floor(r.x + (r.w - px) / 2 + 0.5f), (float)floor(r.y + (r.h - px) / 2 + 0.5f), color);
-    i.y = (float)floor(r.y + (r.h - px) / 2 + 0.5f);   /* custom bitmaps are placed by their top-left corner */
+    i.y = (float)floor(r.y + (r.h - px) / 2 + 0.5f);
     r_push(u->r, &i, 1);
 }
-
-/* ---- tooltips ----------------------------------------------------------------------------------------------------------------- */
 
 void ui_tip(Ui *u, Rect r, const char *text) {
     if (u->blocked || !text || !rect_has(r, u->mx, u->my)) return;
@@ -463,8 +470,6 @@ static void draw_tip(Ui *u) {
     ui_text(u, x + pad, y + S(u, 3), u->tip, u->c.ink);
     u->tip[0] = 0;
 }
-
-/* ---- buttons -------------------------------------------------------------------------------------------------------------------- */
 
 static uint64_t rid(Rect r, const void *p) { return (uint64_t)(uintptr_t)p ^ ((uint64_t)(int)r.x << 24) ^ ((uint64_t)(int)r.y << 4) ^ 0x9e3779b97f4a7c15ull; }
 
@@ -523,8 +528,6 @@ bool ui_checkbox(Ui *u, Rect r, const char *label, bool *v) {
     if (hov) u->want_cursor = 2;
     return clicked;
 }
-
-/* ---- text input -------------------------------------------------------------------------------------------------------------------- */
 
 void ui_text_init(UiText *t, char *buf, int cap) { memset(t, 0, sizeof *t); t->s = buf; t->cap = cap; if (cap) buf[0] = 0; }
 void ui_text_set(UiText *t, const char *s) {
@@ -588,7 +591,7 @@ bool ui_input(Ui *u, Rect r, UiText *t, const char *placeholder, bool password) 
         t->caret = best;
         if (!(SDL_GetModState() & KMOD_SHIFT)) t->anchor = best;
     }
-    if (u->active == id && u->down[1] && !u->pressed[1]) {   /* drag to select */
+    if (u->active == id && u->down[1] && !u->pressed[1]) {
         float rel = u->mx - (r.x + pad) + t->scroll;
         int best = 0;
         for (int i = 0; i <= t->len; i += (i < t->len ? cp_len_at(t->s + i) : 1)) { if (width_to(u, t->s, i, password) <= rel) best = i; else break; if (i >= t->len) break; }
@@ -623,7 +626,6 @@ bool ui_input(Ui *u, Rect r, UiText *t, const char *placeholder, bool password) 
         u->text[0] = 0;
         ui_want_frames(u, 0.6);
     }
-    /* draw */
     ui_rrect(u, r, u->c.bg2, S(u, 8));
     ui_outline(u, r, focused ? u->c.accent : (hov ? u->c.border2 : u->c.border), S(u, 8), 1);
     Rect inner = R(r.x + pad, r.y, r.w - 2 * pad, r.h);
@@ -648,8 +650,6 @@ bool ui_input(Ui *u, Rect r, UiText *t, const char *placeholder, bool password) 
     ui_unclip(u);
     return entered;
 }
-
-/* ---- scroll areas ------------------------------------------------------------------------------------------------------------------------ */
 
 void ui_scroll_begin(Ui *u, Rect view, float content_h, float *offset) {
     float maxo = content_h > view.h ? content_h - view.h : 0;
@@ -683,8 +683,6 @@ void ui_scroll_end(Ui *u) {
     }
     ui_rrect(u, thumb, (u->sc_drag == id || hov) ? u->c.border2 : u->c.border, bw / 2);
 }
-
-/* ---- menus ----------------------------------------------------------------------------------------------------------------------------------- */
 
 void ui_menu_open(Ui *u, float x, float y, const UiMenuItem *items, int n, int tag) {
     free(u->menu_items);
@@ -780,10 +778,11 @@ static void draw_menu(Ui *u) {
 }
 
 void ui_end(Ui *u) {
+    ui_hits_on = false;
     if (!u->tip_shown_this_frame) { u->tip_id = 0; u->tip[0] = 0; }
     draw_tip(u);
     draw_menu(u);
-    if (u->press_this_frame && !u->input_claimed && u->focus) u->focus = 0;   /* a click elsewhere leaves the text field */
+    if (u->press_this_frame && !u->input_claimed && u->focus) u->focus = 0;
     memset(u->pressed, 0, sizeof u->pressed);
     memset(u->released, 0, sizeof u->released);
     u->wheel = 0;

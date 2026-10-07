@@ -1,4 +1,8 @@
-/* Throughput of the terminal core. BENCH_MB sets the size per test (default 8). */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <stdlib.h>
 
 #include "../src/bench.h"

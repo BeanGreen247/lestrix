@@ -1,8 +1,8 @@
-/* lxcat - cat for Lestrix (also installed as `cat` for local Lestrix tabs, where options it does not know are passed to the real cat): prints files through the terminal instead of through the kernel's tty layer, which caps big output at
- * about 35 MB/s. Inside a Lestrix local tab it sends the terminal the file's path (one escape sequence, carrying the tab's secret
- * from $LESTRIX_FASTCAT) and the terminal reads the file itself, in order with everything else. Anywhere else, or if the output is not
- * a terminal, it behaves like cat. Piped input is first copied to /dev/shm (RAM) and then handed over the same way.
- * usage: lxcat [--no-fast] [FILE...]   (no FILE or - reads standard input) */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -43,9 +43,6 @@ static void request(const char *token, const char *path, unsigned flags) {
 
 static const char *prog = "lxcat";
 
-/* Piped input, in chunks: each chunk goes to /dev/shm and is handed to the terminal as it arrives, so `tail -f x | lxcat` still shows
- * lines as they come. The terminal deletes a chunk's file when it has printed it; at most two chunks are ahead of it, which is the
- * flow control that keeps a fast producer from filling memory. */
 static int stream_stdin(const char *token) {
     enum { CHUNK = 8 << 20 };
     char *buf = malloc(CHUNK);
@@ -53,25 +50,26 @@ static int stream_stdin(const char *token) {
     int rc = 0;
     long seq = 0;
     if (!buf) return 1;
+    fcntl(0, F_SETPIPE_SZ, 4 << 20);
     for (;;) {
         size_t have = 0;
         ssize_t n;
         while (have < CHUNK && (n = read(0, buf + have, CHUNK - have)) > 0) {
             have += (size_t)n;
             struct pollfd pf = {0, POLLIN, 0};
-            if (poll(&pf, 1, 0) <= 0) break;   /* nothing more waiting: send what we have now */
+            if (poll(&pf, 1, 0) <= 0) break;
         }
         if (have == 0) break;
         char *old = names[seq & 1];
-        for (int w = 0; old[0] && access(old, F_OK) == 0 && w < 20000; w++) { struct timespec ts = {0, 500000}; nanosleep(&ts, NULL); }   /* wait for the terminal to consume the chunk two back */
+        for (int w = 0; old[0] && access(old, F_OK) == 0 && w < 20000; w++) { struct timespec ts = {0, 500000}; nanosleep(&ts, NULL); }
         snprintf(old, 64, "/dev/shm/lxcat-%d-%ld", (int)getpid(), seq++);
         int fd = open(old, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (fd < 0 || write_all(fd, buf, have)) { if (fd >= 0) close(fd); rc = 1; break; }
         close(fd);
-        request(token, old, 3);   /* flag 1: the terminal deletes it afterwards */
+        request(token, old, 3);
     }
     free(buf);
-    for (int k = 0; k < 2; k++) {   /* do not exit before the terminal has read the last chunks */
+    for (int k = 0; k < 2; k++) {
         for (int w = 0; names[k][0] && access(names[k], F_OK) == 0 && w < 20000; w++) { struct timespec ts = {0, 500000}; nanosleep(&ts, NULL); }
     }
     return rc;
@@ -89,7 +87,7 @@ int main(int argc, char **argv) {
     const char *slash = strrchr(argv[0], '/');
     prog = slash ? slash + 1 : argv[0];
     int as_cat = !strcmp(prog, "cat");
-    if (as_cat) for (int k = 1; k < argc; k++) if (argv[k][0] == '-' && argv[k][1]) exec_real_cat(argv);   /* -n, -A, ...: the real cat's job */
+    if (as_cat) for (int k = 1; k < argc; k++) if (argv[k][0] == '-' && argv[k][1]) exec_real_cat(argv);
     const char *token = getenv("LESTRIX_FASTCAT");
     int fast = token && *token && isatty(1);
     int rc = 0, i = 1, nfiles = 0, use_stdin = 0;
@@ -105,7 +103,7 @@ int main(int argc, char **argv) {
         if (copy_fd(fd, 1)) rc = 1;
         close(fd);
     }
-    if (nfiles == 0 || use_stdin) {   /* standard input */
+    if (nfiles == 0 || use_stdin) {
         if (fast && !isatty(0)) { if (stream_stdin(token)) rc = 1; }
         else if (copy_fd(0, 1)) rc = 1;
     }

@@ -1,7 +1,12 @@
-/* Differential test: the bulk UTF-8 path must leave exactly the same screen, cursor and history as the general path. */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "../src/vt.h"
 
 static unsigned long long rng = 88172645463325252ull;
@@ -25,10 +30,10 @@ static size_t make(uint8_t *b, size_t cap) {
         else if (k < 85) { b[n++] = '\r'; b[n++] = '\n'; }
         else if (k < 88) b[n++] = '\t';
         else if (k < 90) b[n++] = '\b';
-        else if (k < 92) b[n++] = (uint8_t)(0x80 + rnd() % 128);          /* stray continuation or lead byte */
-        else if (k < 94) { b[n++] = 0xe4; b[n++] = (uint8_t)(0xb8); }       /* truncated three-byte sequence */
-        else if (k < 95) { b[n++] = 0xc0; b[n++] = 0x80; }                  /* overlong */
-        else if (k < 96) { b[n++] = 0xed; b[n++] = 0xa0; b[n++] = 0x80; }   /* surrogate */
+        else if (k < 92) b[n++] = (uint8_t)(0x80 + rnd() % 128);
+        else if (k < 94) { b[n++] = 0xe4; b[n++] = (uint8_t)(0xb8); }
+        else if (k < 95) { b[n++] = 0xc0; b[n++] = 0x80; }
+        else if (k < 96) { b[n++] = 0xed; b[n++] = 0xa0; b[n++] = 0x80; }
         else if (k < 98) n += (size_t)snprintf((char *)b + n, 16, "\x1b[%dm", (int)(rnd() % 8) + 30);
         else n += (size_t)snprintf((char *)b + n, 16, "\x1b[%d;%dH", (int)(rnd() % 20) + 1, (int)(rnd() % 90) + 1);
     }
@@ -44,12 +49,62 @@ static int same(Vt *a, Vt *b) {
         int la = 0, lb = 0;
         VtCell *ca = vt_line(a, idx, &la), *cb = vt_line(b, idx, &lb);
         int m = la > lb ? la : lb;
+        if (getenv("FP_DEBUG") && la != lb) { fprintf(stderr, "idx %d len %d/%d hist %d\n", idx, la, lb, ha); }
         for (int x = 0; x < m; x++) {
             VtCell xa = x < la ? ca[x] : (VtCell){0, 0}, xb = x < lb ? cb[x] : (VtCell){0, 0};
-            if (xa.cp != xb.cp || (xa.sf & 0xff) != (xb.sf & 0xff)) return 0;
+            if (xa.cp != xb.cp || (xa.sf & 0xff) != (xb.sf & 0xff)) { if (getenv("FP_DEBUG")) fprintf(stderr, "idx %d x %d: cp %x/%x sf %x/%x len %d/%d hist %d\n", idx, x, xa.cp, xb.cp, xa.sf, xb.sf, la, lb, ha); return 0; }
         }
     }
     return 1;
+}
+
+
+static size_t make_lines(uint8_t *b, size_t cap, int impure_pct, int bare) {
+    size_t n = 0;
+    while (n + 400 < cap) {
+        unsigned kind = rnd() % 100;
+        size_t len = 5 + rnd() % 150;
+        if (kind < (unsigned)impure_pct) {
+            for (size_t i = 0; i < len; i++) {
+                unsigned k = rnd() % 100;
+                if (k < 6) b[n++] = '\t';
+                else if (k < 12) n += enc(POOL[rnd() % (sizeof POOL / sizeof *POOL)], b + n);
+                else b[n++] = (uint8_t)(0x20 + rnd() % 95);
+            }
+        } else {
+            for (size_t i = 0; i < len; i++) b[n++] = (uint8_t)(0x20 + rnd() % 95);
+        }
+        if (!bare) b[n++] = '\r';
+        b[n++] = '\n';
+    }
+    return n;
+}
+
+static int bulk_history_round(int cols, int rows, int scrollback, int impure_pct, size_t mb, int bare) {
+    static uint8_t buf[1 << 20];
+    Vt *fast = vt_new(cols, rows, scrollback), *slow = vt_new(cols, rows, scrollback);
+    int ok = 1;
+    if (bare) { vt_set_force_nl(fast, true); vt_set_force_nl(slow, true); }
+    for (size_t done = 0; done < (mb << 20) && ok; done += sizeof buf) {
+        size_t n = make_lines(buf, sizeof buf, impure_pct, bare);
+        for (size_t i = 0; i < n;) {
+            size_t chunk = 200000 + rnd() % 600000;
+            if (chunk > n - i) chunk = n - i;
+            vt_set_fast_paths(true);  vt_feed(fast, buf + i, chunk);
+            vt_set_fast_paths(false); vt_feed(slow, buf + i, chunk);
+            i += chunk;
+        }
+        vt_set_fast_paths(true);
+        if (!same(fast, slow)) ok = 0;
+    }
+    if (ok && !getenv("FP_NOCOMPACT")) {
+        vt_compact(fast); vt_compact(slow);
+        usleep(150000);
+        vt_compact(fast); vt_compact(slow);
+        ok = same(fast, slow);
+    }
+    vt_free(fast); vt_free(slow);
+    return ok;
 }
 
 int main(void) {
@@ -60,7 +115,7 @@ int main(void) {
         static uint8_t buf[1 << 16];
         size_t n = make(buf, sizeof buf);
         for (size_t i = 0; i < n;) {
-            size_t chunk = 1 + rnd() % 700;   /* split anywhere, including inside a sequence */
+            size_t chunk = 1 + rnd() % 700;
             if (chunk > n - i) chunk = n - i;
             vt_set_fast_paths(true);  vt_feed(fast, buf + i, chunk);
             vt_set_fast_paths(false); vt_feed(slow, buf + i, chunk);
@@ -71,7 +126,15 @@ int main(void) {
         if (!same(fast, slow)) { fails++; fprintf(stderr, "round %d (%dx%d): fast and general paths differ\n", round, cols, rows); }
         vt_free(fast); vt_free(slow);
     }
-    /* every code point the fast path claims a width for must agree with the general width function */
+    {
+        static const struct { int cols, rows, sb, impure; size_t mb; int bare; } cfg[] = {
+            {80, 24, 3000, 0, 2, 0}, {132, 40, 100000, 0, 3, 0}, {200, 30, 5000, 10, 2, 0}, {97, 17, 100000, 40, 2, 0}, {120, 50, 100000, 2, 4, 0}, {60, 12, 1500, 100, 1, 0},
+            {100, 30, 100000, 0, 3, 1}, {140, 35, 5000, 5, 2, 1}, {70, 20, 100000, 30, 2, 1}};
+        for (unsigned i = 0; i < sizeof cfg / sizeof *cfg; i++) {
+            checks++;
+            if (!bulk_history_round(cfg[i].cols, cfg[i].rows, cfg[i].sb, cfg[i].impure, cfg[i].mb, cfg[i].bare)) { fails++; fprintf(stderr, "bulk history config %u: fast and general paths differ\n", i); }
+        }
+    }
     for (uint32_t cp = 0; cp < 0x10000; cp++) {
         int fw = 0;
         if ((cp >= 0xa0 && cp <= 0x2ff) || (cp >= 0x370 && cp <= 0x482) || (cp >= 0x48a && cp <= 0x58f) || (cp >= 0x2500 && cp <= 0x259f)) fw = 1;

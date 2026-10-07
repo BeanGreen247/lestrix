@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Lestrix Lite
+GenericName=Terminal Emulator
+Comment=Terminal only: no sidebar or stats bar, live stats in the title bar
+Exec=@BINDIR@/lestrix --lite
+Icon=lestrix
+Terminal=false
+StartupNotify=true
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;lite;
+StartupWMClass=lestrix-lite

@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# test.sh - installs what the tests need and runs all of them.
-#   ./test.sh                 run everything that can run here, ask before installing packages
-#   ./test.sh --deps          install the test dependencies first (needs root or sudo)
-#   ./test.sh --no-deps       never touch system packages
-#   ./test.sh --arm           also build and run the engine tests for aarch64 and armhf under qemu (Raspberry Pi, ODROID, Tinker Board)
-#   ./test.sh --bench         also run the quick benchmark (Lestrix only, about a minute)
-#   ./test.sh --only NAME     one group: engine, fast, lz, tsan, store, xfer, ftp, perf, gui
-# What runs: the terminal engine under ASan/UBSan (and against pyte when it is installed), the UTF-8 fast-path fuzz test, the compressor,
-# the engine under ThreadSanitizer, the store/transfer/FTP tests, the speed gate and the window test (a real window driven by scripted
-# input; under xvfb when there is no display). Exit status is 0 only if everything that ran passed.
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
+usage() {
+    cat <<'USAGE'
+test.sh - installs what the tests need and runs all of them.
+  ./test.sh                 run everything that can run here, ask before installing packages
+  ./test.sh --deps          install the test dependencies first (needs root or sudo)
+  ./test.sh --no-deps       never touch system packages
+  ./test.sh --arm           also build and run the engine tests for aarch64 and armhf under qemu (Raspberry Pi, ODROID, Tinker Board)
+  ./test.sh --bench         also run the quick benchmark (Lestrix only, about a minute)
+  ./test.sh --only NAME     one group: engine, fast, lz, tsan, store, xfer, ftp, perf, gui
+What runs: the terminal engine under ASan/UBSan (and against pyte when it is installed), the UTF-8 fast-path fuzz test, the compressor,
+the engine under ThreadSanitizer, the store/transfer/FTP tests, the speed gate and the window test (a real window driven by scripted
+input; under xvfb when there is no display). Exit status is 0 only if everything that ran passed.
+set -uo pipefail
+USAGE
+}
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 DEPS=ask; ARM=0; BENCH=0; ONLY=""
@@ -16,7 +24,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --deps) DEPS=yes ;; --no-deps) DEPS=no ;; --arm) ARM=1 ;; --bench) BENCH=1 ;;
     --only) ONLY="$2"; shift ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac; shift
 done
@@ -27,7 +35,6 @@ have() { command -v "$1" >/dev/null 2>&1; }
 if [ "$(id -u)" = 0 ]; then SUDO=""; elif have sudo; then SUDO="sudo"; else SUDO="none"; fi
 PM=""; for c in apt-get dnf yum pacman zypper; do have "$c" && { PM="$c"; break; }; done
 
-# build + test tools, the SDL/Mesa pieces the window test needs, pyte for the differential test, bc/python3 for the benchmark script
 pkgs() {
   local base cross=""
   case "$PM" in
@@ -50,7 +57,6 @@ missing() {
   have python3 || m="$m python3"; have bc || m="$m bc"
   { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || have xvfb-run; } || m="$m xvfb"
   echo "$m"
-  # a test run is only useful with the sanitizer runtimes: check by compiling a one-liner
   echo 'int main(void){return 0;}' | gcc -x c -fsanitize=address,undefined - -o /tmp/lx-san-check 2>/dev/null || echo " sanitizer-runtimes"
   echo 'int main(void){return 0;}' | gcc -x c -fsanitize=thread - -o /tmp/lx-san-check 2>/dev/null || echo " thread-sanitizer-runtime"
   [ "$ARM" = 1 ] && { have aarch64-linux-gnu-gcc || echo " aarch64-cross-compiler"; have qemu-aarch64 || have qemu-aarch64-static || echo " qemu-user"; }
@@ -67,7 +73,6 @@ install_deps() {
     pacman)  $SUDO pacman -S --needed --noconfirm $(pkgs) ;;
     zypper)  for p in $(pkgs); do $SUDO zypper --non-interactive install "$p" >/dev/null || warn "skipped $p"; done ;;
   esac
-  # pyte (the reference terminal for the differential test) from pip when the distribution has no package
   python3 -c 'import pyte' 2>/dev/null || python3 -m pip install --user pyte >/dev/null 2>&1 || python3 -m pip install --user --break-system-packages pyte >/dev/null 2>&1 || true
 }
 
@@ -82,7 +87,7 @@ python3 -c 'import pyte' 2>/dev/null || echo "note: the optional comparison agai
 
 declare -a NAMES RESULTS
 record() { NAMES+=("$1"); RESULTS+=("$2"); }
-run() {   # run NAME COMMAND...
+run() {
   local name=$1; shift
   [ -z "$ONLY" ] || [ "$ONLY" = "$name" ] || return 0
   say "$name"
@@ -109,7 +114,7 @@ if [ -z "$ONLY" ] || [ "$ONLY" = gui ]; then
   if [ $rc = 0 ]; then record gui PASS; elif [ $rc = 2 ]; then record gui SKIP; else record gui FAIL; fi
 fi
 
-arm_tests() {   # the engine and the compressor on 64-bit and 32-bit ARM, run under qemu (same NEON code as a Raspberry Pi 2-5)
+arm_tests() {
   local ok=0 name cc flags qemu out
   mkdir -p build/arm
   for t in "aarch64:aarch64-linux-gnu-gcc:-march=armv8-a" "armhf:arm-linux-gnueabihf-gcc:-march=armv7-a -mfpu=neon-vfpv4"; do

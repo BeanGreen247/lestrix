@@ -2,7 +2,7 @@
 
 **Current revision first.** The full benchmark of this revision (all terminals, everyday workloads, refterm's two stress files, random text from 128 MB to 2 GB, CPU, start-up, memory, idle) is in the README under "Current revision: full benchmark, all terminals"; its raw tables are what `native/benchmark` writes to `bench/results/summary.md`. The sections below keep the older measurements and the experiments, labelled with the revision they were taken on, so they do not get mixed up.
 
-Every number here was measured on one machine: Intel i5-8265U (4 cores, 8 threads), Debian 13, X11. Nothing is estimated. Where a figure comes from a single run it says so. Lower is better for times, higher for speeds.
+Every number here was measured on one machine: Intel i5-8265U (4 cores, 8 threads), Debian 13, X11. The CPU governor was `powersave` (`intel_pstate`, energy preference `balance_performance`, about 3.4 GHz under load) for every table in this document except where stated; with the `performance` governor (about 3.7 GHz) the flood tests ran 7-12% faster and RAM bandwidth was unchanged, see `PERFORMANCE_2026-10-07.md`. The `native/benchmark` summary now records the CPU model and governor on its first line. Nothing is estimated. Where a figure comes from a single run it says so. Lower is better for times, higher for speeds.
 
 ## 1. The final benchmark: 1 GiB of random text, `cat` in each terminal
 

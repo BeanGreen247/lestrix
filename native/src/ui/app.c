@@ -1,4 +1,8 @@
-/* app.c - Lestrix on SDL2 and OpenGL: no GTK anywhere. Window, tabs, sidebar, menus, the event loop. */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #define _GNU_SOURCE
 #include <malloc.h>
 #include <pthread.h>
@@ -29,8 +33,6 @@ App *g_app;
 static Uint32 EV_WAKE;
 static atomic_int wake_pending;
 
-/* ---- wake ---------------------------------------------------------------------------------------------------------------------- */
-
 void app_wake(void) {
     int exp = 0;
     if (atomic_compare_exchange_strong(&wake_pending, &exp, 1)) {
@@ -43,7 +45,6 @@ void app_wake(void) {
 
 void app_redraw(App *a) { a->dirty = true; (void)a; }
 
-/* LESTRIX_TIMING=1 prints how long start-up phases take (milliseconds since the process began) */
 static void tmark(const char *what) {
     static int on = -1;
     static double t0;
@@ -55,8 +56,6 @@ static void tmark(const char *what) {
 }
 
 static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9; }
-
-/* ---- small utilities ------------------------------------------------------------------------------------------------------------ */
 
 static char *relative_age(double ts) {
     double secs = (double)g_get_real_time() / 1e6 - ts;
@@ -101,7 +100,6 @@ static int proc_threads(void) {
     return n;
 }
 
-/* total interrupts serviced since boot, all CPUs: the first number on the "intr" line of /proc/stat */
 static uint64_t proc_interrupts(void) {
     FILE *f = fopen("/proc/stat", "r");
     char line[256];
@@ -111,7 +109,6 @@ static uint64_t proc_interrupts(void) {
     return n;
 }
 
-/* 1234 -> "1.2k", 1234567 -> "1.2M" */
 static void fmt_count(double v, char *out, size_t cap) {
     if (v >= 1e9) snprintf(out, cap, "%.2fG", v / 1e9);
     else if (v >= 1e6) snprintf(out, cap, "%.2fM", v / 1e6);
@@ -121,7 +118,7 @@ static void fmt_count(double v, char *out, size_t cap) {
 
 static char *fmt_mb(double bytes) { return bytes >= 1048576 ? g_strdup_printf("%.1f MB", bytes / 1048576) : g_strdup_printf("%.0f KB", bytes / 1024); }
 
-/* ---- settings -------------------------------------------------------------------------------------------------------------------- */
+static bool g_lite;
 
 static void settings_load(App *a) {
     a->settings = g_key_file_new();
@@ -148,10 +145,11 @@ static void settings_load(App *a) {
     a->follow_fleet = !g_key_file_has_key(a->settings, "ui", "follow_fleetwm", NULL) || g_key_file_get_boolean(a->settings, "ui", "follow_fleetwm", NULL);
     a->rounded = !g_key_file_has_key(a->settings, "ui", "rounded_corners", NULL) || g_key_file_get_boolean(a->settings, "ui", "rounded_corners", NULL);
     a->pinned = !g_key_file_has_key(a->settings, "ui", "sidebar_pinned", NULL) || g_key_file_get_boolean(a->settings, "ui", "sidebar_pinned", NULL);
-    if (g_key_file_has_key(a->settings, "ui", "sidebar_shown", NULL)) a->dock_shown = g_key_file_get_boolean(a->settings, "ui", "sidebar_shown", NULL);   /* pinned panel open or collapsed to the rail */
+    if (g_key_file_has_key(a->settings, "ui", "sidebar_shown", NULL)) a->dock_shown = g_key_file_get_boolean(a->settings, "ui", "sidebar_shown", NULL);
     if (g_key_file_has_key(a->settings, "ui", "sidebar_page", NULL)) a->side_page = g_key_file_get_integer(a->settings, "ui", "sidebar_page", NULL);
     a->panel_w = g_key_file_has_key(a->settings, "ui", "panel_width", NULL) ? g_key_file_get_integer(a->settings, "ui", "panel_width", NULL) : 300;
     if (a->panel_w < 200 || a->panel_w > 700) a->panel_w = 300;
+    if (g_lite) { a->lite = true; a->hud = true; a->pinned = false; a->dock_shown = false; a->side_open = false; }
 }
 
 void app_settings_save(App *a) {
@@ -168,11 +166,11 @@ void app_settings_save(App *a) {
     g_key_file_set_integer(a->settings, "ui", "scrollback_ram_mb", (int)a->sb_ram_mb);
     g_key_file_set_integer(a->settings, "ui", "scrollback_disk_mb", (int)a->sb_disk_mb);
     g_key_file_set_boolean(a->settings, "ui", "scrollback_spill", a->sb_spill);
-    g_key_file_set_boolean(a->settings, "ui", "performance_overlay", a->hud);
-    g_key_file_set_boolean(a->settings, "ui", "sidebar_pinned", a->pinned);
+    if (!a->lite) g_key_file_set_boolean(a->settings, "ui", "performance_overlay", a->hud);
+    if (!a->lite) g_key_file_set_boolean(a->settings, "ui", "sidebar_pinned", a->pinned);
     g_key_file_set_boolean(a->settings, "ui", "fast_cat", a->fast_cat);
-    g_key_file_set_boolean(a->settings, "ui", "sidebar_shown", a->dock_shown);
-    g_key_file_set_integer(a->settings, "ui", "sidebar_page", (int)a->side_page);
+    if (!a->lite) g_key_file_set_boolean(a->settings, "ui", "sidebar_shown", a->dock_shown);
+    if (!a->lite) g_key_file_set_integer(a->settings, "ui", "sidebar_page", (int)a->side_page);
     g_key_file_set_boolean(a->settings, "ui", "follow_fleetwm", a->follow_fleet);
     g_key_file_set_boolean(a->settings, "ui", "rounded_corners", a->rounded);
     g_key_file_set_integer(a->settings, "ui", "panel_width", a->panel_w);
@@ -181,8 +179,6 @@ void app_settings_save(App *a) {
     g_free(dir);
     g_key_file_save_to_file(a->settings, a->settings_path, NULL);
 }
-
-/* ---- theme and fonts ------------------------------------------------------------------------------------------------------------ */
 
 void app_apply_theme(App *a, const UiTheme *t) {
     a->theme = t;
@@ -240,8 +236,6 @@ void app_apply_font(App *a) {
     app_redraw(a);
 }
 
-/* ---- tabs ------------------------------------------------------------------------------------------------------------------------- */
-
 Tab *app_cur_tab(App *a) { return a->cur >= 0 && a->cur < (int)a->tabs->len ? a->tabs->pdata[a->cur] : NULL; }
 
 static int tab_index(App *a, Tab *t) { for (guint i = 0; i < a->tabs->len; i++) if (a->tabs->pdata[i] == t) return (int)i; return -1; }
@@ -251,7 +245,7 @@ static void select_tab(App *a, int i) {
     a->cur = i;
     Tab *t = a->tabs->pdata[i];
     if (t->state == ST_ACTIVITY || t->state == ST_BELL) t->state = ST_IDLE;
-    a->strip_scroll = -1;   /* scroll the strip so the tab is visible */
+    a->strip_scroll = -1;
     app_redraw(a);
 }
 
@@ -303,9 +297,7 @@ static Tab *tab_add(App *a, TabKind kind, const char *title) {
     return t;
 }
 
-static bool g_fastcat = true;   /* --no-fastcat turns the lxcat file-streaming channel off */
-
-/* ---- files shipped with Lestrix: lxcat ------------------------------------------------------------------------------ */
+static bool g_fastcat = true;
 
 static char *exe_dir(void) {
     char buf[4096];
@@ -315,7 +307,7 @@ static char *exe_dir(void) {
     return g_path_get_dirname(buf);
 }
 
-static char *find_shipped(const char *const rel[]) {   /* first existing path among exe-dir-relative candidates */
+static char *find_shipped(const char *const rel[]) {
     char *dir = exe_dir();
     char *found = NULL;
     for (int i = 0; dir && rel[i] && !found; i++) {
@@ -327,7 +319,6 @@ static char *find_shipped(const char *const rel[]) {   /* first existing path am
     return found;
 }
 
-/* A directory holding `cat` -> lxcat, put first on PATH in local tabs when Fast cat is on. */
 void app_fastcat_apply(App *a) {
     static char *cat_dir;
     g_free(cat_dir); cat_dir = NULL;
@@ -365,7 +356,7 @@ char **app_default_shell_argv(const char *shell) {
 
 Tab *app_open_local(App *a, const char *title, char **argv, const char *cwd) {
     Tab *t = tab_add(a, TAB_LOCAL, title);
-    t->term = make_term(a, t, argv, cwd, true);   /* local shells only */
+    t->term = make_term(a, t, argv, cwd, true);
     t->local_argv = g_strdupv(argv);
     return t;
 }
@@ -419,7 +410,6 @@ static Tab *open_connection_copy(App *a, const SdConn *c) {
     return t;
 }
 
-/* app_refresh() reloads ~/.ssh/config and frees the store's connection records, so work on a private copy. */
 Tab *app_open_connection(App *a, const SdConn *conn) {
     SdConn *c = sd_conn_copy(conn);
     sd_store_touch(a->store, c->id);
@@ -443,8 +433,6 @@ static void move_current_tab(App *a, int delta) {
     a->cur = i + delta;
     a->strip_scroll = -1;
 }
-
-/* ---- sessions list ------------------------------------------------------------------------------------------------------------------- */
 
 typedef struct { char *id, *name, *group, *color, *hay, *tip; bool live; } Row;
 typedef struct { char *id, *name, *dest, *age; } Recent;
@@ -500,7 +488,6 @@ void app_refresh(App *a) {
     app_redraw(a);
 }
 
-/* background reachability probe */
 typedef struct { char *id, *host; int port; int ok; } Probe;
 
 static void *probe_work(void *arg) {
@@ -544,8 +531,6 @@ static void probe_all(App *a) {
     }
     g_ptr_array_free(all, TRUE);
 }
-
-/* ---- menus -------------------------------------------------------------------------------------------------------------------------- */
 
 enum {
     A_NEW_CONN = 100, A_NEW_LOCAL, A_IMPORT_INV, A_IMPORT_SSH, A_QUIT, A_SIDEBAR, A_FILES, A_BIGGER, A_SMALLER, A_RECHECK, A_ACCENT,
@@ -694,14 +679,14 @@ static void run_action(App *a, int id) {
         break;
     }
     case A_QUIT: a->running = false; break;
-    case A_SIDEBAR: if (a->pinned) { a->dock_shown = !a->dock_shown; app_settings_save(a); } else a->side_open = !a->side_open; ui_want_frames(a->ui, 0.3); break;
-    case A_FILES: side_select(a, a->side_page == 0 ? 1 : 0); break;
+    case A_SIDEBAR: if (a->lite) break; if (a->pinned) { a->dock_shown = !a->dock_shown; app_settings_save(a); } else a->side_open = !a->side_open; ui_want_frames(a->ui, 0.3); break;
+    case A_FILES: if (a->lite) break; side_select(a, a->side_page == 0 ? 1 : 0); break;
     case A_BIGGER: if (a->font_size < 32) { a->font_size++; app_apply_font(a); app_settings_save(a); } break;
     case A_SMALLER: if (a->font_size > 7) { a->font_size--; app_apply_font(a); app_settings_save(a); } break;
     case A_RECHECK: g_hash_table_remove_all(a->up); probe_all(a); break;
     case A_ACCENT: dlg_color(a, "Accent color", a->accent, accent_cb, NULL); break;
     case A_ACCENT_RESET: app_set_accent(a, ""); break;
-    case A_HUD: a->hud = !a->hud; app_settings_save(a); break;
+    case A_HUD: if (a->lite) break; a->hud = !a->hud; app_settings_save(a); break;
     case A_FASTCAT: a->fast_cat = !a->fast_cat; app_fastcat_apply(a); app_settings_save(a); break;
     case A_SSHCFG: a->show_ssh_config = !a->show_ssh_config; app_refresh(a); app_settings_save(a); break;
     case A_STARTUP: a->startup_shell = !a->startup_shell; app_settings_save(a); break;
@@ -761,8 +746,6 @@ static void run_row_action(App *a, int id) {
     }
 }
 
-/* ---- layout ----------------------------------------------------------------------------------------------------------------------- */
-
 typedef struct { Rect bar, rail, panel, strip, content, hud; bool panel_vis, overlay; } Lay;
 static Lay lay;
 static Rect term_rect;
@@ -771,8 +754,8 @@ static bool term_dragging;
 static float side_t(App *a) { return a->side_anim; }
 
 static void compute_layout(App *a) {
-    float bar_h = P(30), rail_w = P(30);
-    float hud_h = a->hud ? ui_line_h(a->ui) + P(10) : 0;
+    float bar_h = P(30), rail_w = a->lite ? 0 : P(30);
+    float hud_h = a->hud && !a->lite ? ui_line_h(a->ui) + P(10) : 0;
     float pw = P(a->panel_w);
     lay.bar = R(0, 0, (float)a->W, bar_h);
     lay.hud = R(0, a->H - hud_h, (float)a->W, hud_h);
@@ -781,7 +764,7 @@ static void compute_layout(App *a) {
     lay.overlay = !a->pinned;
     float docked = (a->pinned && a->dock_shown) ? pw : 0;
     float anim = side_t(a);
-    lay.panel_vis = a->pinned ? a->dock_shown : anim > 0.001;
+    lay.panel_vis = a->lite ? false : a->pinned ? a->dock_shown : anim > 0.001;
     float px = a->pinned ? rail_w : rail_w - (1.f - anim) * pw;
     lay.panel = R(px, top, pw, bottom - top);
     float cx = rail_w + docked;
@@ -789,8 +772,6 @@ static void compute_layout(App *a) {
     lay.strip = R(cx, top, a->W - cx, strip_h);
     lay.content = R(cx, top + strip_h, a->W - cx, bottom - top - strip_h);
 }
-
-/* ---- menu bar and rail ---------------------------------------------------------------------------------------------------------------- */
 
 static void draw_menubar(App *a) {
     Ui *u = a->ui;
@@ -844,8 +825,6 @@ static void draw_rail(App *a) {
     }
 }
 
-/* ---- sessions and files panel ------------------------------------------------------------------------------------------------------- */
-
 static void draw_sessions(App *a, Rect r) {
     Ui *u = a->ui;
     const UiColors *c = &a->colors;
@@ -860,7 +839,6 @@ static void draw_sessions(App *a, Rect r) {
     snprintf(needle, sizeof needle, "%s", lowered);
     g_free(lowered);
     float rowh = P(30), headh = P(26);
-    /* content height */
     float ch = 0;
     const char *prev = NULL;
     for (int i = 0; i < nrows; i++) {
@@ -949,7 +927,6 @@ static void draw_panel(App *a) {
     ui_clip(u, p);
     if (a->side_page == 0) draw_sessions(a, p); else draw_files_page(a, p);
     ui_unclip(u);
-    /* drag the right edge to resize a docked panel */
     if (!lay.overlay) {
         Rect grip = R(p.x + p.w - P(3), p.y, P(6), p.h);
         static bool dragging;
@@ -961,8 +938,6 @@ static void draw_panel(App *a) {
         }
     }
 }
-
-/* ---- tab strip --------------------------------------------------------------------------------------------------------------------------- */
 
 static UiIcon kind_icon(TabKind k) { return k == TAB_LOCAL ? IC_TERMINAL : k == TAB_SSH ? IC_SERVER : IC_FOLDER; }
 
@@ -982,7 +957,6 @@ static void draw_strip(App *a) {
     if (ui_icon_button(u, R(x + 2 * btn, s.y + P(3), btn, btn), IC_PASTE, "Paste (Ctrl+Shift+V)", has_term ? 0 : UB_DISABLED) && has_term) tcore_paste_request(ct->term);
     if (ui_icon_button(u, R(x + 3 * btn, s.y + P(3), btn, btn), IC_DUPLICATE, "Duplicate tab (Ctrl+Shift+D)", ct ? 0 : UB_DISABLED) && ct) app_dup_tab(a, ct);
     Rect tabs_area = R(s.x, s.y, s.w - acts_w, s.h);
-    /* widths */
     float total = 0;
     for (guint i = 0; i < a->tabs->len; i++) {
         Tab *t = a->tabs->pdata[i];
@@ -994,7 +968,7 @@ static void draw_strip(App *a) {
     float chev = overflow ? P(24) : 0;
     Rect view = R(tabs_area.x + chev, s.y, tabs_area.w - 2 * chev, s.h);
     float maxs = total > view.w ? total - view.w : 0;
-    if (a->strip_scroll < 0) {   /* bring the current tab into view */
+    if (a->strip_scroll < 0) {
         float tx = 0;
         for (int i = 0; i < a->cur && i < (int)a->tabs->len; i++) tx += ((Tab *)a->tabs->pdata[i])->w;
         float tw = a->cur < (int)a->tabs->len ? ((Tab *)a->tabs->pdata[a->cur])->w : 0;
@@ -1047,7 +1021,6 @@ static void draw_strip(App *a) {
         else if (hov && ui_mouse_pressed(u, 3, r)) { select_tab(a, (int)i); open_tab_menu(a, t, ui_mx(u), ui_my(u)); }
     }
     ui_unclip(u);
-    /* drag to reorder */
     if (a->drag_tab >= 0) {
         if (ui_mouse_down(u, 1) && a->drag_tab < (int)a->tabs->len) {
             float mx = ui_mx(u);
@@ -1062,8 +1035,6 @@ static void draw_strip(App *a) {
     }
     if (close_idx >= 0) app_close_tab(a, a->tabs->pdata[close_idx]);
 }
-
-/* ---- welcome page ------------------------------------------------------------------------------------------------------------------------ */
 
 static void draw_welcome(App *a, Rect r) {
     Ui *u = a->ui;
@@ -1100,14 +1071,12 @@ static void draw_welcome(App *a, Rect r) {
     if (!nrecent) ui_text(u, x, y + P(14), "Double-click a host on the left, or press + to add one.", c->muted);
 }
 
-/* ---- terminal area and HUD ------------------------------------------------------------------------------------------------------------- */
-
 static void draw_content(App *a) {
     Ui *u = a->ui;
     Rect r = lay.content;
     Tab *t = app_cur_tab(a);
     if (!t) { draw_welcome(a, R(r.x, r.y, r.w, r.h)); term_rect = R(0, 0, 0, 0); return; }
-    if (!t->term) {   /* FTP: the file browser is the whole tab */
+    if (!t->term) {
         term_rect = R(0, 0, 0, 0);
         if (t->files) files_draw(a, t->files, r);
         return;
@@ -1122,10 +1091,8 @@ static void draw_content(App *a) {
     if (rect_has(r, ui_mx(u), ui_my(u)) && !ui_blocked(u)) ui_set_cursor(u, 1);
 }
 
-/* Frame-rate limits, both settable on the command line. g_max_fps caps drawing in normal use (0 = no cap, and vsync off).
- * g_io_fps is the cap while a big dump pours in, so drawing never competes with reading output (0 = no extra cap). */
 static double g_max_fps = 60, g_io_fps = 24;
-static int g_parse_threads = -1, g_compress_threads = -1, g_render_threads = -1;   /* -1: decided from the number of cores */
+static int g_parse_threads = -1, g_compress_threads = -1, g_render_threads = -1;
 static double frame_gap(bool flooding) {
     double f = g_max_fps, io = g_io_fps;
     if (flooding && io > 0 && (f <= 0 || io < f)) f = io;
@@ -1138,27 +1105,45 @@ static void draw_hud(App *a) {
     Ui *u = a->ui;
     ui_rect(u, lay.hud, a->colors.bg0);
     ui_rect(u, R(0, lay.hud.y, lay.hud.w, 1), a->colors.border);
-    static const char *const tips[10] = {
+    static const char *const tips[11] = {
         "Frames per second actually drawn. 0 when nothing changes (no wasted redraws); capped at 60 normally and at 24 while a big dump pours in, so reading output gets the CPU (see --max-fps, --io-fps).",
         "Size of the current terminal in columns x rows.",
-        "Parse rate: program output the terminal engine consumed, in MB per second, over the last second.",
+        "Parse rate: program output the terminal engine consumed, in GB per second, over the last second.",
         "CPU used by Lestrix, all threads together. 100% = one full core; 400% = four cores busy.",
         "Hardware interrupts handled by the whole machine (from /proc/stat). Click to flip between per second and running total.",
         "Resident memory held by Lestrix right now.",
         "Threads in the Lestrix process (UI, one parser per tab, compressors, font loading) / logical CPU cores the system offers.",
         "Raw data reads: read() calls per second on the program's pty, and the average bytes per call. Bigger is better: fewer system calls per MB.",
         NULL,
-        "Scrollback of the current tab: lines kept, memory they use (compressed), and how much was moved to the disk spill file."};
-    float tx = P(12), ty = lay.hud.y + (lay.hud.h - ui_line_h(u)) / 2, sepw = ui_text_mono_w(u, " \xc2\xb7 ");
-    for (int i = 0; i < 10; i++) {
-        if (!a->hud_seg[i][0]) continue;
-        float w = ui_text_mono_w(u, a->hud_seg[i]);
-        ui_text_mono(u, tx, ty, a->hud_seg[i], a->colors.muted);
-        Rect r = R(tx, lay.hud.y, w, lay.hud.h);
-        if (ui_hover(u, r)) ui_tip(u, r, i == 8 ? a->hud_cache_tip : tips[i]);
+        "Scrollback of the current tab: lines kept, memory they use (compressed), and how much was moved to the disk spill file.",
+        "Last finished command: run time, then its output throughput in GB per second (output bytes / run time). Not measured for full-screen programs."};
+    static const char *const widest[11] = {
+        "fps 999", "no terminal", "parse 99.999 GB/s", "cpu 800%", "irq 9999.9M/s", "memory 9999.9 MB", "99 thr/99c", "reads 9999.9k/s @9999K",
+        "cache rows 100% glyphs 100% recyc 9999", "scrlbck 9999999 ln, 9999.9 MB mem, 9999.9 MB disk", "cmd 99.99 s, 99.999 GB/s"};
+    static const int priority[11] = {0, 3, 2, 10, 5, 1, 8, 7, 6, 4, 9};
+    float x0 = P(12), ty = lay.hud.y + (lay.hud.h - ui_line_h(u)) / 2, sepw = ui_text_mono_w(u, " \xc2\xb7 "), slot_w[11];
+    bool show[11] = {false};
+    float room = lay.hud.w - 2 * x0, used = 0;
+    for (int i = 0; i < 11; i++) slot_w[i] = ui_text_mono_w(u, widest[i]);
+    for (int k = 0; k < 11; k++) {
+        int i = priority[k];
+        float need = slot_w[i] + (used > 0 ? sepw : 0);
+        if (used + need > room) continue;
+        show[i] = true; used += need;
+    }
+    float tx = x0;
+    bool first = true;
+    for (int i = 0; i < 11; i++) {
+        if (!show[i]) continue;
+        if (!first) ui_text_mono(u, tx, ty, " \xc2\xb7 ", a->colors.border);
+        if (!first) tx += sepw;
+        first = false;
+        const char *txt = a->hud_seg[i][0] ? a->hud_seg[i] : i == 9 ? "scrlbck --" : i == 10 ? "cmd --" : "";
+        ui_text_mono(u, tx, ty, txt, a->colors.muted);
+        Rect r = R(tx, lay.hud.y, slot_w[i], lay.hud.h);
+        if (ui_hover(u, r)) ui_tip(u, r, i == 8 ? a->hud_cache_tip : i == 2 ? a->hud_parse_tip : tips[i]);
         if (i == 4 && ui_mouse_pressed(u, 1, r)) { a->hud_irq_total = !a->hud_irq_total; hud_tick(a); }
-        tx += w + sepw;
-        if (i < 9 && a->hud_seg[i + 1][0]) ui_text_mono(u, tx - sepw, ty, " \xc2\xb7 ", a->colors.border);
+        tx += slot_w[i];
     }
     if (ui_mouse_pressed(u, 1, lay.hud)) { a->hud_irq_total = !a->hud_irq_total; hud_tick(a); }
 }
@@ -1182,7 +1167,7 @@ static void hud_tick(App *a) {
     a->hud_prev_time = now; a->hud_prev_ticks = ticks; a->hud_prev_bytes = fed; a->hud_prev_frames = a->frames; a->hud_prev_irq = irq; a->hud_prev_reads = reads;
     char irq_txt[32], hist[160] = "", dims[32] = "no terminal", cache[256];
     if (t && t->term) snprintf(dims, sizeof dims, "%dx%d", tcore_cols(t->term), tcore_rows(t->term));
-    {   /* hits/misses per second since the last tick; recycled = row blocks reused in place + glyphs dropped by atlas clears */
+    {
         static CacheStats prev;
         CacheStats d = {sd_cache.glyph_hit - prev.glyph_hit, sd_cache.glyph_miss - prev.glyph_miss, sd_cache.glyph_recycle - prev.glyph_recycle,
                         sd_cache.row_hit - prev.row_hit, sd_cache.row_miss - prev.row_miss, sd_cache.row_recycle - prev.row_recycle};
@@ -1210,7 +1195,8 @@ static void hud_tick(App *a) {
     char *rss = fmt_mb((double)proc_rss_kb() * 1024);
     snprintf(a->hud_seg[0], sizeof a->hud_seg[0], "fps %.0f", fps);
     snprintf(a->hud_seg[1], sizeof a->hud_seg[1], "%s", dims);
-    snprintf(a->hud_seg[2], sizeof a->hud_seg[2], "parse %.1f MB/s", rate);
+    snprintf(a->hud_seg[2], sizeof a->hud_seg[2], "parse %.3f GB/s", rate / 1024);
+    snprintf(a->hud_parse_tip, sizeof a->hud_parse_tip, "Parse rate: program output the terminal engine consumed over the last second. Right now: %.0f MB/s.", rate);
     snprintf(a->hud_seg[3], sizeof a->hud_seg[3], "cpu %.0f%%", cpu);
     snprintf(a->hud_seg[4], sizeof a->hud_seg[4], "irq %s%s", irq_txt, a->hud_irq_total ? "" : "/s");
     snprintf(a->hud_seg[5], sizeof a->hud_seg[5], "memory %s", rss);
@@ -1219,7 +1205,13 @@ static void hud_tick(App *a) {
     snprintf(a->hud_seg[8], sizeof a->hud_seg[8], "%s", cache);
     snprintf(a->hud_seg[9], sizeof a->hud_seg[9], "%s", hist);
     g_free(rss);
-    if (memcmp(before, a->hud_seg, sizeof before) != 0) app_redraw(a);   /* nothing new to show: no frame */
+    if (a->lite) {
+        char title[400];
+        snprintf(title, sizeof title, "Lestrix Lite  |  %.40s  |  %.40s  |  %.80s  |  glyphs %u  |  ascii %d/512%s%.60s", a->hud_seg[0], a->hud_seg[3], a->hud_seg[8],
+                 a->atlas ? (unsigned)atlas_count(a->atlas) : 0u, a->atlas ? atlas_ascii_filled(a->atlas) : 0, a->hud_seg[10][0] ? "  |  " : "", a->hud_seg[10]);
+        if (strcmp(title, a->title_last) != 0) { snprintf(a->title_last, sizeof a->title_last, "%s", title); SDL_SetWindowTitle(a->win, title); }
+    }
+    if (!a->lite && memcmp(before, a->hud_seg, sizeof before) != 0) app_redraw(a);
 }
 
 static void trim_tick(App *a) {
@@ -1231,8 +1223,6 @@ static void trim_tick(App *a) {
     for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->term) tcore_compact(t->term); }
     malloc_trim(0);
 }
-
-/* ---- one frame ---------------------------------------------------------------------------------------------------------------------------- */
 
 static void handle_menu_results(App *a) {
     int tag = 0;
@@ -1246,7 +1236,6 @@ static void handle_menu_results(App *a) {
 static void build_frame(App *a) {
     Ui *u = a->ui;
     ui_begin(u, a->W, a->H, a->now);
-    /* sidebar slide */
     float target = (!a->pinned && a->side_open) ? 1.f : 0.f;
     if (fabs(a->side_anim - target) > 0.002f) {
         a->side_anim += (float)((target - a->side_anim) * fminf(1.0, 0.25));
@@ -1265,14 +1254,10 @@ static void build_frame(App *a) {
     draw_strip(a);
     ui_set_blocked(u, base_blocked);
     draw_menubar(a);
-    draw_rail(a);
-    if (lay.panel_vis) draw_panel(a);
-    draw_hud(a);
+    if (!a->lite) { draw_rail(a); if (lay.panel_vis) draw_panel(a); draw_hud(a); }
     if (dlg) { ui_set_blocked(u, ui_menu_is_open(u)); dlg_draw_top(a); }
     ui_end(u);
 }
-
-/* ---- keyboard shortcuts ------------------------------------------------------------------------------------------------------------------ */
 
 static bool shortcut(App *a, SDL_Keycode k, Uint16 m) {
     bool ctrl = m & KMOD_CTRL, shift = m & KMOD_SHIFT, alt = m & KMOD_ALT;
@@ -1301,7 +1286,7 @@ static bool shortcut(App *a, SDL_Keycode k, Uint16 m) {
         return true;
     }
     if (k == SDLK_F5 && !ctrl && !alt) { run_action(a, A_RECHECK); return true; }
-    if (!n && !ctrl && !alt && !dlg_active(a) && !ui_keyboard_taken(a->ui)) {   /* the welcome page: 1-9 open a recent host, 0 a local shell */
+    if (!n && !ctrl && !alt && !dlg_active(a) && !ui_keyboard_taken(a->ui)) {
         if (k == SDLK_0) { do_new_local(a, NULL); return true; }
         if (k >= SDLK_1 && k <= SDLK_9 && k - SDLK_1 < nrecent) {
             SdConn *cn = sd_store_get(a->store, recents[k - SDLK_1].id);
@@ -1362,6 +1347,7 @@ static void handle_event(App *a, SDL_Event *e) {
             if (kbd_ui || !term) break;
             SDL_Keycode k = e->key.keysym.sym;
             uint32_t cp = (k >= 32 && k < 127) ? (uint32_t)k : 0;
+            if ((k == SDLK_RETURN || k == SDLK_KP_ENTER)) tcore_cmd_begin(term, now_s());
             if (tcore_key(term, map_key(k), cp, map_mods(e->key.keysym.mod))) app_redraw(a);
         }
         break;
@@ -1379,7 +1365,6 @@ static void handle_event(App *a, SDL_Event *e) {
             term_dragging = true;
             ui_release_focus(a->ui);
         }
-        /* a click in the terminal area folds a floating sidebar */
         if (!a->pinned && a->side_open && !dlg_active(a) && !ui_menu_is_open(a->ui)) {
             float mx = (float)e->button.x * a->scale, my = (float)e->button.y * a->scale;
             if (!rect_has(lay.panel, mx, my) && !rect_has(lay.rail, mx, my) && !rect_has(lay.bar, mx, my)) { a->side_open = false; ui_want_frames(a->ui, 0.3); }
@@ -1402,12 +1387,11 @@ static void handle_event(App *a, SDL_Event *e) {
             int col, row;
             cell_at(a, e->motion.x, e->motion.y, &col, &row);
             tcore_mouse_move(term, col, row, map_mods(SDL_GetModState()));
-            if (term_dragging) app_redraw(a);
         }
-        app_redraw(a);
+        if (term_dragging || ui_motion_matters(a->ui)) app_redraw(a);
         break;
     case SDL_MOUSEWHEEL: {
-        float mx = ui_mx(a->ui) / a->scale, my = ui_my(a->ui) / a->scale;   /* the toolkit's pointer: also what injected test events set */
+        float mx = ui_mx(a->ui) / a->scale, my = ui_my(a->ui) / a->scale;
         if (term && !a->blocked_for_term && rect_has(term_rect, mx * a->scale, my * a->scale) && !dlg_active(a)) {
             int col, row;
             cell_at(a, mx, my, &col, &row);
@@ -1422,11 +1406,8 @@ static void handle_event(App *a, SDL_Event *e) {
     }
 }
 
-/* ---- main ----------------------------------------------------------------------------------------------------------------------------------------- */
-
 static void *prewarm_main(void *unused) { (void)unused; font_prewarm(); return NULL; }
 
-/* the framebuffer as a PPM (tests only); RGBA is the one read-back format every OpenGL flavour must support */
 static void write_ppm(App *a, const char *path) {
     uint8_t *px = malloc((size_t)a->W * a->H * 4);
     glReadPixels(0, 0, a->W, a->H, GL_RGBA, GL_UNSIGNED_BYTE, px);
@@ -1439,7 +1420,6 @@ static void write_ppm(App *a, const char *path) {
     free(px);
 }
 
-/* Open the window with one flavour of OpenGL and build the atlas and renderer on it; false (and cleaned up) on any failure. */
 static bool gl_init(App *a, GlKind kind) {
     if (a->gl) { SDL_GL_DeleteContext(a->gl); a->gl = NULL; }
     if (a->win) { SDL_DestroyWindow(a->win); a->win = NULL; }
@@ -1452,7 +1432,7 @@ static bool gl_init(App *a, GlKind kind) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     }
-    int win_w = 1440, win_h = 780;   /* wide enough for the performance overlay; shrunk to fit small screens */
+    int win_w = 1440, win_h = 780;
     { SDL_Rect db; if (SDL_GetDisplayBounds(0, &db) == 0) { if (win_w > db.w * 95 / 100) win_w = db.w * 95 / 100; if (win_h > db.h * 90 / 100) win_h = db.h * 90 / 100; } }
     a->win = SDL_CreateWindow("Lestrix", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (a->win) {
@@ -1463,7 +1443,7 @@ static bool gl_init(App *a, GlKind kind) {
     a->gl = a->win ? SDL_GL_CreateContext(a->win) : NULL;
     tmark("GL context created");
     if (!a->gl || sd_gl_load(kind)) return false;
-    SDL_GL_SetSwapInterval(g_max_fps > 0 ? 1 : 0);   /* no cap also means no vsync wait */
+    SDL_GL_SetSwapInterval(g_max_fps > 0 ? 1 : 0);
     int ww, wh;
     SDL_GetWindowSize(a->win, &ww, &wh);
     SDL_GL_GetDrawableSize(a->win, &a->W, &a->H);
@@ -1478,7 +1458,6 @@ static bool gl_init(App *a, GlKind kind) {
 
 typedef struct { bool local; const char *cwd, *theme, *connect; char **exec; } Startup;
 
-/* --script "w:0.5;c:100,200;r:100,200;k:ctrl+n;t:text;s:file.ppm": events pushed into the app's own queue (tests only) */
 typedef struct { char **steps; int n, i; double wait_until; char *shot_file; } Script;
 
 static void script_key(const char *spec) {
@@ -1527,14 +1506,14 @@ static bool script_run(App *a, Script *sc, const char **shot_out) {
         script_mouse(a, SDL_MOUSEBUTTONDOWN, 3, x, y);
         script_mouse(a, SDL_MOUSEBUTTONUP, 3, x, y);
         sc->wait_until = a->now + 0.12;
-    } else if (sscanf(st, "p:%d,%d,%d,%d", &x, &y, &sx, &sy) == 4) {   /* press at x,y; move to sx,sy; release */
+    } else if (sscanf(st, "p:%d,%d,%d,%d", &x, &y, &sx, &sy) == 4) {
         script_mouse(a, SDL_MOUSEMOTION, 0, x, y);
         script_mouse(a, SDL_MOUSEBUTTONDOWN, 1, x, y);
         script_mouse(a, SDL_MOUSEMOTION, 0, (x + sx) / 2, (y + sy) / 2);
         script_mouse(a, SDL_MOUSEMOTION, 0, sx, sy);
         script_mouse(a, SDL_MOUSEBUTTONUP, 1, sx, sy);
         sc->wait_until = a->now + 0.15;
-    } else if (sscanf(st, "x:%d", &x) == 1) {   /* wheel: positive = up */
+    } else if (sscanf(st, "x:%d", &x) == 1) {
         SDL_Event we;
         SDL_zero(we);
         we.type = SDL_MOUSEWHEEL; we.wheel.y = x; we.wheel.preciseY = (float)x;
@@ -1548,6 +1527,25 @@ static bool script_run(App *a, Script *sc, const char **shot_out) {
 }
 
 static void jobs_wake(void) { app_wake(); }
+
+static bool cmd_pending(App *a) {
+    for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->term && tcore_cmd_active(t->term)) return true; }
+    return false;
+}
+
+static void cmd_poll_all(App *a) {
+    for (guint i = 0; i < a->tabs->len; i++) {
+        Tab *t = a->tabs->pdata[i];
+        double secs; uint64_t bytes;
+        if (!t->term || !tcore_cmd_active(t->term) || !tcore_cmd_poll(t->term, a->now, &secs, &bytes) || !a->hud) continue;
+        double gbs = secs > 0 ? (double)bytes / secs / 1073741824.0 : 0;
+        char tm[24], th[24];
+        if (secs < 1) snprintf(tm, sizeof tm, "%.0f ms", secs * 1000); else snprintf(tm, sizeof tm, "%.2f s", secs);
+        if (gbs >= 1) snprintf(th, sizeof th, "%.2f GB/s", gbs); else if (gbs >= 0.001) snprintf(th, sizeof th, "%.3f GB/s", gbs); else snprintf(th, sizeof th, "<0.001 GB/s");
+        snprintf(a->hud_seg[10], sizeof a->hud_seg[10], "cmd %s, %s", tm, th);
+        if (a->lite) hud_tick(a); else app_redraw(a);
+    }
+}
 
 static void pump_all(App *a) {
     if (jobs_pump()) app_redraw(a);
@@ -1580,6 +1578,8 @@ int main(int argc, char **argv) {
         if (g_str_equal(argv[i], "--help") || g_str_equal(argv[i], "-h")) {
             g_print("Usage: lestrix [--local] [--working-directory DIR] [-e COMMAND [ARGS...]]\n"
                     "  --local               open a local shell on startup\n"
+                    "  --no-fast-output      keep the kernel's newline processing on the pty while cat, grep, ls, find and similar print (default: switch it off for them and let the terminal add the carriage returns; about 3x faster)\n"
+                    "  --lite                terminal only: no sidebar, no stats bar; fps, cpu and cache stats go in the title bar\n"
                     "  --working-directory   start the local shell in DIR\n"
                     "  --benchmark           measure this machine's terminal throughput and exit\n"
                     "  --connect NAME        open the saved connection NAME on startup\n"
@@ -1598,6 +1598,8 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (g_str_equal(argv[i], "--local")) s.local = true;
+        else if (g_str_equal(argv[i], "--lite")) { g_lite = true; s.local = true; }
+        else if (g_str_equal(argv[i], "--no-fast-output")) tcore_set_fast_output(false);
         else if (g_str_equal(argv[i], "--working-directory") && i + 1 < argc) s.cwd = argv[++i];
         else if (g_str_equal(argv[i], "--theme") && i + 1 < argc) s.theme = argv[++i];
         else if (g_str_equal(argv[i], "--connect") && i + 1 < argc) s.connect = argv[++i];
@@ -1612,8 +1614,9 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    g_setenv("SDL_VIDEO_X11_WMCLASS", "lestrix", FALSE);
-    g_setenv("SDL_VIDEO_WAYLAND_WMCLASS", "lestrix", FALSE);
+    for (int i = 1; i < argc; i++) if (g_str_equal(argv[i], "--lite")) g_lite = true;
+    g_setenv("SDL_VIDEO_X11_WMCLASS", g_lite ? "lestrix-lite" : "lestrix", FALSE);
+    g_setenv("SDL_VIDEO_WAYLAND_WMCLASS", g_lite ? "lestrix-lite" : "lestrix", FALSE);
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     tmark("main entered");
@@ -1624,7 +1627,7 @@ int main(int argc, char **argv) {
     App *a = g_new0(App, 1);
     g_app = a;
     tmark("SDL_Init done");
-    {   /* desktop OpenGL 3.3 first, then OpenGL ES 3.0, then ES 2.0 (Raspberry Pi 2/3 and Mali-T6xx stop there); LESTRIX_GL forces one */
+    {
         GlKind order[3] = {GLK_CORE, GLK_ES3, GLK_ES2};
         int n = 3, first = 0;
         const char *force = getenv("LESTRIX_GL");
@@ -1714,7 +1717,7 @@ int main(int argc, char **argv) {
         a->now = now_s();
         int wait = 250;
         bool focused = (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS) != 0;
-        {   /* nothing to draw: sleep until the next timer instead of waking four times a second; an unfocused window barely wakes at all */
+        {
             double due = a->next_trim < a->next_probe ? a->next_trim : a->next_probe;
             if (a->hud && a->next_hud < due) due = a->next_hud;
             if (a->follow_fleet && a->next_fleet < due) due = a->next_fleet;
@@ -1722,7 +1725,7 @@ int main(int argc, char **argv) {
             double left = due - a->now;
             wait = left < 0.001 ? 1 : left > 1.0 ? 1000 : (int)(left * 1000.0) + 1;
         }
-        {   /* sleep until something can happen: a pending redraw waits out the flood gap instead of spinning */
+        {
             Tab *wt = app_cur_tab(a);
             uint64_t wfed = wt && wt->term ? tcore_bytes_fed(wt->term) : 0;
             double gap = frame_gap(wfed - last_draw_bytes >= 256 * 1024);
@@ -1730,9 +1733,11 @@ int main(int argc, char **argv) {
             else if (a->dirty) { double left = last_draw + gap - a->now; wait = left > 0 ? (int)(left * 1000.0) + 1 : 0; }
         }
         if (flood && flood_sent && wait > 2) wait = 2;
+        if (wait > 20 && cmd_pending(a)) wait = 20;
         if (SDL_WaitEventTimeout(&e, wait)) { do handle_event(a, &e); while (SDL_PollEvent(&e)); }
         a->now = now_s();
         pump_all(a);
+        cmd_poll_all(a);
         while (script_run(a, &script, &script_shot)) { if (a->now < script.wait_until) break; }
         if (flood && !flood_sent && a->now - t0 > 1.0 && app_cur_tab(a)) {
             char cmd[1024];
@@ -1743,7 +1748,7 @@ int main(int argc, char **argv) {
         if (run_cmd && !flood_sent && a->now - t0 > 1.0 && app_cur_tab(a)) { tcore_send_str(app_cur_tab(a)->term, run_cmd); flood_sent = true; }
         if (flood && flood_sent && app_cur_tab(a) && tcore_screen_contains(app_cur_tab(a)->term, "FLOOD_DONE_42")) {
             printf("flood finished in %.2fs\n", a->now - flood_t);
-            if (getenv("LESTRIX_THREADS")) {   /* where the CPU went, per thread */
+            if (getenv("LESTRIX_THREADS")) {
                 GDir *d = g_dir_open("/proc/self/task", 0, NULL);
                 const char *n;
                 while (d && (n = g_dir_read_name(d))) {
@@ -1766,11 +1771,10 @@ int main(int argc, char **argv) {
         if (a->now >= a->next_hud) { a->next_hud = a->now + (focused ? 1 : 5); if (a->hud) hud_tick(a); }
         if (a->now >= a->next_trim) { a->next_trim = a->now + 5; trim_tick(a); }
         if (a->now >= a->next_probe) { a->next_probe = a->now + 30; if (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS) probe_all(a); }
-        if (!focused) { if (!a->blink_on) { a->blink_on = true; app_redraw(a); } a->last_blink = a->now; }   /* unfocused: a solid cursor, no blinking, no frames */
+        if (!focused) { if (!a->blink_on) { a->blink_on = true; app_redraw(a); } a->last_blink = a->now; }
         else if (a->now - a->last_blink > 0.53) { a->last_blink = a->now; a->blink_on = !a->blink_on; if (app_cur_tab(a) && app_cur_tab(a)->term) app_redraw(a); }
         Tab *ct = app_cur_tab(a);
         uint64_t fed = ct && ct->term ? tcore_bytes_fed(ct->term) : 0;
-        /* a flood scrolls faster than anyone can read: redraw at most every 33 ms while output is heavy */
         double min_gap = frame_gap(fed - last_draw_bytes >= 256 * 1024);
         if ((a->dirty || ui_animating(a->ui)) && a->now - last_draw >= min_gap) {
             last_draw = a->now;
@@ -1786,7 +1790,7 @@ int main(int argc, char **argv) {
                 script_shot = NULL;
             }
             if (script.n && script.i >= script.n && a->now > script.wait_until + 0.2 && !shot) a->running = false;
-            if (shot && a->now - t0 > shot_after) {   /* write the frame as a PPM and stop: lets the UI be checked without touching the screen */
+            if (shot && a->now - t0 > shot_after) {
                 write_ppm(a, shot);
                 a->running = false;
             }

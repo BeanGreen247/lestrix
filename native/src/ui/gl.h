@@ -1,16 +1,17 @@
-/* gl.h - the few OpenGL 3.3 entry points the renderer needs, loaded at run time through the platform layer.
- * (GL 1.x functions such as glClear and glTexImage2D come straight from the system library.) */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #ifndef SD_GL_H
 #define SD_GL_H
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
 
-/* Which flavour of OpenGL the window got: chosen at start-up, tried in this order unless LESTRIX_GL (core|es3|es2) forces one. */
 typedef enum { GLK_CORE = 0, GLK_ES3 = 1, GLK_ES2 = 2 } GlKind;
 extern GlKind sd_gl_kind;
 
 typedef struct {
-    /* the old 1.x entry points are loaded too: an ES context on a board need not have a desktop libGL to link against */
     void (APIENTRY *Viewport)(GLint, GLint, GLsizei, GLsizei);
     void (APIENTRY *Scissor)(GLint, GLint, GLsizei, GLsizei);
     void (APIENTRY *Enable)(GLenum);
@@ -62,9 +63,8 @@ typedef struct {
 } SdGL;
 
 extern SdGL gl;
-int sd_gl_load(GlKind kind);   /* after the context is current; 0 on success (ES 2 does not need VAOs or instancing) */
+int sd_gl_load(GlKind kind);
 
-/* the rest of the code keeps writing glClear(...) and gets the run-time-loaded function */
 #define glViewport gl.Viewport
 #define glScissor gl.Scissor
 #define glEnable gl.Enable

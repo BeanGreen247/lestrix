@@ -1,3 +1,6 @@
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
 """Differential test: the C terminal core must agree with pyte on random escape-sequence streams.
 
 Run from native/: ../.venv/bin/python tests/diff_pyte.py [seeds]
@@ -59,11 +62,11 @@ def color(c: int) -> str:
 
 def c_cell(t, cell):
     flags = cell.sf & 0xFF
-    if flags & 2:            # tail of a wide char
+    if flags & 2:
         return ("", "", "", 0)
     ch = cell.cp & 0x1FFFFF
     if ch == 0 or ch == 32:
-        return (" ", "", "", 0)  # blank: colours are not compared (erase colouring differs from pyte)
+        return (" ", "", "", 0)
     s = vt.vt_style(t, cell.sf >> 8).contents
     text = chr(ch)
     comb = vt.vt_comb_char(t, cell.cp >> 21)
@@ -113,7 +116,7 @@ def run(seed: int, cols=40, rows=12) -> bool:
     pyte.ByteStream(ref).feed(data)
     t = vt.vt_new(cols, rows, 100)
     pos = 0
-    while pos < len(data):  # arbitrary chunk boundaries, including mid-sequence and mid-UTF-8
+    while pos < len(data):
         n = rnd.randint(1, 41)
         vt.vt_feed(t, data[pos:pos + n], len(data[pos:pos + n]))
         pos += n

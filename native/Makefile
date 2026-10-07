@@ -1,8 +1,8 @@
-# Native build. Needs: gcc, make, pkg-config and the development files of SDL2, FreeType, fontconfig, OpenGL, GLib and libcurl.
-# No GTK or Qt: the window, the widgets and the text rendering are Lestrix's own code on top of SDL2 and OpenGL.
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
 CC      ?= gcc
 CFLAGS  ?= -O3
-# GCC code-layout and vectorisation options that measured +5% on the terminal engine (interleaved A/B, all five workloads); skipped for compilers that lack them
 GCC_TUNE := $(shell $(CC) -freorder-blocks-algorithm=simple -fvect-cost-model=unlimited -E -x c /dev/null >/dev/null 2>&1 && echo -freorder-blocks-algorithm=simple -fvect-cost-model=unlimited)
 CFLAGS  += $(GCC_TUNE)
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-deprecated-declarations -Wno-missing-field-initializers -fvisibility=hidden -pthread
@@ -14,7 +14,6 @@ all: app
 $(BUILD):
 	mkdir -p $@
 
-# shared build of the terminal core, used by the differential tests
 $(BUILD)/libvt.so: src/vt.c src/lz.c src/vt.h | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -shared -fvisibility=default -o $@ src/vt.c src/lz.c
 
@@ -27,7 +26,6 @@ $(BUILD)/test_vt: tests/test_vt.c src/vt.c src/lz.c src/vt.h | $(BUILD)
 $(BUILD)/bench_vt: tests/bench_vt.c src/bench.c src/vt.c src/lz.c src/vt.h | $(BUILD)
 	$(CC) -O3 -march=native -std=gnu11 -o $@ tests/bench_vt.c src/bench.c src/vt.c src/lz.c
 
-# terminal core: unit tests under ASan/UBSan, then a differential test against pyte when it is importable
 test-vt: $(BUILD)/test_vt $(BUILD)/libvt.so
 	$(BUILD)/test_vt
 	@PY=$$(for p in ../.venv/bin/python python3; do $$p -c "import pyte" 2>/dev/null && echo $$p && break; done); \
@@ -84,15 +82,16 @@ install: $(BUILD)/lestrix $(BUILD)/lxcat
 	install -m 755 $(BUILD)/lxcat $(BINDIR)/lxcat
 	install -m 644 data/lestrix.png $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png
 	sed 's|@BINDIR@|$(BINDIR)|g' data/lestrix.desktop.in > $(DATADIR)/applications/lestrix.desktop
-	chmod 644 $(DATADIR)/applications/lestrix.desktop   # root's umask is often 027: a menu entry the user cannot read does not show up
-	-desktop-file-validate $(DATADIR)/applications/lestrix.desktop 2>&1 | sed 's/^/desktop-file-validate: /'
+	sed 's|@BINDIR@|$(BINDIR)|g' data/lestrix-lite.desktop.in > $(DATADIR)/applications/lestrix-lite.desktop
+	chmod 644 $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop
+	-desktop-file-validate $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop 2>&1 | sed 's/^/desktop-file-validate: /'
 	-update-desktop-database $(DATADIR)/applications 2>/dev/null
 	-chmod 644 $(DATADIR)/applications/mimeinfo.cache 2>/dev/null
 	-gtk-update-icon-cache -q -t $(DATADIR)/icons/hicolor 2>/dev/null || true
 	-chmod -R a+rX $(DATADIR)/icons/hicolor 2>/dev/null
 
 uninstall:
-	rm -f $(BINDIR)/lestrix $(BINDIR)/lxcat $(DATADIR)/applications/lestrix.desktop $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png
+	rm -f $(BINDIR)/lestrix $(BINDIR)/lxcat $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png
 	-update-desktop-database $(DATADIR)/applications 2>/dev/null
 	-gtk-update-icon-cache -q -t $(DATADIR)/icons/hicolor 2>/dev/null || true
 
@@ -102,7 +101,6 @@ $(BUILD)/test_lz: tests/test_lz.c src/lz.c src/lz.h | $(BUILD)
 test-lz: $(BUILD)/test_lz
 	$(BUILD)/test_lz
 
-# the history worker threads, under ThreadSanitizer
 $(BUILD)/test_vt_tsan: tests/test_vt.c src/vt.c src/lz.c src/vt.h src/lz.h | $(BUILD)
 	$(CC) -std=gnu11 -O3 -g -pthread -fsanitize=thread -o $@ tests/test_vt.c src/vt.c src/lz.c
 
@@ -115,7 +113,6 @@ $(BUILD)/perf_gate: tests/perf_gate.c src/vt.c src/lz.c src/vt.h | $(BUILD)
 perf-gate: $(BUILD)/perf_gate
 	$(BUILD)/perf_gate
 
-# Needs a display and OpenGL 3.3: drives the real window with scripted input and checks that it runs and draws.
 test-gui: $(BUILD)/lestrix
 	@set -e; d=$$(mktemp -d); mkdir -p $$d/lestrix; \
 	 for s in "w:0.5;s:$$d/a.ppm" "w:0.5;c:28,15;w:0.3;s:$$d/b.ppm" "w:0.5;c:303,56;w:0.4;t:name;k:escape;w:0.2;s:$$d/c.ppm"; do \
@@ -124,14 +121,12 @@ test-gui: $(BUILD)/lestrix
 	 for f in a b c; do test -s $$d/$$f.ppm || { echo "test-gui: no frame $$f"; exit 1; }; done; \
 	 rm -rf $$d; echo "test-gui: ok"
 
-# the bulk UTF-8 path against the general path, under ASan/UBSan, on random text split at random points
 $(BUILD)/test_fast_paths: tests/test_fast_paths.c src/vt.c src/lz.c src/vt.h | $(BUILD)
 	$(CC) -std=gnu11 -O3 -g -pthread -fsanitize=address,undefined -o $@ tests/test_fast_paths.c src/vt.c src/lz.c
 
 test-fast: $(BUILD)/test_fast_paths
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/test_fast_paths
 
-# The cross-terminal benchmark: a 1 GiB file of random text, listed with `cat` in each terminal (see bench/)
 bench-file: $(BUILD)/gen_random
 	$(BUILD)/gen_random /tmp/lestrix-bench-1g.txt 1024
 $(BUILD)/gen_random: bench/gen_random.c | $(BUILD)

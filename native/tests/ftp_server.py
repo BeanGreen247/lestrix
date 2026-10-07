@@ -1,3 +1,6 @@
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
 """A small FTP server for tests (stdlib only). Prints its port, serves a temp dir, quits on SIGTERM."""
 import os, socket, socketserver, sys, threading, time
 

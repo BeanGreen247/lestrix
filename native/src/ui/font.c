@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "font.h"
 
 #include <ft2build.h>
@@ -19,12 +24,12 @@ struct Font {
     double px;
     bool mono;
     uint32_t id;
-    FaceEnt style[4];            /* regular, bold, italic, bold italic; face NULL = synthesize from regular */
-    char *family;                /* kept so the other styles can be opened the first time they are needed */
+    FaceEnt style[4];
+    char *family;
     bool tried[4];
-    FaceEnt *fb;                 /* fallback faces opened on demand */
+    FaceEnt *fb;
     int nfb, capfb;
-    uint32_t neg[NEG_SLOTS];     /* code points no installed font has (so fontconfig is asked only once) */
+    uint32_t neg[NEG_SLOTS];
     int cw, ch, ascent;
     uint8_t *scratch;
     size_t scratch_cap;
@@ -44,7 +49,6 @@ static bool open_face(Font *f, FaceEnt *e, const char *path, int index) {
     return true;
 }
 
-/* ask fontconfig for the best file for a pattern; the caller frees *path */
 static bool match(const char *family, int weight, int slant, uint32_t cp, bool mono, char **path, int *index) {
     FcPattern *pat = FcPatternCreate();
     if (family) FcPatternAddString(pat, FC_FAMILY, (const FcChar8 *)family);
@@ -78,7 +82,6 @@ static bool match(const char *family, int weight, int slant, uint32_t cp, bool m
 static const struct { int weight, slant; } STYLE_WANT[4] = {
     {FC_WEIGHT_REGULAR, FC_SLANT_ROMAN}, {FC_WEIGHT_BOLD, FC_SLANT_ROMAN}, {FC_WEIGHT_REGULAR, FC_SLANT_ITALIC}, {FC_WEIGHT_BOLD, FC_SLANT_ITALIC}};
 
-/* open one style's face now (once); a style that resolves to the regular file is synthesized instead of loaded twice */
 static void load_style(Font *f, int s) {
     if (f->tried[s]) return;
     f->tried[s] = true;
@@ -101,7 +104,6 @@ Font *font_open(const char *family, double px, bool mono) {
     f->family = family ? strdup(family) : NULL;
     load_style(f, FS_REGULAR);
     if (!f->style[0].face) { font_close(f); return NULL; }
-    /* cell metrics from the regular face */
     FT_Face fc = f->style[0].face;
     if (FT_Load_Char(fc, 'M', FT_LOAD_TARGET_LIGHT) == 0) f->cw = (int)lround(fc->glyph->metrics.horiAdvance / 64.0);
     int asc = (int)ceil(fc->size->metrics.ascender / 64.0), desc = (int)ceil(-fc->size->metrics.descender / 64.0);
@@ -134,11 +136,10 @@ int font_ascent(const Font *f) { return f->ascent; }
 static bool neg_has(const Font *f, uint32_t cp) { return f->neg[(cp * 2654435761u) % NEG_SLOTS] == cp; }
 static void neg_add(Font *f, uint32_t cp) { f->neg[(cp * 2654435761u) % NEG_SLOTS] = cp; }
 
-/* the face to draw cp with; *synth_bold / *synth_italic say what the face cannot do itself */
 static FT_Face pick_face(Font *f, uint32_t cp, int style, bool *synth_bold, bool *synth_italic) {
     bool want_b = style & FS_BOLD, want_i = style & FS_ITALIC;
     *synth_bold = *synth_italic = false;
-    if (style) { load_style(f, style); if (want_b && want_i) { load_style(f, FS_BOLD); load_style(f, FS_ITALIC); } else if (want_b || want_i) { /* the regular face is the fallback */ } }
+    if (style) { load_style(f, style); if (want_b && want_i) { load_style(f, FS_BOLD); load_style(f, FS_ITALIC); } else if (want_b || want_i) {  } }
     FaceEnt *e = &f->style[style];
     if (e->face && FT_Get_Char_Index(e->face, cp)) return e->face;
     e = &f->style[0];
@@ -154,11 +155,11 @@ static FT_Face pick_face(Font *f, uint32_t cp, int style, bool *synth_bold, bool
     char *path = NULL;
     int idx = 0;
     if (match(NULL, FC_WEIGHT_REGULAR, FC_SLANT_ROMAN, cp, f->mono, &path, &idx)) {
-        for (int i = 0; i < f->nfb; i++)   /* already open: the font simply lacks the glyph */
+        for (int i = 0; i < f->nfb; i++)
             if (f->fb[i].path && strcmp(f->fb[i].path, path) == 0 && f->fb[i].index == idx) { free(path); neg_add(f, cp); return NULL; }
         if (f->nfb == f->capfb) {
             int nc = f->capfb ? f->capfb * 2 : 8;
-            if (nc > 64) { free(path); neg_add(f, cp); return NULL; }   /* bounded: a hostile stream cannot open files forever */
+            if (nc > 64) { free(path); neg_add(f, cp); return NULL; }
             FaceEnt *nf = realloc(f->fb, (size_t)nc * sizeof *nf);
             if (!nf) { free(path); return NULL; }
             f->fb = nf; f->capfb = nc;
@@ -184,7 +185,7 @@ bool font_glyph(Font *f, uint32_t cp, int style, GlyphBmp *out) {
     FT_GlyphSlot slot = face->glyph;
     if (slot->format == FT_GLYPH_FORMAT_OUTLINE) {
         if (si) {
-            FT_Matrix m = {0x10000, 0x5800, 0, 0x10000};   /* about 12 degrees of slant */
+            FT_Matrix m = {0x10000, 0x5800, 0, 0x10000};
             FT_Outline_Transform(&slot->outline, &m);
         }
         if (sb) FT_Outline_Embolden(&slot->outline, (FT_Pos)(f->px * 64.0 / 24.0));
@@ -239,8 +240,6 @@ char *font_pick_family(const char *const *wanted) {
     return NULL;
 }
 
-/* Start-up helper, safe to run on its own thread while the window is being created: makes fontconfig read its cache and settle
- * the common lookups now, so the later font_open calls find everything ready. */
 void font_prewarm(void) {
     if (!FcInit()) return;
     static const char *const fams[] = {"sans", "monospace", "JetBrains Mono", "DejaVu Sans Mono", NULL};

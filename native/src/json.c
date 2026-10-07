@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "json.h"
 
 #include <stdlib.h>
@@ -36,7 +41,7 @@ static int hex4(const char *p) {
 }
 
 static char *parse_string(Parser *ps) {
-    ps->p++; /* opening quote */
+    ps->p++;
     GString *s = g_string_new(NULL);
     while (ps->p < ps->end && *ps->p != '"') {
         if (*ps->p == '\\' && ps->p + 1 < ps->end) {

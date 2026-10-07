@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #define _GNU_SOURCE
 #include "tcore.h"
 
@@ -9,6 +14,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -18,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "../pty.h"
@@ -31,22 +38,23 @@ static bool default_spill = true;
 struct TermCore {
     Vt *vt;
     SdPty pty;
-    pthread_mutex_t lock;              /* guards vt and everything a renderer reads from it (recursive) */
-    pthread_t worker;                  /* the parser thread */
+    pthread_mutex_t lock;
+    pthread_t worker;
     bool worker_started;
-    /* split I/O: a reader thread takes bytes off the pty into a ring of buffers, the worker parses them, a writer thread sends input to the child */
     bool io_split, reader_started, writer_started;
     pthread_t reader, writer;
     pthread_mutex_t iom; pthread_cond_t io_data, io_space, out_cv;
     struct { uint8_t *data; size_t n; } iob[8];
     int io_head, io_count;
     bool io_eof;
-    int wake[2];                       /* pipe: tells the worker there is output to write or to stop */
+    int wake[2];
     atomic_int stop, act_flag, eof_flag, running_flag, wake_pending;
-    atomic_int ui_waiting;      /* threads (the drawing thread) waiting for the lock: the parser steps aside between slices */
+    atomic_int ui_waiting;
     atomic_ullong bytes_fed;
-    char fastcat_token[33];     /* empty = fast cat off for this tab */
-    atomic_ullong reads;     /* successful read() calls on the pty */
+    struct { bool on, saw_child, alt; double t0, t_last, t_back; uint64_t fed0, fed_last; } cmd;
+    struct { bool active, suspect, th_started; struct termios saved; pid_t fg, last_checked; double release_at; pthread_t th; atomic_int restored, cancel; int pidfd; } fo;
+    char fastcat_token[33];
+    atomic_ullong reads;
     bool running, eof, child_done;
     int exit_status;
     pthread_mutex_t outlock, evlock;
@@ -65,7 +73,7 @@ struct TermCore {
     void *user;
 };
 
-static inline void lock_counted(TermCore *t) {   /* a thread waiting here makes the parser step aside between slices (see feed_sliced) */
+static inline void lock_counted(TermCore *t) {
     atomic_fetch_add_explicit(&t->ui_waiting, 1, memory_order_relaxed);
     pthread_mutex_lock(&t->lock);
     atomic_fetch_sub_explicit(&t->ui_waiting, 1, memory_order_relaxed);
@@ -86,12 +94,162 @@ void tcore_unlock(TermCore *t) { UNLOCK(t); }
 int tcore_cols(const TermCore *t) { return t->cols; }
 int tcore_rows(const TermCore *t) { return t->rows; }
 bool tcore_running(const TermCore *t) { return t->running; }
-/* Microseconds to wait after a tiny read (under 1 KB: a line at a time), so the next read finds more data; big reads mean data is already flowing and are never delayed, so the next read finds more data: about 40x fewer system calls and 40% less CPU in a flood, no slower. 0 = off. */
 int tcore_read_delay_us = 200;
-int tcore_io_threads = -1;   /* 2 = a reader and a writer thread per tab besides the parser; 0 = one thread does it all; -1 = decide from the cores */
+int tcore_io_threads = -1;
 const char *tcore_cat_dir = NULL;
 
 uint64_t tcore_reads(const TermCore *t) { return atomic_load((atomic_ullong *)&t->reads); }
+static bool g_fast_output = true;
+
+void tcore_set_fast_output(bool on) { g_fast_output = on; }
+
+static bool fo_comm_ok(pid_t pgrp) {
+    static const char *const ok[] = {"cat", "ls", "grep", "egrep", "fgrep", "rg", "find", "fd", "seq", "tail", "head", "tree", "du", "df", "ps", "lsblk", "wc", "sort",
+                                     "uniq", "cut", "tr", "sed", "awk", "gawk", "mawk", "base64", "od", "hexdump", "xxd", "dd", "zcat", "bzcat", "xzcat", "strings",
+                                     "nl", "tac", "rev", "fold", "yes", "make", "gcc", "cc", "g++", "cargo", "tar", "unzip", "rsync", "zgrep"};
+    char path[64], comm[32];
+    snprintf(path, sizeof path, "/proc/%d/comm", (int)pgrp);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, comm, sizeof comm - 1);
+    close(fd);
+    if (n <= 0) return false;
+    comm[n] = 0;
+    char *nl = strchr(comm, '\n');
+    if (nl) *nl = 0;
+    for (size_t i = 0; i < sizeof ok / sizeof *ok; i++) if (!strcmp(comm, ok[i])) return true;
+    return false;
+}
+
+static void fo_restore_kernel(TermCore *t) {
+    struct termios cur;
+    if (t->pty.fd >= 0 && tcgetattr(t->pty.fd, &cur) == 0) {
+        cur.c_oflag = (cur.c_oflag & ~(OPOST | ONLCR)) | (t->fo.saved.c_oflag & (OPOST | ONLCR));
+        tcsetattr(t->pty.fd, TCSANOW, &cur);
+    }
+}
+
+static void *fo_watch_main(void *data) {
+    TermCore *t = data;
+    struct pollfd p = {t->fo.pidfd, POLLIN, 0};
+    while (!atomic_load(&t->stop) && !atomic_load(&t->fo.cancel))
+        if (poll(&p, 1, 100) > 0) break;
+    fo_restore_kernel(t);
+    atomic_store(&t->fo.restored, 1);
+    return NULL;
+}
+
+static void fo_join(TermCore *t) {
+    if (!t->fo.th_started) return;
+    pthread_join(t->fo.th, NULL);
+    t->fo.th_started = false;
+    if (t->fo.pidfd >= 0) { close(t->fo.pidfd); t->fo.pidfd = -1; }
+}
+
+static void fo_shutdown(TermCore *t) {
+    atomic_store(&t->fo.cancel, 1);
+    fo_join(t);
+    t->fo.active = false;
+}
+
+static bool fo_activate(TermCore *t, pid_t fg, const struct termios *cur, bool already_off) {
+    int pfd = (int)syscall(SYS_pidfd_open, fg, 0);
+    if (pfd < 0) return false;
+    t->fo.saved = *cur;
+    t->fo.saved.c_oflag |= OPOST | ONLCR;
+    t->fo.fg = fg;
+    t->fo.release_at = 0;
+    t->fo.pidfd = pfd;
+    atomic_store(&t->fo.cancel, 0);
+    atomic_store(&t->fo.restored, 0);
+    LOCK(t);
+    vt_set_force_nl(t->vt, true);
+    UNLOCK(t);
+    if (!already_off) {
+        struct termios off = *cur;
+        off.c_oflag &= ~(OPOST | ONLCR);
+        if (tcsetattr(t->pty.fd, TCSANOW, &off) != 0) { close(pfd); t->fo.pidfd = -1; return false; }
+    }
+    if (pthread_create(&t->fo.th, NULL, fo_watch_main, t) != 0) { fo_restore_kernel(t); close(pfd); t->fo.pidfd = -1; return false; }
+    t->fo.th_started = true;
+    t->fo.active = true;
+    t->fo.suspect = true;
+    return true;
+}
+
+static void fo_step(TermCore *t, double now) {
+    if (!g_fast_output || t->pty.fd < 0) return;
+    if (t->fo.active) {
+        if (atomic_load(&t->fo.restored)) {
+            fo_join(t);
+            t->fo.active = false;
+            t->fo.release_at = now + 0.25;
+            atomic_store(&t->fo.restored, 0);
+        }
+        return;
+    }
+    pid_t fg = tcgetpgrp(t->pty.fd);
+    if (t->fo.release_at > 0 && now >= t->fo.release_at) {
+        LOCK(t);
+        vt_set_force_nl(t->vt, false);
+        UNLOCK(t);
+        t->fo.release_at = 0;
+    }
+    if (fg <= 0) return;
+    struct termios cur;
+    if (t->fo.suspect && t->fo.release_at == 0 && tcgetattr(t->pty.fd, &cur) == 0 && (cur.c_oflag & (OPOST | ONLCR)) != (OPOST | ONLCR)) {
+        bool shell = fg == t->pty.pid;
+        if (getenv("LX_FODEBUG")) fprintf(stderr, "fastout: kernel newline processing found off (fg %s)\n", shell ? "shell" : "child");
+        if (!shell && fo_comm_ok(fg)) { fo_activate(t, fg, &cur, true); return; }
+        if (shell || !fo_comm_ok(fg)) {
+            cur.c_oflag |= OPOST | ONLCR;
+            tcsetattr(t->pty.fd, TCSANOW, &cur);
+            return;
+        }
+    }
+    if (fg == t->pty.pid) { t->fo.last_checked = 0; return; }
+    if (fg == t->fo.last_checked) return;
+    t->fo.last_checked = fg;
+    if (!fo_comm_ok(fg)) return;
+    if (tcgetattr(t->pty.fd, &cur) != 0 || (cur.c_oflag & (OPOST | ONLCR)) != (OPOST | ONLCR)) return;
+    fo_activate(t, fg, &cur, false);
+}
+
+void tcore_cmd_begin(TermCore *t, double now) {
+    if (t->cmd.on || t->pty.fd < 0 || (tcore_modes(t) & VT_M_ALT_SCREEN) || tcgetpgrp(t->pty.fd) != t->pty.pid) return;
+    uint64_t fed = atomic_load(&t->bytes_fed);
+    t->cmd.on = true; t->cmd.saw_child = false; t->cmd.alt = false; t->cmd.t_back = 0;
+    t->cmd.t0 = t->cmd.t_last = now; t->cmd.fed0 = t->cmd.fed_last = fed;
+}
+
+bool tcore_cmd_active(const TermCore *t) { return t->cmd.on || t->fo.active || t->fo.release_at > 0; }
+
+bool tcore_cmd_poll(TermCore *t, double now, double *secs, uint64_t *bytes) {
+    fo_step(t, now);
+    if (!t->cmd.on) return false;
+    uint64_t fed = atomic_load(&t->bytes_fed);
+    if (fed != t->cmd.fed_last) { t->cmd.fed_last = fed; t->cmd.t_last = now; }
+    if (tcore_modes(t) & VT_M_ALT_SCREEN) t->cmd.alt = true;
+    pid_t fg = t->pty.fd >= 0 ? tcgetpgrp(t->pty.fd) : -1;
+    if (fg != t->pty.pid && fg > 0) t->cmd.saw_child = true;
+    if (fg < 0) { t->cmd.on = false; return false; }
+    if (fg != t->pty.pid) { t->cmd.t_back = 0; return false; }
+    double end;
+    if (t->cmd.saw_child) {
+        if (t->cmd.t_back == 0) t->cmd.t_back = now;
+        if (now - t->cmd.t_last < 0.03) return false;
+        end = t->cmd.t_back > t->cmd.t_last ? t->cmd.t_back : t->cmd.t_last;
+    } else {
+        if (now - t->cmd.t_last < 0.05 || now - t->cmd.t0 < 0.05) return false;
+        end = t->cmd.t_last;
+    }
+    t->cmd.on = false;
+    if (t->cmd.alt) return false;
+    *secs = end - t->cmd.t0;
+    *bytes = fed - t->cmd.fed0;
+    return true;
+}
+
 uint64_t tcore_bytes_fed(const TermCore *t) { return atomic_load((atomic_ullong *)&t->bytes_fed); }
 const char *tcore_title(const TermCore *t) { return t->title; }
 bool tcore_focused(const TermCore *t) { return t->focused; }
@@ -110,14 +268,13 @@ static void wake_ui(TermCore *t) {
 
 static void wake_worker(TermCore *t) {
     if (t->wake[1] >= 0) { char c = 1; ssize_t r = write(t->wake[1], &c, 1); (void)r; }
-    if (t->io_split) {   /* the writer sleeps on a condition, the parser on the ring */
+    if (t->io_split) {
         pthread_mutex_lock(&t->iom);
         pthread_cond_broadcast(&t->out_cv); pthread_cond_broadcast(&t->io_data); pthread_cond_broadcast(&t->io_space);
         pthread_mutex_unlock(&t->iom);
     }
 }
 
-/* any thread: queue bytes for the child; the worker writes them */
 void tcore_send(TermCore *t, const char *data, size_t len) {
     if (!len || !atomic_load(&t->running_flag)) return;
     pthread_mutex_lock(&t->outlock);
@@ -136,7 +293,6 @@ void tcore_send_str(TermCore *t, const char *s) { tcore_send(t, s, strlen(s)); }
 
 static void vt_write_cb(const uint8_t *d, size_t n, void *user) { tcore_send(user, (const char *)d, n); }
 
-/* runs on the worker thread inside vt_feed: queue the notification for the UI thread */
 static void vt_event_cb(VtEvent ev, const char *text, void *user) {
     TermCore *t = user;
     PendingEv *pe = calloc(1, sizeof *pe);
@@ -150,7 +306,6 @@ static void vt_event_cb(VtEvent ev, const char *text, void *user) {
     wake_ui(t);
 }
 
-/* the renderer keeps a per-line cache in VtLineMeta.cache; it is plain malloc'd memory */
 static void cache_free_cb(void *cache, void *user) { (void)user; free(cache); }
 
 static void term_print(TermCore *t, const char *s) {
@@ -172,10 +327,7 @@ static void flush_out(TermCore *t, bool *still_pending) {
     pthread_mutex_unlock(&t->outlock);
 }
 
-/* Parse `n` bytes in slices small enough (~0.3 ms) that a frame can be drawn between them: when the drawing thread is waiting for the
- * lock the parser lets it in before taking the next slice, so frame rate does not depend on how much data is being poured in. */
 static void feed_sliced(TermCore *t, const uint8_t *p, size_t n, bool notify) {
-    /* streamed files come in big slices so the parser can spread plain text over cores (see vt.c); program output is read in 64 KB pieces anyway */
     const size_t SLICE = notify ? 512 * 1024 : 64 * 1024;
     while (n) {
         size_t k = n < SLICE ? n : SLICE;
@@ -183,43 +335,31 @@ static void feed_sliced(TermCore *t, const uint8_t *p, size_t n, bool notify) {
         vt_feed(t->vt, p, k);
         UNLOCK(t);
         p += k; n -= k;
-        if (notify) { atomic_fetch_add(&t->bytes_fed, k); atomic_store(&t->act_flag, 1); wake_ui(t); }   /* streamed files: every slice is new output */
+        if (notify) { atomic_fetch_add(&t->bytes_fed, k); atomic_store(&t->act_flag, 1); wake_ui(t); }
         for (int spin = 0; atomic_load_explicit(&t->ui_waiting, memory_order_relaxed) > 0 && spin < 2000; spin++) sched_yield();
     }
 }
 
-/* Feed program output to the parser. A fast-cat request (OSC 7777) stops the parser at that exact byte; the file is read here, in
- * big chunks, and fed in at that point, so it appears in order with everything around it. */
 static void stream_file(TermCore *t, const char *path, uint64_t off, uint64_t len, unsigned flags) {
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
     if (fd < 0) return;
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return; }   /* regular files only: never a device, pipe or socket */
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return; }
     enum { CH = 1 << 20 };
-    uint8_t *in = malloc(CH), *out = malloc(2 * CH);
-    if (in && out) {
+    uint8_t *in = malloc(CH);
+    if (in) {
         uint64_t done = 0;
+        if (flags & 2) { LOCK(t); vt_set_stream_nl(t->vt, true); UNLOCK(t); }
         while (!atomic_load(&t->stop) && (len == 0 || done < len)) {
             size_t want = len ? (len - done < CH ? (size_t)(len - done) : (size_t)CH) : (size_t)CH;
             ssize_t n = pread(fd, in, want, (off_t)(off + done));
             if (n <= 0) break;
-            const uint8_t *src = in; size_t outn = (size_t)n;
-            if (flags & 2) {   /* what the tty would have done to a newline on the way out: LF -> CR LF */
-                size_t o = 0;
-                for (ssize_t i = 0; i < n; ) {
-                    const uint8_t *nl = memchr(in + i, '\n', (size_t)(n - i));
-                    size_t seg = nl ? (size_t)(nl - (in + i)) : (size_t)(n - i);
-                    memcpy(out + o, in + i, seg); o += seg; i += (ssize_t)seg;
-                    if (nl) { out[o++] = '\r'; out[o++] = '\n'; i++; }
-                }
-                src = out; outn = o;
-            }
-            feed_sliced(t, src, outn, true);
+            feed_sliced(t, in, (size_t)n, true);
             done += (uint64_t)n;
         }
+        if (flags & 2) { LOCK(t); vt_set_stream_nl(t->vt, false); UNLOCK(t); }
     }
-    free(in); free(out);
-    /* a temporary copy made by lxcat (for piped input) is ours to remove: only in its own place, only if it is ours */
+    free(in);
     if ((flags & 1) && !strncmp(path, "/dev/shm/lxcat-", 15) && st.st_uid == getuid()) unlink(path);
     close(fd);
 }
@@ -237,12 +377,10 @@ static void feed_output(TermCore *t, const uint8_t *p, size_t n) {
     }
 }
 
-/* ---- split I/O: reader thread -> ring of buffers -> parser thread; writer thread for input ------------------------------------------------------ */
-
-/* reads the pty as fast as the parser lets it; never parses */
 static void *reader_main(void *data) {
+    prctl(PR_SET_NAME, "lx-reader", 0, 0, 0);
     TermCore *t = data;
-    prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);   /* a 20 us wait should take about 20 us, not the default 50 us more */
+    prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
     while (!atomic_load(&t->stop)) {
         struct pollfd fds[2] = {{t->pty.fd, POLLIN, 0}, {t->wake[0], POLLIN, 0}};
         if (poll(fds, 2, -1) < 0 && errno != EINTR) break;
@@ -267,7 +405,7 @@ static void *reader_main(void *data) {
                 continue;
             }
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) break;
-            pthread_mutex_lock(&t->iom);   /* end of output */
+            pthread_mutex_lock(&t->iom);
             t->io_eof = true;
             pthread_cond_broadcast(&t->io_data);
             pthread_mutex_unlock(&t->iom);
@@ -277,8 +415,8 @@ static void *reader_main(void *data) {
     return NULL;
 }
 
-/* sends what the UI and the parser queued for the child (keys, pastes, replies) */
 static void *writer_main(void *data) {
+    prctl(PR_SET_NAME, "lx-writer", 0, 0, 0);
     TermCore *t = data;
     while (!atomic_load(&t->stop)) {
         pthread_mutex_lock(&t->iom);
@@ -306,7 +444,7 @@ static void parser_main(TermCore *t) {
         pthread_mutex_lock(&t->iom);
         while (t->io_count == 0 && !t->io_eof && !atomic_load(&t->stop)) pthread_cond_wait(&t->io_data, &t->iom);
         if (atomic_load(&t->stop)) { pthread_mutex_unlock(&t->iom); return; }
-        if (t->io_count == 0) { pthread_mutex_unlock(&t->iom); break; }   /* the ring is empty and the output has ended */
+        if (t->io_count == 0) { pthread_mutex_unlock(&t->iom); break; }
         int slot = t->io_head;
         pthread_mutex_unlock(&t->iom);
         if (t->fastcat_token[0]) feed_output(t, t->iob[slot].data, t->iob[slot].n);
@@ -319,7 +457,7 @@ static void parser_main(TermCore *t) {
         pthread_mutex_unlock(&t->iom);
         struct timespec wt1;
         clock_gettime(CLOCK_MONOTONIC, &wt1);
-        if (idle || (wt1.tv_sec - wt0.tv_sec) * 1000000000L + (wt1.tv_nsec - wt0.tv_nsec) > 200000L) {   /* tell the drawing thread about new output */
+        if (idle || (wt1.tv_sec - wt0.tv_sec) * 1000000000L + (wt1.tv_nsec - wt0.tv_nsec) > 200000L) {
             atomic_fetch_add(&t->bytes_fed, unsaid);
             atomic_store(&t->act_flag, 1);
             wake_ui(t);
@@ -329,7 +467,7 @@ static void parser_main(TermCore *t) {
     if (unsaid) { atomic_fetch_add(&t->bytes_fed, unsaid); atomic_store(&t->act_flag, 1); wake_ui(t); }
     atomic_store(&t->eof_flag, 1);
     wake_ui(t);
-    while (!atomic_load(&t->stop)) {   /* the child usually exits right behind the end of its output: reap it here */
+    while (!atomic_load(&t->stop)) {
         int st = 0;
         pid_t r = waitpid(t->pty.pid, &st, WNOHANG);
         if (r == t->pty.pid || (r < 0 && errno != EINTR)) {
@@ -345,6 +483,7 @@ static void parser_main(TermCore *t) {
 }
 
 static void *worker_main(void *data) {
+    prctl(PR_SET_NAME, "lx-io", 0, 0, 0);
     TermCore *t = data;
     prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
     if (t->io_split) { parser_main(t); return NULL; }
@@ -369,7 +508,7 @@ static void *worker_main(void *data) {
                     else feed_sliced(t, buf, (size_t)n, false);
                     total += (size_t)n;
                     unsaid += (size_t)n;
-                    {   /* tell the drawing thread about new output every ~0.2 ms, not only when the pipe runs dry: the frame rate follows */
+                    {
                         struct timespec wt1;
                         clock_gettime(CLOCK_MONOTONIC, &wt1);
                         if ((wt1.tv_sec - wt0.tv_sec) * 1000000000L + (wt1.tv_nsec - wt0.tv_nsec) > 200000L) {
@@ -380,7 +519,7 @@ static void *worker_main(void *data) {
                         }
                     }
                     atomic_fetch_add_explicit(&t->reads, 1, memory_order_relaxed);
-                    if (total >= (1u << 20)) break;   /* give the UI thread the lock now and then */
+                    if (total >= (1u << 20)) break;
                     if (tcore_read_delay_us > 0 && n < 1024) { struct timespec ts = {0, (long)tcore_read_delay_us * 1000}; nanosleep(&ts, NULL); }
                     continue;
                 }
@@ -393,11 +532,10 @@ static void *worker_main(void *data) {
                 atomic_store(&t->act_flag, 1);
                 wake_ui(t);
             }
-            flush_out(t, &out_pending);   /* replies the parser produced (DA, cursor position) */
+            flush_out(t, &out_pending);
             if (eof) {
                 atomic_store(&t->eof_flag, 1);
                 wake_ui(t);
-                /* the child usually exits right behind the end of its output: reap it here */
                 while (!atomic_load(&t->stop)) {
                     int st = 0;
                     pid_t r = waitpid(t->pty.pid, &st, WNOHANG);
@@ -428,11 +566,10 @@ static bool spawn(TermCore *t) {
     if (t->fastcat_token[0]) {
         snprintf(env_fc, sizeof env_fc, "LESTRIX_FASTCAT=%s", t->fastcat_token);
         extra[0] = env_fc;
-        if (tcore_cat_dir && *tcore_cat_dir) {   /* a directory holding `cat` -> lxcat goes first on PATH, so plain `cat file` is fast */
+        if (tcore_cat_dir && *tcore_cat_dir) {
             const char *cur = getenv("PATH");
             snprintf(env_path, sizeof env_path, "PATH=%s:%s", tcore_cat_dir, cur && *cur ? cur : "/usr/local/bin:/usr/bin:/bin");
             extra[1] = env_path;
-            /* bash imports exported functions from the environment, so `cat` stays fast even when a startup file rewrites PATH */
             if (!strchr(tcore_cat_dir, '\'')) { snprintf(env_fn, sizeof env_fn, "BASH_FUNC_cat%%%%=() {  '%s/cat' \"$@\"\n}", tcore_cat_dir); extra[2] = env_fn; }
         }
     }
@@ -455,7 +592,7 @@ static bool spawn(TermCore *t) {
             t->io_split = true;
             t->reader_started = pthread_create(&t->reader, NULL, reader_main, t) == 0;
             t->writer_started = pthread_create(&t->writer, NULL, writer_main, t) == 0;
-            if (!t->reader_started) t->io_split = false;   /* cannot split: the parser thread reads for itself below */
+            if (!t->reader_started) t->io_split = false;
         }
     }
     t->worker_started = pthread_create(&t->worker, NULL, worker_main, t) == 0;
@@ -492,6 +629,7 @@ TermCore *tcore_new(char *const argv[], const char *cwd, int cols, int rows, con
     t->mouse_btn = -1;
     t->wake[0] = t->wake[1] = -1;
     t->pty.fd = -1;
+    t->fo.pidfd = -1;
     int n = 0;
     while (argv && argv[n]) n++;
     t->argv = calloc((size_t)n + 1, sizeof *t->argv);
@@ -502,7 +640,7 @@ TermCore *tcore_new(char *const argv[], const char *cwd, int cols, int rows, con
     vt_set_history(t->vt, default_scrollback, default_ram_mb << 20, default_disk_mb << 20, default_spill);
     UNLOCK(t);
     vt_set_callbacks(t->vt, vt_write_cb, vt_event_cb, cache_free_cb, t);
-    if (fastcat) {   /* a secret only programs started in this tab know; remote hosts cannot ask this terminal to read files */
+    if (fastcat) {
         uint8_t rnd[16];
         if (getrandom(rnd, sizeof rnd, 0) == (ssize_t)sizeof rnd) {
             for (int i = 0; i < 16; i++) snprintf(t->fastcat_token + 2 * i, 3, "%02x", rnd[i]);
@@ -514,6 +652,7 @@ TermCore *tcore_new(char *const argv[], const char *cwd, int cols, int rows, con
 }
 
 void tcore_close(TermCore *t) {
+    fo_shutdown(t);
     if (t->running || t->worker_started) {
         atomic_store(&t->running_flag, 0);
         sd_pty_hangup(&t->pty);
@@ -564,7 +703,7 @@ bool tcore_pump(TermCore *t) {
     }
     int exp = 1;
     if (atomic_compare_exchange_strong(&t->act_flag, &exp, 0)) {
-        if (t->offset == 0) t->sel_on = false;   /* the text under a selection just changed */
+        if (t->offset == 0) t->sel_on = false;
         changed = true;
         if (t->hooks.activity) t->hooks.activity(t->user);
     }
@@ -577,7 +716,7 @@ bool tcore_pump(TermCore *t) {
 void tcore_resize(TermCore *t, int cols, int rows) {
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
-    if (cols == t->cols && rows == t->rows) return;   /* called every frame: no lock when nothing changed (only this thread resizes) */
+    if (cols == t->cols && rows == t->rows) return;
     LOCK(t);
     if (cols != t->cols || rows != t->rows) {
         t->cols = cols; t->rows = rows;
@@ -595,8 +734,6 @@ void tcore_set_focus(TermCore *t, bool focused) {
     t->focused = focused;
     if (tcore_modes(t) & VT_M_FOCUS_EVENTS) tcore_send_str(t, focused ? "\x1b[I" : "\x1b[O");
 }
-
-/* ---- scrollback view ----------------------------------------------------------------------------- */
 
 void tcore_scroll(TermCore *t, int delta) {
     LOCK(t);
@@ -629,8 +766,6 @@ size_t tcore_compact(TermCore *t) {
     return freed;
 }
 
-/* ---- selection and clipboard ---------------------------------------------------------------- */
-
 bool tcore_has_selection(TermCore *t) { return t->sel_on; }
 void tcore_clear_selection(TermCore *t) { t->sel_on = false; t->dragging = false; }
 
@@ -652,7 +787,6 @@ static void put_cell(char **out, size_t *len, size_t *cap, uint32_t cp) {
     *len += (size_t)n;
 }
 
-/* the text of lines first..last (indexes as vt_line), from column lo on the first line to hi on the last; lock held */
 static char *lines_text(TermCore *t, int first, int last, int lo, int hi) {
     char *out = NULL;
     size_t len = 0, cap = 0;
@@ -719,7 +853,7 @@ void tcore_paste(TermCore *t, const char *text) {
     g[m] = 0;
     if (tcore_modes(t) & VT_M_BRACKETED_PASTE) {
         char *e;
-        while ((e = strstr(g, "\x1b[201~"))) { memmove(e, e + 6, strlen(e + 6) + 1); m -= 6; }   /* a paste cannot end itself early */
+        while ((e = strstr(g, "\x1b[201~"))) { memmove(e, e + 6, strlen(e + 6) + 1); m -= 6; }
         tcore_send(t, "\x1b[200~", 6);
         tcore_send(t, g, m);
         tcore_send(t, "\x1b[201~", 6);
@@ -743,8 +877,6 @@ bool tcore_screen_contains(TermCore *t, const char *needle) {
     UNLOCK(t);
     return false;
 }
-
-/* ---- keyboard ---------------------------------------------------------------------------------------- */
 
 static int mod_param(int m) { return 1 + ((m & TM_SHIFT) ? 1 : 0) + ((m & TM_ALT) ? 2 : 0) + ((m & TM_CTRL) ? 4 : 0); }
 
@@ -833,7 +965,7 @@ bool tcore_key(TermCore *t, TKey key, uint32_t cp, int mods) {
         tcore_send(t, b, (size_t)n + 1);
         return true;
     }
-    return false;   /* printable text arrives as text input */
+    return false;
 }
 
 void tcore_text(TermCore *t, const char *utf8) {
@@ -841,8 +973,6 @@ void tcore_text(TermCore *t, const char *utf8) {
     if (t->offset) t->offset = 0;
     tcore_send(t, utf8, strlen(utf8));
 }
-
-/* ---- mouse ---------------------------------------------------------------------------------------- */
 
 static bool mouse_reporting(TermCore *t, int mods) {
     return (tcore_modes(t) & (VT_M_MOUSE_BTN | VT_M_MOUSE_DRAG | VT_M_MOUSE_ANY)) && !(mods & TM_SHIFT);
@@ -895,7 +1025,7 @@ void tcore_mouse_button(TermCore *t, int button, bool press, int col, int row, i
         } else if (button == 2) {
             if (t->hooks.clip_request) t->hooks.clip_request(t->user, true);
         } else if (button == 3 && !mouse_reporting(t, mods)) {
-            if (t->sel_on) tcore_copy(t); else tcore_paste_request(t);   /* right click: copy a selection, otherwise paste */
+            if (t->sel_on) tcore_copy(t); else tcore_paste_request(t);
         }
     } else {
         if (t->mouse_btn >= 0) { report_mouse(t, t->mouse_btn, col, row, false, false, mods); t->mouse_btn = -1; return; }
@@ -929,7 +1059,7 @@ void tcore_wheel(TermCore *t, double dy, int col, int row, int mods) {
     if (!steps) return;
     t->scroll_acc -= steps;
     int n = steps < 0 ? -steps : steps;
-    bool up = steps > 0;   /* positive = away from the user = back in history */
+    bool up = steps > 0;
     uint32_t m = tcore_modes(t);
     if (mouse_reporting(t, mods)) {
         for (int i = 0; i < n; i++) report_mouse(t, up ? 64 : 65, col < 0 ? 0 : col, row < 0 ? 0 : row, true, false, mods);

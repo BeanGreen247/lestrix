@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "workpool.h"
 
 #include <pthread.h>
@@ -20,7 +25,7 @@ void wp_configure(int workers) { P.configured = workers; }
 
 int wp_workers(void) {
     int w = P.configured;
-    if (w < 0) w = 0;   /* off unless asked for: at 0.5 ms a frame the hand-over costs more than building rows in parallel saves (measured) */
+    if (w < 0) w = 0;
     return w > 8 ? 8 : w;
 }
 

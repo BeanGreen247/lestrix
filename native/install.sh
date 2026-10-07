@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
-# Builds and installs the native Lestrix. Safe to re-run: it rebuilds and replaces the installed binary.
-#   ./install.sh                   build and install system-wide (/usr/local; the copy step uses sudo)
-#   ./install.sh --prefix ~/.local     install only for the current user (no sudo for the copy)
-#   ./install.sh --deps            install build dependencies first (needs root or sudo)
-#   ./install.sh --no-deps         never touch system packages
-#   ./install.sh --no-default-terminal   do not make Lestrix the default terminal (the default is to do it)
-#   ./install.sh --uninstall       remove it (same as ./uninstall.sh)
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
 set -euo pipefail
-umask 022   # files installed with sudo must be readable by everyone, whatever root's umask is
+umask 022
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 PREFIX="/usr/local"; DEPS=ask; UNINSTALL=0; DEFAULT_TERM=1
@@ -30,7 +26,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 if [ "$(id -u)" = 0 ]; then SUDO=""; elif have sudo; then SUDO="sudo"; else SUDO="none"; fi
 INSTALL_SUDO=""
-if [ "$(id -u)" != 0 ]; then  # sudo only when the prefix is not ours to write
+if [ "$(id -u)" != 0 ]; then
   probe="$PREFIX"; while [ ! -e "$probe" ] && [ "$probe" != / ]; do probe="$(dirname "$probe")"; done
   [ -w "$probe" ] || INSTALL_SUDO="sudo"
 fi
@@ -42,8 +38,6 @@ fi
 PM=""
 for cand in apt-get dnf yum pacman zypper apk; do have "$cand" && { PM="$cand"; break; }; done
 
-# Build: a C compiler, make, pkg-config and the SDL2, FreeType, fontconfig, GLib and libcurl development files.
-# Run time: a working OpenGL driver stack (Mesa) - SDL loads OpenGL, or OpenGL ES on boards such as the Raspberry Pi, at run time.
 pkgs() {
   case "$PM" in
     apt-get) echo build-essential pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libglib2.0-dev libcurl4-openssl-dev openssh-client libgl1 libegl1 libgles2 libgl1-mesa-dri ;;
@@ -53,14 +47,24 @@ pkgs() {
   esac
 }
 
+profiling_pkgs() {
+  case "$PM" in
+    apt-get) echo linux-perf perf-tools-unstable autofdo bolt-19 gdb ;;
+    dnf|yum) echo perf gdb ;;
+    pacman)  echo perf gdb ;;
+  esac
+}
+
 install_deps() {
   [ -n "$PM" ] && [ "$PM" != apk ] && [ "$SUDO" != none ] || { warn "cannot install packages here; install gcc, make, pkg-config and the SDL2, FreeType, fontconfig, GLib and libcurl development files, and Mesa's OpenGL libraries, yourself"; return 1; }
   say "Installing build dependencies with $PM"
   case "$PM" in
-    apt-get) $SUDO apt-get update -y >/dev/null; $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $(pkgs) ;;
-    dnf)     $SUDO dnf install -y $(pkgs) ;;
-    yum)     $SUDO yum install -y $(pkgs) ;;
-    pacman)  $SUDO pacman -S --needed --noconfirm $(pkgs) || $SUDO pacman -Sy --needed --noconfirm $(pkgs) ;;
+    apt-get) $SUDO apt-get update -y >/dev/null; $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $(pkgs)
+             for p in $(profiling_pkgs); do $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" || warn "$p not available here (optional profiling tool)"; done ;;
+    dnf)     $SUDO dnf install -y $(pkgs); for p in $(profiling_pkgs); do $SUDO dnf install -y "$p" || warn "$p not available here (optional profiling tool)"; done ;;
+    yum)     $SUDO yum install -y $(pkgs); for p in $(profiling_pkgs); do $SUDO yum install -y "$p" || warn "$p not available here (optional profiling tool)"; done ;;
+    pacman)  $SUDO pacman -S --needed --noconfirm $(pkgs) || $SUDO pacman -Sy --needed --noconfirm $(pkgs)
+             for p in $(profiling_pkgs); do $SUDO pacman -S --needed --noconfirm "$p" || warn "$p not available here (optional profiling tool)"; done ;;
     zypper)  $SUDO zypper --non-interactive refresh >/dev/null || true
              for p in $(pkgs); do $SUDO zypper --non-interactive install "$p" >/dev/null || warn "skipped $p"; done ;;
   esac
@@ -89,35 +93,28 @@ $INSTALL_SUDO make -s PREFIX="$PREFIX" install
 case ":$PATH:" in *":$PREFIX/bin:"*) ;; *) echo "Note: add $PREFIX/bin to your PATH to run 'lestrix' from a shell." ;; esac
 [ -x "$PREFIX/bin/lestrix" ] || { echo "Install failed: $PREFIX/bin/lestrix was not created." >&2; exit 1; }
 
-# ---- make it the default terminal ------------------------------------------------------------------------------------------------------
-# Per-user settings need no privileges. The Debian/Ubuntu `x-terminal-emulator` alternative is system-wide and needs sudo.
 set_default_terminal() {
   local bin="$PREFIX/bin/lestrix" cfg="${XDG_CONFIG_HOME:-$HOME/.config}" done_any=0
-  # xdg-terminal-exec specification: the first entry of xdg-terminals.list is the terminal that launchers use
   mkdir -p "$cfg"
   if ! grep -qx 'lestrix.desktop' "$cfg/xdg-terminals.list" 2>/dev/null; then
     { echo 'lestrix.desktop'; cat "$cfg/xdg-terminals.list" 2>/dev/null || true; } > "$cfg/xdg-terminals.list.new" && mv "$cfg/xdg-terminals.list.new" "$cfg/xdg-terminals.list"
   fi
   echo "  xdg-terminals.list: lestrix first"; done_any=1
-  # GNOME and Cinnamon/MATE-style "default terminal" settings
   if have gsettings && gsettings list-schemas 2>/dev/null | grep -qx 'org.gnome.desktop.default-applications.terminal'; then
     gsettings set org.gnome.desktop.default-applications.terminal exec "$bin" 2>/dev/null && gsettings set org.gnome.desktop.default-applications.terminal exec-arg '-e' 2>/dev/null && echo "  GNOME default terminal: $bin"
   fi
-  # Xfce: a helper entry for the preferred-applications setting
   if have xfce4-session || [ -d "$cfg/xfce4" ]; then
     local hd="${XDG_DATA_HOME:-$HOME/.local/share}/xfce4/helpers"; mkdir -p "$hd" "$cfg/xfce4"
     printf '[Desktop Entry]\nVersion=1.0\nType=X-XFCE-Helper\nX-XFCE-Category=TerminalEmulator\nX-XFCE-CommandsWithParameter=%s -e "%%s"\nX-XFCE-Commands=%s\nIcon=lestrix\nName=Lestrix\n' "$bin" "$bin" > "$hd/lestrix.desktop"
     if grep -q '^TerminalEmulator=' "$cfg/xfce4/helpers.rc" 2>/dev/null; then sed -i 's/^TerminalEmulator=.*/TerminalEmulator=lestrix/' "$cfg/xfce4/helpers.rc"; else echo 'TerminalEmulator=lestrix' >> "$cfg/xfce4/helpers.rc"; fi
     echo "  Xfce preferred terminal: lestrix"
   fi
-  # KDE
   for kw in kwriteconfig6 kwriteconfig5; do
     if have "$kw"; then
       "$kw" --file kdeglobals --group General --key TerminalApplication "$bin" && "$kw" --file kdeglobals --group General --key TerminalService lestrix.desktop && echo "  KDE default terminal: $bin"
       break
     fi
   done
-  # Debian/Ubuntu: x-terminal-emulator (used by many programs and by "Open in terminal" in file managers)
   if have update-alternatives && [ -e /etc/alternatives/x-terminal-emulator -o -e /usr/bin/x-terminal-emulator ]; then
     local ASUDO=""; [ "$(id -u)" = 0 ] || ASUDO="sudo"
     if [ "$ASUDO" = "" ] || have sudo; then
