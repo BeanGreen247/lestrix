@@ -102,3 +102,21 @@ So the governor is worth about 7-12% on everything the CPU does and nothing on t
 | Escape pre-scan only after a stop, per-128-line limit checks, zero-copy all-compact blocks (row 35) | 0.18 s | 0.93 s |
 
 Rejected: 1, 2 and 4 MB feed slices instead of 512 KB (ASCII -5% at best, random text +15%).
+
+## Serial parser and speed gate (2026-10-08, README row 36)
+
+Method: callgrind (perf is blocked here, `perf_event_paranoid=3`), A/B against `git show HEAD:native/src/vt.c` built with the same flags, best of 5-6 runs of `tests/perf_gate.c` and a scratch driver (8 MB of CRLF lines of 20/85/170/1000 characters, 176x49 grid).
+
+| Case | Before | After |
+|---|---|---|
+| Gate, no scrollback | 1429 MB/s | about 1580 MB/s |
+| Gate, 10,000-line scrollback | 690 MB/s | about 790 MB/s |
+| 85-char lines, scrollback | 605 MB/s | about 877 MB/s |
+| 170-char lines, scrollback | 673 MB/s | about 1130 MB/s |
+| 20-char lines, scrollback | 390 MB/s | 385-430 MB/s (kept on the old path below 32 cells) |
+| Text with no line breaks (autowrap), no scrollback | about 2.1 GB/s | unchanged, the floor for this path |
+
+Kept: (1) `hist_push` packs all-ASCII single-style rows of 32-512 cells into `hist_add_compact` (1 byte per character; the 8-byte copy and the later 8-byte block packing both disappear); (2) `\r` and `\n` after an ASCII run handled inline in `feed_serial`.
+Rejected on the gate: `-march=native` 1369, LTO 1399, PGO 1405, `-freorder-blocks-algorithm=simple -fvect-cost-model=unlimited` 1386 (baseline 1426); 16-bytes-per-step `fill_ascii` (no gain, short runs -10%); compacting rows under 32 cells (-20%).
+Remaining gap: the scrollback path is still about 2.6x below the 2.1 GB/s floor (history compaction pass over each row, block packing). Not measured: GUI benchmark, input latency, 1024x768 (parse engine only).
+Tests after the change: test-vt 120/0, test-lz 1005/0, test_fast_paths (ASan/UBSan differential) 34163/0, TSan 120/0.

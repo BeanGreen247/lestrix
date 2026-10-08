@@ -898,13 +898,47 @@ static void hist_add_compact(Vt *t, const uint8_t *src, int hw, uint32_t sf, VtL
         enforce_limits(t);
 }
 
+#define PUSH_BYTES_MIN 32
+#define PUSH_BYTES_MAX 512
+
 static void hist_push(Vt *t, int y) {
     if (t->max_lines == 0) return;
     VtLineMeta *m = rowm(t, y);
     VtLineMeta meta = *m;
     m->cache = NULL;
     m->dirty = 1;
-    hist_add(t, rowp(t, y), m->hw, meta);
+    const VtCell *src = rowp(t, y);
+    int len = m->hw < t->cols ? m->hw : t->cols;
+    while (len > 0 && src[len - 1].cp == 0 && src[len - 1].sf == 0) len--;
+    if (len >= PUSH_BYTES_MIN && len <= PUSH_BYTES_MAX) {
+        uint8_t bytes[PUSH_BYTES_MAX];
+        const uint32_t sf = src[0].sf;
+        uint32_t bad = 0;
+        int i = 0;
+#ifdef __SSE2__
+        {
+            const __m128i sfv = _mm_set1_epi32((int)sf), hi = _mm_set1_epi32((int)~0xFFu), zero = _mm_setzero_si128();
+            __m128i acc = zero;
+            for (; i + 8 <= len; i += 8) {
+                __m128 a = _mm_loadu_ps((const float *)(src + i)), b = _mm_loadu_ps((const float *)(src + i + 2));
+                __m128 c = _mm_loadu_ps((const float *)(src + i + 4)), d = _mm_loadu_ps((const float *)(src + i + 6));
+                __m128i cp0 = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0)));
+                __m128i sf0 = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)));
+                __m128i cp1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(2, 0, 2, 0)));
+                __m128i sf1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(3, 1, 3, 1)));
+                acc = _mm_or_si128(acc, _mm_or_si128(_mm_and_si128(_mm_or_si128(cp0, cp1), hi), _mm_or_si128(_mm_xor_si128(sf0, sfv), _mm_xor_si128(sf1, sfv))));
+                _mm_storel_epi64((__m128i *)(bytes + i), _mm_packus_epi16(_mm_packs_epi32(cp0, cp1), zero));
+            }
+            bad = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) ^ 0xFFFFu;
+        }
+#endif
+        for (; i < len; i++) {
+            bad |= (src[i].cp & ~0xFFu) | (src[i].sf ^ sf);
+            bytes[i] = (uint8_t)src[i].cp;
+        }
+        if (!bad) { hist_add_compact(t, bytes, len, sf, meta, true); return; }
+    }
+    hist_add(t, src, m->hw, meta);
 }
 
 void vt_clear_history(Vt *t) {
@@ -1847,6 +1881,8 @@ static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
                 size_t run = ascii_run(p + i, n - i);
                 put_ascii(t, p + i, run);
                 i += run;
+                if (i < n && p[i] == '\r') { t->cx = 0; i++; }
+                if (i < n && p[i] == '\n') { do_linefeed(t); i++; }
                 continue;
             }
             if (t->utf_need == 0 && c >= 0xc2 && c <= 0xef) {
