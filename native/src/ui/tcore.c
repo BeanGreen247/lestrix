@@ -106,7 +106,10 @@ void tcore_set_fast_output(bool on) { g_fast_output = on; }
 static bool fo_comm_ok(pid_t pgrp) {
     static const char *const ok[] = {"cat", "ls", "grep", "egrep", "fgrep", "rg", "find", "fd", "seq", "tail", "head", "tree", "du", "df", "ps", "lsblk", "wc", "sort",
                                      "uniq", "cut", "tr", "sed", "awk", "gawk", "mawk", "base64", "od", "hexdump", "xxd", "dd", "zcat", "bzcat", "xzcat", "strings",
-                                     "nl", "tac", "rev", "fold", "yes", "make", "gcc", "cc", "g++", "cargo", "tar", "unzip", "rsync", "zgrep"};
+                                     "nl", "tac", "rev", "fold", "yes", "make", "gcc", "cc", "g++", "cargo", "tar", "unzip", "rsync", "zgrep",
+                                     "diff", "cmp", "comm", "join", "paste", "expand", "unexpand", "pr", "column", "jq", "curl", "wget", "printenv", "env", "dmesg",
+                                     "lscpu", "lsusb", "lspci", "lsmod", "lsof", "ss", "ip", "free", "dig", "host", "nslookup", "last", "who", "stat", "realpath",
+                                     "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "shuf", "fmt", "iconv", "zstdcat", "lz4cat", "pigz", "gzip"};
     char path[64], comm[32];
     snprintf(path, sizeof path, "/proc/%d/comm", (int)pgrp);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
