@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #define _GNU_SOURCE
 #include "xfer.h"
 
@@ -18,8 +23,8 @@ struct SdXfer {
     char *control_path, *dest;
     gboolean ftp;
     char *password;
-    gboolean sftp_ok;          /* ssh: sftp subsystem usable */
-    GPtrArray *xfer_order;     /* "scp", "ssh" */
+    gboolean sftp_ok;
+    GPtrArray *xfer_order;
 };
 
 void sd_entry_free(SdEntry *e) {
@@ -38,8 +43,6 @@ static void set_err(GError **err, const char *fmt, ...) {
     g_free(m);
 }
 
-/* ---- running commands with a deadline ---------------------------------------------------------- */
-
 typedef struct { int status; char *out, *err; gboolean timed_out; } Run;
 
 static void run_free(Run *r) { g_free(r->out); g_free(r->err); }
@@ -51,7 +54,6 @@ static void read_available(int fd, GString *dst, gboolean *open) {
     else if (n == 0 || (errno != EAGAIN && errno != EINTR)) *open = FALSE;
 }
 
-/* argv may be NULL-terminated; input (may be NULL) is written to stdin. Returns FALSE if it could not start. */
 static gboolean run_cmd(char **argv, const char *input, int timeout_s, Run *r) {
     memset(r, 0, sizeof *r);
     gint in_fd, out_fd, err_fd;
@@ -104,8 +106,6 @@ static gboolean run_cmd(char **argv, const char *input, int timeout_s, Run *r) {
     return TRUE;
 }
 
-/* ---- listing parser -------------------------------------------------------------------------------- */
-
 GPtrArray *sd_parse_ls(const char *text) {
     GPtrArray *out = g_ptr_array_new_with_free_func((GDestroyNotify)sd_entry_free);
     static GRegex *re;
@@ -146,8 +146,6 @@ static int entry_cmp(gconstpointer a, gconstpointer b) {
     return c;
 }
 
-/* ---- quoting --------------------------------------------------------------------------------------------- */
-
 static char *sftp_quote(const char *p) {
     GString *s = g_string_new("\"");
     for (; *p; p++) { if (*p == '"' || *p == '\\') g_string_append_c(s, '\\'); g_string_append_c(s, *p); }
@@ -155,7 +153,6 @@ static char *sftp_quote(const char *p) {
     return g_string_free(s, FALSE);
 }
 
-/* classic scp: the remote end is a shell, and the client glob-matches replies, so escape with backslashes */
 static char *scp_quote(const char *p) {
     GString *s = g_string_new(NULL);
     for (; *p; p++) {
@@ -165,10 +162,8 @@ static char *scp_quote(const char *p) {
     return g_string_free(s, FALSE);
 }
 
-/* ---- control path ----------------------------------------------------------------------------------------- */
-
 char *sd_xfer_new_control_path(void) {
-    char *dir = g_dir_make_tmp("sd-XXXXXX", NULL);   /* honours TMPDIR; keep it short: unix sockets cap at ~100 chars */
+    char *dir = g_dir_make_tmp("sd-XXXXXX", NULL);
     if (!dir || strlen(dir) > 60) { g_free(dir); dir = g_strdup("/tmp/sd-XXXXXX"); dir = mkdtemp(dir) ? dir : NULL; }
     if (!dir) return NULL;
     chmod(dir, 0700);
@@ -184,8 +179,6 @@ void sd_xfer_remove_control_path(const char *path) {
     g_rmdir(dir);
     g_free(dir);
 }
-
-/* ---- SSH backend --------------------------------------------------------------------------------------------- */
 
 SdXfer *sd_xfer_new_ssh(const SdConn *conn, const char *control_path) {
     SdXfer *x = g_new0(SdXfer, 1);
@@ -224,7 +217,6 @@ char *sd_xfer_label(SdXfer *x) {
     return g_strdup(x->sftp_ok ? "SFTP" : "ssh (no SFTP on this server)");
 }
 
-/* argv fragments common to every client riding the master connection */
 static void mux_args(SdXfer *x, GPtrArray *a, const char *port_flag) {
     g_ptr_array_add(a, g_strdup("-o")); g_ptr_array_add(a, g_strdup_printf("ControlPath=%s", x->control_path));
     g_ptr_array_add(a, g_strdup("-o")); g_ptr_array_add(a, g_strdup("ControlMaster=no"));
@@ -244,7 +236,6 @@ gboolean sd_xfer_ready(SdXfer *x) {
     return ok;
 }
 
-/* run a remote command over the master connection */
 static char *ssh_run(SdXfer *x, const char *command, int timeout_s, GError **err) {
     GPtrArray *a = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(a, g_strdup("ssh"));
@@ -263,7 +254,6 @@ static char *ssh_run(SdXfer *x, const char *command, int timeout_s, GError **err
     return out;
 }
 
-/* run an sftp batch; returns NULL with *unavailable set when sftp cannot be used at all */
 static char *sftp_batch(SdXfer *x, char **cmds, int timeout_s, gboolean *unavailable, GError **err) {
     GPtrArray *a = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(a, g_strdup("sftp"));
@@ -290,7 +280,6 @@ static char *sftp_batch(SdXfer *x, char **cmds, int timeout_s, gboolean *unavail
     return out;
 }
 
-/* sftp first; NULL + *used_sftp == FALSE means fall back to ssh exec */
 static char *try_sftp(SdXfer *x, char **cmds, int timeout_s, gboolean *used, GError **err) {
     *used = FALSE;
     if (!x->sftp_ok) return NULL;
@@ -307,15 +296,13 @@ static char *ssh_home(SdXfer *x, GError **err) {
     return o;
 }
 
-/* ---- FTP backend (libcurl) --------------------------------------------------------------------------------------- */
-
 static size_t curl_to_string(void *p, size_t sz, size_t n, void *ud) { g_string_append_len(ud, p, (gssize)(sz * n)); return sz * n; }
 static size_t curl_to_file(void *p, size_t sz, size_t n, void *ud) { return fwrite(p, sz, n, ud); }
 static size_t curl_from_file(void *p, size_t sz, size_t n, void *ud) { return fread(p, sz, n, ud); }
 
 static CURL *ftp_handle(SdXfer *x, const char *path, gboolean dir) {
     CURL *c = curl_easy_init();
-    char *enc = curl_easy_escape(c, path, 0);   /* escapes '/' too; undo for path separators */
+    char *enc = curl_easy_escape(c, path, 0);
     GString *clean = g_string_new(NULL);
     for (const char *p = enc; *p; p++) {
         if (!strncmp(p, "%2F", 3)) { g_string_append_c(clean, '/'); p += 2; } else g_string_append_c(clean, *p);
@@ -456,7 +443,7 @@ static gboolean ftp_upload_tree(SdXfer *x, const char *local, const char *remote
     if (g_file_test(local, G_FILE_TEST_IS_DIR)) {
         GError *e2 = NULL;
         char *cmd = g_strdup_printf("MKD %s", target);
-        ftp_quote(x, remote_dir, cmd, NULL, &e2);   /* already existing is fine */
+        ftp_quote(x, remote_dir, cmd, NULL, &e2);
         g_clear_error(&e2);
         g_free(cmd);
         GDir *d = g_dir_open(local, 0, NULL);
@@ -474,11 +461,9 @@ static gboolean ftp_upload_tree(SdXfer *x, const char *local, const char *remote
     return ok;
 }
 
-/* ---- public operations ------------------------------------------------------------------------------------------------- */
-
 char *sd_xfer_home(SdXfer *x, GError **err) {
     if (x->ftp) {
-        CURL *c = ftp_handle(x, "/", TRUE);   /* FTP logins start in the user's home; report "/" as the browsable root */
+        CURL *c = ftp_handle(x, "/", TRUE);
         curl_easy_cleanup(c);
         return g_strdup("/");
     }
@@ -567,7 +552,7 @@ gboolean sd_xfer_rename(SdXfer *x, const char *from, const char *to, GError **er
 gboolean sd_xfer_remove(SdXfer *x, const char *path, gboolean is_dir, GError **err) {
     if (x->ftp) return ftp_remove_tree(x, path, is_dir, err);
     char *out;
-    if (is_dir) {   /* sftp has no recursive delete */
+    if (is_dir) {
         char *sq = g_shell_quote(path), *cmd = g_strdup_printf("rm -rf -- %s", sq);
         out = ssh_run(x, cmd, 600, err);
         g_free(sq); g_free(cmd);
@@ -583,7 +568,6 @@ gboolean sd_xfer_remove(SdXfer *x, const char *path, gboolean is_dir, GError **e
     return out != NULL;
 }
 
-/* run `sh -c script`; used for tar pipelines */
 static gboolean run_script(const char *script, GError **err) {
     char *bash = g_find_program_in_path("bash");
     const char *shell = bash ? "bash" : "sh";
@@ -614,7 +598,7 @@ static gboolean scp_run(SdXfer *x, char **tail, GError **err) {
         GPtrArray *a = g_ptr_array_new_with_free_func(g_free);
         g_ptr_array_add(a, g_strdup("scp"));
         mux_args(x, a, "-P");
-        if (legacy) g_ptr_array_add(a, g_strdup("-O"));   /* classic protocol: works without an sftp subsystem */
+        if (legacy) g_ptr_array_add(a, g_strdup("-O"));
         for (char **t = tail; *t; t++) g_ptr_array_add(a, g_strdup(*t));
         char **argv = finish(a);
         Run r;
@@ -742,7 +726,6 @@ gboolean sd_xfer_upload(SdXfer *x, const char *local, const char *remote_dir, GE
 
 char *sd_xfer_terminal_cwd(SdXfer *x) {
     if (x->ftp) return NULL;
-    /* the exec'd command and the login shell are siblings under one sshd process: $PPID finds the shell */
     const char *script = "p=$(ps -o pid=,tty= --ppid $PPID 2>/dev/null | awk '$2!=\"?\"{print $1; exit}'); "
                          "[ -n \"$p\" ] && readlink /proc/$p/cwd";
     char *o = ssh_run(x, script, 5, NULL);

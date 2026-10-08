@@ -1,3 +1,6 @@
+# Copyright (c) 2026 BeanGreen247
+# SPDX-License-Identifier: MIT
+
 import random, sys
 sys.path.insert(0, "tests")
 import diff_pyte as d

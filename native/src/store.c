@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include "store.h"
 
 #include <gio/gio.h>
@@ -77,14 +82,12 @@ char **sd_conn_argv(const SdConn *c, const char *control_path) {
         }
     }
     gboolean cmd = *g_strstrip(c->remote_command);
-    if (cmd) g_ptr_array_add(a, g_strdup("-t")); /* force a tty so interactive shells and tmux work */
+    if (cmd) g_ptr_array_add(a, g_strdup("-t"));
     g_ptr_array_add(a, sd_conn_dest(c));
     if (cmd) g_ptr_array_add(a, g_strdup(c->remote_command));
     g_ptr_array_add(a, NULL);
     return (char **)g_ptr_array_free(a, FALSE);
 }
-
-/* ---- persistence ------------------------------------------------------------------------ */
 
 char *sd_config_dir(void) {
     const char *o = g_getenv("LESTRIX_CONFIG_DIR");
@@ -269,7 +272,7 @@ void sd_store_reload_ssh_config(SdStore *s, gboolean enabled, const char *path) 
         SdConn *c = items->pdata[i];
         gboolean saved = FALSE;
         for (guint j = 0; j < s->conns->len; j++) if (g_str_equal(((SdConn *)s->conns->pdata[j])->name, c->name)) { saved = TRUE; break; }
-        if (saved) { sd_conn_free(c); continue; }   /* a saved copy wins */
+        if (saved) { sd_conn_free(c); continue; }
         SdConn *m = g_hash_table_lookup(s->meta, c->id);
         if (m) { sd_conn_set(&c->color, m->color); c->last_used = m->last_used; }
         g_ptr_array_add(s->live, c);

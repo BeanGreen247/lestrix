@@ -1,5 +1,8 @@
-/* A speed regression gate: the thresholds are about ten times below what this code does on a laptop,
- * so only a real slowdown (an accidental copy per line, a lock in the parser) trips it. */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +28,7 @@ int main(void) {
     for (int i = 0; n < want; i++)
         n += (size_t)snprintf(buf + n, 200, "2026-10-03 12:00:%02d INFO worker-%d processed request id=%d in %d ms\r\n", i % 60, i % 8, i, i % 97);
     double best_plain = 0, best_hist = 0;
-    for (int k = 0; k < 3; k++) {   /* best of three: a busy machine only makes a run slower */
+    for (int k = 0; k < 3; k++) {
         double a = run(buf, n, 0), b = run(buf, n, 10000);
         if (a > best_plain) best_plain = a;
         if (b > best_hist) best_hist = b;

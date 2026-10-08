@@ -1,0 +1,6 @@
+terminal=alacritty
+startup_s=0.24
+rss_rest_mb=99
+rss_peak_mb=149
+idle_cpu_s=0.00
+done=1

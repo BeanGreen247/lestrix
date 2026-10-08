@@ -1,4 +1,8 @@
-/* FTP backend test against tests/ftp_server.py (stdlib server, no extra packages). */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <signal.h>

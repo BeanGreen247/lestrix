@@ -1,10 +1,12 @@
-/* inventory.c - Ansible inventories (INI and YAML) and ~/.ssh/config. */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <glob.h>
 #include <string.h>
 
 #include "store.h"
-
-/* ---- shared helpers --------------------------------------------------------------------- */
 
 static char *dup_strip(const char *s) { return g_strstrip(g_strdup(s)); }
 
@@ -24,7 +26,7 @@ static const char *var(GHashTable *v, const char *a, const char *b, const char *
     if (a) r = g_hash_table_lookup(v, a);
     if ((!r || !*r) && b) r = g_hash_table_lookup(v, b);
     if ((!r || !*r) && c) r = g_hash_table_lookup(v, c);
-    return (r && *r && !strstr(r, "{{")) ? r : NULL;   /* unresolved Jinja is ignored */
+    return (r && *r && !strstr(r, "{{")) ? r : NULL;
 }
 
 static SdConn *conn_from_vars(const char *name, const char *group, GHashTable *v) {
@@ -59,8 +61,6 @@ static GHashTable *copy_vars(GHashTable *src) {
     return d;
 }
 
-/* ---- host patterns: web[01:05].example.com ------------------------------------------------------ */
-
 static void expand_pattern(const char *pat, GPtrArray *out) {
     const char *lb = strchr(pat, '['), *rb = lb ? strchr(lb, ']') : NULL, *colon = lb ? memchr(lb, ':', rb ? (size_t)(rb - lb) : 0) : NULL;
     if (!lb || !rb || !colon) { g_ptr_array_add(out, g_strdup(pat)); return; }
@@ -86,8 +86,6 @@ static void expand_pattern(const char *pat, GPtrArray *out) {
     }
     g_free(from); g_free(to); g_free(head);
 }
-
-/* ---- INI ------------------------------------------------------------------------------------------ */
 
 static char **split_words(const char *line) {
     GPtrArray *w = g_ptr_array_new();
@@ -188,8 +186,6 @@ static GPtrArray *parse_ini(const char *text) {
     return out;
 }
 
-/* ---- YAML subset: block maps, `- ` sequences, flow {..}/[..], quoted scalars ----------------------------- */
-
 typedef enum { Y_SCALAR, Y_MAP, Y_SEQ } YType;
 typedef struct YNode { YType t; char *s; GPtrArray *keys, *vals; } YNode;
 
@@ -289,7 +285,7 @@ static YNode *parse_value_after_key(GArray *ls, guint *i, int indent, const char
     }
     if (*i < ls->len && g_array_index(ls, YLine, *i).indent > indent) return parse_block(ls, i, g_array_index(ls, YLine, *i).indent);
     if (*i < ls->len && g_array_index(ls, YLine, *i).indent == indent && g_str_has_prefix(g_array_index(ls, YLine, *i).text, "- "))
-        return parse_block(ls, i, indent);   /* `key:` followed by an unindented sequence */
+        return parse_block(ls, i, indent);
     YNode *n = ynew(Y_SCALAR);
     n->s = g_strdup("");
     return n;
@@ -403,7 +399,7 @@ GPtrArray *sd_parse_ansible_inventory(const char *path, GError **err) {
     char *text = NULL;
     if (!g_file_get_contents(path, &text, NULL, err)) return NULL;
     gboolean yaml = g_str_has_suffix(path, ".yml") || g_str_has_suffix(path, ".yaml");
-    if (!yaml) {   /* extensionless: a YAML inventory starts with a `key:` line, an INI one with [section] or a host */
+    if (!yaml) {
         for (char *p = text; *p; ) {
             char *eol = strchr(p, '\n');
             char *line = g_strndup(p, eol ? (gsize)(eol - p) : strlen(p));
@@ -419,8 +415,6 @@ GPtrArray *sd_parse_ansible_inventory(const char *path, GError **err) {
     g_free(text);
     return r;
 }
-
-/* ---- ~/.ssh/config --------------------------------------------------------------------------------------- */
 
 static void config_lines(const char *path, int depth, GPtrArray *out) {
     char *text = NULL;
@@ -486,7 +480,7 @@ GPtrArray *sd_parse_ssh_config(const char *path, gboolean live) {
     for (guint i = 0; i < aliases->len; i++) {
         const char *alias = aliases->pdata[i];
         GHashTable *o = alias_opts->pdata[i];
-        gboolean dup = FALSE;  /* the same alias in two Host lines: ssh uses the first, so list it once */
+        gboolean dup = FALSE;
         for (guint j = 0; j < i && !dup; j++) dup = g_str_equal(aliases->pdata[j], alias);
         if (dup) continue;
         SdConn *c = sd_conn_new();

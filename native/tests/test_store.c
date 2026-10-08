@@ -1,4 +1,8 @@
-/* Store, JSON and importer tests. */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <string.h>
@@ -77,7 +81,7 @@ static void test_store_roundtrip(void) {
     SdConn *dup = sd_conn_copy(c);
     g_free(dup->id); dup->id = g_strdup("other");
     g_ptr_array_add(items, dup);
-    CHECK(sd_store_add_imported(s2, items) == 0);   /* same name+host+port+user is a duplicate */
+    CHECK(sd_store_add_imported(s2, items) == 0);
     sd_store_touch(s2, c->id);
     GPtrArray *recent = sd_store_recent(s2, 9);
     CHECK(recent->len == 1);
@@ -172,7 +176,7 @@ static void test_ssh_config(void) {
     CHECK(live->len == 3 && find(live, "jump") && find(live, "other"));
     SdConn *box = find(live, "box");
     CHECK(box && sd_conn_is_live(box) && box->port == 2200 && g_str_equal(box->x11, "untrusted") && g_str_equal(box->id, "sshcfg:box"));
-    CHECK(g_str_equal(box->options, ""));          /* live hosts keep ProxyJump in the config, not in options */
+    CHECK(g_str_equal(box->options, ""));
     GPtrArray *copy = sd_parse_ssh_config(cfg, FALSE);
     CHECK(g_str_equal(find(copy, "box")->options, "-J jump") && !sd_conn_is_live(find(copy, "box")));
     g_ptr_array_free(live, TRUE); g_ptr_array_free(copy, TRUE);

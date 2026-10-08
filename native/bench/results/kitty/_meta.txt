@@ -1,0 +1,6 @@
+terminal=kitty
+startup_s=0.81
+rss_rest_mb=126
+rss_peak_mb=149
+idle_cpu_s=0.00
+done=1

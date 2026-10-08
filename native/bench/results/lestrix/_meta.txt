@@ -1,0 +1,6 @@
+terminal=lestrix
+startup_s=0.18
+rss_rest_mb=97
+rss_peak_mb=110
+idle_cpu_s=0.03
+done=1

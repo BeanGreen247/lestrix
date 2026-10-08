@@ -1,0 +1,6 @@
+terminal=xfce4-terminal
+startup_s=0.27
+rss_rest_mb=53
+rss_peak_mb=71
+idle_cpu_s=0.00
+done=1

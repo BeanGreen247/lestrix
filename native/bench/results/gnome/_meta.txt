@@ -1,0 +1,6 @@
+terminal=gnome-terminal-
+startup_s=0.38
+rss_rest_mb=55
+rss_peak_mb=72
+idle_cpu_s=0.01
+done=1

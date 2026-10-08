@@ -1,5 +1,8 @@
-/* File-transfer tests: listing parser always; the ssh backends run against `ssh localhost` when it
- * works without a password (skipped otherwise). */
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <stdio.h>
