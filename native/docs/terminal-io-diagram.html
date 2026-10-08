@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lestrix byte path</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#1d2430;--mut:#5b6678;--box:#ffffff;--bd:#aab3c2;--kern:#fdf0d5;--kbd:#d9a441;--skip:#dff3e4;--sbd:#3f9d5a;--ui:#e3ecfb;--ubd:#4a76c7;--ar:#4a5568;--card:#ffffff}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14171c;--fg:#e6e9ef;--mut:#9aa5b8;--box:#1d222a;--bd:#4a5365;--kern:#3a2f15;--kbd:#c9953a;--skip:#16301f;--sbd:#4cae69;--ui:#1b2a45;--ubd:#6a93df;--ar:#9aa5b8;--card:#1a1e25}}
+:root[data-theme="dark"]{--bg:#14171c;--fg:#e6e9ef;--mut:#9aa5b8;--box:#1d222a;--bd:#4a5365;--kern:#3a2f15;--kbd:#c9953a;--skip:#16301f;--sbd:#4cae69;--ui:#1b2a45;--ubd:#6a93df;--ar:#9aa5b8;--card:#1a1e25}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1040px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:22px;margin:0 0 4px} p.lead{margin:0 0 16px;color:var(--mut)}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px}
+svg{width:100%;height:auto;display:block}
+.box{fill:var(--box);stroke:var(--bd);stroke-width:1.2} .hot{fill:var(--kern);stroke:var(--kbd);stroke-width:1.6}
+.skip{fill:var(--skip);stroke:var(--sbd);stroke-width:1.6} .ui{fill:var(--ui);stroke:var(--ubd);stroke-width:1.2}
+.t{fill:var(--fg);font:600 13px system-ui,sans-serif} .s{fill:var(--mut);font:11.5px system-ui,sans-serif} .h{fill:var(--fg);font:700 15px system-ui,sans-serif}
+.ar{stroke:var(--ar);stroke-width:1.6} .ar2{stroke:var(--sbd);stroke-width:1.6;stroke-dasharray:5 4} .mk{fill:var(--ar)}
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin:12px 0 0;font-size:13px;color:var(--mut)}
+.legend i{display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;margin-right:6px;border:1.5px solid}
+table{width:100%;border-collapse:collapse;margin-top:16px;font-size:14px} th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--bd);vertical-align:top} th{color:var(--mut);font-weight:600}
+td.n{white-space:nowrap} .note{color:var(--mut);font-size:13px;margin-top:12px}
+</style></head><body><main>
+<h1>How Lestrix moves bytes</h1>
+<p class="lead">From a program's stdout to the screen, and from the keyboard back to its stdin. Source: native/src/ui/tcore.c, native/src/pty.c, native/tools/lxcat.c, native/src/vt.c.</p>
+<div class="card"><svg viewBox="0 0 980 950" role="img" aria-label="How Lestrix moves bytes between programs, the kernel and the screen" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mk"/></marker></defs>
+<text class="h" x="20" y="30">1. Program output (stdout) to the screen - normal path</text>
+<text class="s" x="20" y="48">Every byte crosses the pty and the kernel&#x27;s line discipline, which rewrites newlines.</text>
+<rect class="box" x="20" y="70" width="200" height="64" rx="6"/>
+<text class="t" x="120.0" y="98.0" text-anchor="middle">Program</text>
+<text class="s" x="120.0" y="114.0" text-anchor="middle">write(1, ...)  stdout</text>
+<rect class="hot" x="260" y="70" width="200" height="64" rx="6"/>
+<text class="t" x="360.0" y="90.0" text-anchor="middle">Kernel: pty + line discipline</text>
+<text class="s" x="360.0" y="106.0" text-anchor="middle">newline translation (ONLCR)</text>
+<text class="s" x="360.0" y="122.0" text-anchor="middle">kernel-bound: 0.09 GB/s</text>
+<rect class="box" x="500" y="70" width="200" height="64" rx="6"/>
+<text class="t" x="600.0" y="90.0" text-anchor="middle">lx-reader thread</text>
+<text class="s" x="600.0" y="106.0" text-anchor="middle">poll, read 64 KB</text>
+<text class="s" x="600.0" y="122.0" text-anchor="middle">ring of 8 buffers</text>
+<rect class="box" x="740" y="70" width="200" height="64" rx="6"/>
+<text class="t" x="840.0" y="90.0" text-anchor="middle">lx-io parser thread</text>
+<text class="s" x="840.0" y="106.0" text-anchor="middle">1 slice = 64 KB, under lock</text>
+<text class="s" x="840.0" y="122.0" text-anchor="middle">bulk path &gt;= 128 KB: workers</text>
+<line class="ar" x1="220" y1="102.0" x2="260" y2="102.0" marker-end="url(#h)"/>
+<line class="ar" x1="460" y1="102.0" x2="500" y2="102.0" marker-end="url(#h)"/>
+<line class="ar" x1="700" y1="102.0" x2="740" y2="102.0" marker-end="url(#h)"/>
+<rect class="box" x="740" y="180" width="200" height="64" rx="6"/>
+<text class="t" x="840.0" y="200.0" text-anchor="middle">Vt grid + scrollback</text>
+<text class="s" x="840.0" y="216.0" text-anchor="middle">SSE2 ASCII runs -&gt; cells</text>
+<text class="s" x="840.0" y="232.0" text-anchor="middle">scrolled rows: 1 byte/char</text>
+<rect class="ui" x="500" y="180" width="200" height="64" rx="6"/>
+<text class="t" x="600.0" y="200.0" text-anchor="middle">UI thread (SDL2)</text>
+<text class="s" x="600.0" y="216.0" text-anchor="middle">redraw only dirty rows</text>
+<text class="s" x="600.0" y="232.0" text-anchor="middle">&lt;= 60 fps, idle 0-2 fps</text>
+<rect class="ui" x="260" y="180" width="200" height="64" rx="6"/>
+<text class="t" x="360.0" y="200.0" text-anchor="middle">OpenGL glyph atlas</text>
+<text class="s" x="360.0" y="216.0" text-anchor="middle">ASCII lookup table</text>
+<text class="s" x="360.0" y="232.0" text-anchor="middle">one texture, no re-raster</text>
+<rect class="ui" x="20" y="180" width="200" height="64" rx="6"/>
+<text class="t" x="120.0" y="208.0" text-anchor="middle">Screen</text>
+<text class="s" x="120.0" y="224.0" text-anchor="middle">GPU / compositor</text>
+<line class="ar" x1="840.0" y1="134" x2="840.0" y2="180" marker-end="url(#h)"/>
+<line class="ar" x1="740" y1="212.0" x2="700" y2="212.0" marker-end="url(#h)"/>
+<line class="ar" x1="500" y1="212.0" x2="460" y2="212.0" marker-end="url(#h)"/>
+<line class="ar" x1="260" y1="212.0" x2="220" y2="212.0" marker-end="url(#h)"/>
+<text class="h" x="20" y="294">2. Fast output (row 31) - skip the kernel&#x27;s newline work</text>
+<text class="s" x="20" y="312">When the foreground program is a plain printer (cat, ls, grep, make ...), Lestrix switches OPOST/ONLCR off.</text>
+<rect class="box" x="20" y="334" width="200" height="64" rx="6"/>
+<text class="t" x="120.0" y="362.0" text-anchor="middle">Program</text>
+<text class="s" x="120.0" y="378.0" text-anchor="middle">cat, ls, grep, find, seq...</text>
+<rect class="skip" x="260" y="334" width="200" height="64" rx="6"/>
+<text class="t" x="360.0" y="354.0" text-anchor="middle">Kernel: pty only</text>
+<text class="s" x="360.0" y="370.0" text-anchor="middle">line discipline skipped</text>
+<text class="s" x="360.0" y="386.0" text-anchor="middle">0.42-0.46 GB/s (pty bench)</text>
+<rect class="box" x="500" y="334" width="200" height="64" rx="6"/>
+<text class="t" x="600.0" y="362.0" text-anchor="middle">lx-reader thread</text>
+<text class="s" x="600.0" y="378.0" text-anchor="middle">same ring of 8 buffers</text>
+<rect class="box" x="740" y="334" width="200" height="64" rx="6"/>
+<text class="t" x="840.0" y="354.0" text-anchor="middle">lx-io parser thread</text>
+<text class="s" x="840.0" y="370.0" text-anchor="middle">LF treated as CR+LF</text>
+<text class="s" x="840.0" y="386.0" text-anchor="middle">(force_nl) instead</text>
+<line class="ar" x1="220" y1="366.0" x2="260" y2="366.0" marker-end="url(#h)"/>
+<line class="ar" x1="460" y1="366.0" x2="500" y2="366.0" marker-end="url(#h)"/>
+<line class="ar" x1="700" y1="366.0" x2="740" y2="366.0" marker-end="url(#h)"/>
+<text class="s" x="20" y="418">A pidfd watcher restores the saved termios the moment that program exits, so the shell never sees a changed terminal.</text>
+<text class="h" x="20" y="450">3. lxcat (rows 32-33) - bulk bytes never enter the pty</text>
+<text class="s" x="20" y="468">cat is shimmed to lxcat; files and pipes travel through tmpfs, the pty only carries a ~60 byte request.</text>
+<rect class="box" x="20" y="490" width="200" height="64" rx="6"/>
+<text class="t" x="120.0" y="518.0" text-anchor="middle">Producer | pipe</text>
+<text class="s" x="120.0" y="534.0" text-anchor="middle">or: cat file</text>
+<rect class="box" x="260" y="490" width="200" height="64" rx="6"/>
+<text class="t" x="360.0" y="510.0" text-anchor="middle">lxcat</text>
+<text class="s" x="360.0" y="526.0" text-anchor="middle">pipe buffer 4 MB (F_SETPIPE_SZ)</text>
+<text class="s" x="360.0" y="542.0" text-anchor="middle">reads up to 8 MB per chunk</text>
+<rect class="skip" x="500" y="490" width="200" height="64" rx="6"/>
+<text class="t" x="600.0" y="510.0" text-anchor="middle">/dev/shm/lxcat-PID-N</text>
+<text class="s" x="600.0" y="526.0" text-anchor="middle">tmpfs, two files alternate</text>
+<text class="s" x="600.0" y="542.0" text-anchor="middle">written once, mode 0600</text>
+<rect class="box" x="740" y="490" width="200" height="64" rx="6"/>
+<text class="t" x="840.0" y="510.0" text-anchor="middle">Parser pread()</text>
+<text class="s" x="840.0" y="526.0" text-anchor="middle">1 MB chunks, 512 KB slices</text>
+<text class="s" x="840.0" y="542.0" text-anchor="middle">stream_nl, no tty involved</text>
+<line class="ar" x1="220" y1="522.0" x2="260" y2="522.0" marker-end="url(#h)"/>
+<line class="ar" x1="460" y1="522.0" x2="500" y2="522.0" marker-end="url(#h)"/>
+<line class="ar" x1="700" y1="522.0" x2="740" y2="522.0" marker-end="url(#h)"/>
+<rect class="box" x="260" y="598" width="200" height="56" rx="6"/>
+<text class="t" x="360.0" y="622.0" text-anchor="middle">Kernel: pty</text>
+<text class="s" x="360.0" y="638.0" text-anchor="middle">carries only the request</text>
+<rect class="box" x="500" y="598" width="200" height="56" rx="6"/>
+<text class="t" x="600.0" y="622.0" text-anchor="middle">lx-reader thread</text>
+<text class="s" x="600.0" y="638.0" text-anchor="middle">sees OSC 7777;cat;token;path</text>
+<line class="ar2" x1="360.0" y1="554" x2="360.0" y2="598" marker-end="url(#h)"/>
+<text class="s" x="426.0" y="580" text-anchor="middle">OSC 7777 (~60 B)</text>
+<line class="ar2" x1="460" y1="626.0" x2="500" y2="626.0" marker-end="url(#h)"/>
+<line class="ar2" x1="700" y1="626.0" x2="840.0" y2="554" marker-end="url(#h)"/>
+<text class="s" x="820.0" y="630.0" text-anchor="middle">path + token checked</text>
+<text class="h" x="20" y="706">4. Keyboard (stdin) to the program</text>
+<text class="s" x="20" y="724">Input is tiny, so the work is latency: no polling timer, no batching delay on the way in.</text>
+<rect class="ui" x="20" y="746" width="200" height="64" rx="6"/>
+<text class="t" x="120.0" y="774.0" text-anchor="middle">Keyboard</text>
+<text class="s" x="120.0" y="790.0" text-anchor="middle">SDL_KEYDOWN / TEXTINPUT</text>
+<rect class="ui" x="260" y="746" width="200" height="64" rx="6"/>
+<text class="t" x="360.0" y="766.0" text-anchor="middle">UI thread: tcore_key</text>
+<text class="s" x="360.0" y="782.0" text-anchor="middle">encodes bytes, tcore_send</text>
+<text class="s" x="360.0" y="798.0" text-anchor="middle">memcpy into out queue</text>
+<rect class="box" x="500" y="746" width="200" height="64" rx="6"/>
+<text class="t" x="600.0" y="766.0" text-anchor="middle">lx-writer thread</text>
+<text class="s" x="600.0" y="782.0" text-anchor="middle">woken by condvar</text>
+<text class="s" x="600.0" y="798.0" text-anchor="middle">write(master fd)</text>
+<rect class="hot" x="740" y="746" width="200" height="64" rx="6"/>
+<text class="t" x="840.0" y="766.0" text-anchor="middle">Kernel: pty master</text>
+<text class="s" x="840.0" y="782.0" text-anchor="middle">line discipline: echo,</text>
+<text class="s" x="840.0" y="798.0" text-anchor="middle">Ctrl-C (ISIG), line editing</text>
+<line class="ar" x1="220" y1="778.0" x2="260" y2="778.0" marker-end="url(#h)"/>
+<line class="ar" x1="460" y1="778.0" x2="500" y2="778.0" marker-end="url(#h)"/>
+<line class="ar" x1="700" y1="778.0" x2="740" y2="778.0" marker-end="url(#h)"/>
+<rect class="box" x="740" y="856" width="200" height="64" rx="6"/>
+<text class="t" x="840.0" y="884.0" text-anchor="middle">pty slave</text>
+<text class="s" x="840.0" y="900.0" text-anchor="middle">read(0) in the program</text>
+<rect class="box" x="500" y="856" width="200" height="64" rx="6"/>
+<text class="t" x="600.0" y="876.0" text-anchor="middle">Program / shell</text>
+<text class="s" x="600.0" y="892.0" text-anchor="middle">reads stdin, prints echo</text>
+<text class="s" x="600.0" y="908.0" text-anchor="middle">and results to stdout</text>
+<rect class="box" x="260" y="856" width="200" height="64" rx="6"/>
+<text class="t" x="360.0" y="884.0" text-anchor="middle">Panel 1 or 2</text>
+<text class="s" x="360.0" y="900.0" text-anchor="middle">output returns the same way</text>
+<line class="ar" x1="840.0" y1="810" x2="840.0" y2="856" marker-end="url(#h)"/>
+<line class="ar" x1="740" y1="888.0" x2="700" y2="888.0" marker-end="url(#h)"/>
+<line class="ar" x1="500" y1="888.0" x2="460" y2="888.0" marker-end="url(#h)"/>
+</svg>
+<div class="legend"><span><i style="background:var(--box);border-color:var(--bd)"></i>Lestrix or program code</span><span><i style="background:var(--ui);border-color:var(--ubd)"></i>UI / GPU side</span><span><i style="background:var(--kern);border-color:var(--kbd)"></i>Kernel cost on the path</span><span><i style="background:var(--skip);border-color:var(--sbd)"></i>Kernel work skipped or replaced</span></div></div>
+<table><thead><tr><th>Speed gain</th><th>What it removes</th><th>Measured (this machine, from native/docs)</th></tr></thead><tbody>
+<tr><td class="n">Fast output (row 31)</td><td>Kernel newline translation on the pty for plain printers</td><td>pty benchmark 0.09 -> 0.42-0.46 GB/s; line-heavy text 34-45 -> 211 MB/s</td></tr>
+<tr><td class="n">lxcat file path (rows 32-33)</td><td>Bulk bytes through the pty and tty layer; conversion copy</td><td>256 MB ASCII log: 0.27 -> 0.22 s; pipe case 0.63 -> 0.70 GB/s</td></tr>
+<tr><td class="n">Compact scrollback (row 30, 36)</td><td>8-byte cells kept for history; later 8-byte block packing</td><td>256 MB log 0.50 -> 0.31 s; parser gate with scrollback 690 -> ~790 MB/s</td></tr>
+<tr><td class="n">Deferred compression</td><td>Compressing history that is evicted before it is read</td><td>-15% wall, -48% CPU on floods</td></tr>
+<tr><td class="n">Pipelined parse (rows 34-35)</td><td>IO thread waiting for the parser, per-slice scans</td><td>ASCII flood 0.27 -> 0.18 s; random text 1.12 -> 0.93 s</td></tr>
+<tr><td class="n">Dirty-row rendering</td><td>Redrawing text that did not change</td><td>idle redraw 0-2 fps (idle CPU 0.03 s in the 2026-10-05 benchmark, best rival 0.00)</td></tr>
+</tbody></table>
+<p class="note">Nothing here bypasses the kernel completely: the pty, the pipe and tmpfs are all kernel objects. The gains come from skipping the line discipline, keeping bulk data out of the pty, and cutting copies and wakeups.</p>
+</main></body></html>
