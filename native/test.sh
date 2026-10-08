@@ -96,6 +96,8 @@ run() {
 
 run engine make test-vt
 run fast   make test-fast
+run shadow make test-shadow
+run lxcat  make test-lxcat
 run lz     make test-lz
 run tsan   make test-vt-tsan
 run store  make test-store

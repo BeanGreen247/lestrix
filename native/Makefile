@@ -8,7 +8,7 @@ CFLAGS  += $(GCC_TUNE)
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-deprecated-declarations -Wno-missing-field-initializers -fvisibility=hidden -pthread
 BUILD   := build
 
-.PHONY: bench-file bench-terminals all test test-fast test-gui perf-gate test-lz test-vt-tsan test-vt test-store test-xfer test-ftp bench app install uninstall clean
+.PHONY: bench-file bench-terminals all test test-fast test-shadow test-lxcat test-gui perf-gate test-lz test-vt-tsan test-vt test-store test-xfer test-ftp bench app install uninstall clean
 all: app
 
 $(BUILD):
@@ -31,7 +31,7 @@ test-vt: $(BUILD)/test_vt $(BUILD)/libvt.so
 	@PY=$$(for p in ../.venv/bin/python python3; do $$p -c "import pyte" 2>/dev/null && echo $$p && break; done); \
 	  if [ -n "$$PY" ]; then $$PY tests/diff_pyte.py 1500; else echo "(pyte not installed: skipping the differential test)"; fi
 
-test: test-vt test-fast test-lz test-vt-tsan test-store test-xfer test-ftp perf-gate
+test: test-vt test-fast test-shadow test-lxcat test-lz test-vt-tsan test-store test-xfer test-ftp perf-gate
 
 bench: $(BUILD)/bench_vt
 	$(BUILD)/bench_vt
@@ -126,6 +126,20 @@ $(BUILD)/test_fast_paths: tests/test_fast_paths.c src/vt.c src/lz.c src/vt.h | $
 
 test-fast: $(BUILD)/test_fast_paths
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/test_fast_paths
+
+$(BUILD)/dump_vt_shadow: tests/dump_vt.c src/vt.c src/lz.c src/vt.h | $(BUILD)
+	$(CC) -std=gnu11 -O2 -g -pthread -fsanitize=address,undefined -o $@ tests/dump_vt.c src/vt.c src/lz.c
+
+$(BUILD)/dump_vt_plain: tests/dump_vt.c src/vt.c src/lz.c src/vt.h | $(BUILD)
+	$(CC) -std=gnu11 -O2 -g -pthread -fsanitize=address,undefined -DVT_NO_SHADOW -o $@ tests/dump_vt.c src/vt.c src/lz.c
+
+test-shadow: $(BUILD)/dump_vt_shadow $(BUILD)/dump_vt_plain
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/dump_vt_shadow 300 > $(BUILD)/shadow.out
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/dump_vt_plain 300 > $(BUILD)/plain.out
+	cmp $(BUILD)/shadow.out $(BUILD)/plain.out && echo "shadow rows: 300 random streams identical"
+
+test-lxcat: $(BUILD)/lxcat
+	python3 tests/test_lxcat.py $(BUILD)/lxcat
 
 bench-file: $(BUILD)/gen_random
 	$(BUILD)/gen_random /tmp/lestrix-bench-1g.txt 1024

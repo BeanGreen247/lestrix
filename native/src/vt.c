@@ -46,6 +46,7 @@ typedef struct {
     VtCell *cells;
     VtLineMeta *meta;
     int *order;
+    uint8_t *sh;
 } Scr;
 
 typedef struct HSeg {
@@ -311,6 +312,7 @@ static void scr_alloc(Scr *s, int cols, int rows) {
     s->cells = calloc((size_t)cols * (size_t)rows, sizeof(VtCell));
     s->meta = calloc((size_t)rows, sizeof(VtLineMeta));
     s->order = malloc((size_t)rows * sizeof(int));
+    s->sh = malloc((size_t)cols * (size_t)rows);
     for (int i = 0; i < rows; i++) { s->order[i] = i; s->meta[i].dirty = 1; }
 }
 
@@ -324,7 +326,7 @@ static void scr_release_caches(Vt *t, Scr *s, int rows) {
 
 static void scr_free(Vt *t, Scr *s, int rows) {
     scr_release_caches(t, s, rows);
-    free(s->cells); free(s->meta); free(s->order);
+    free(s->cells); free(s->meta); free(s->order); free(s->sh);
     memset(s, 0, sizeof *s);
 }
 
@@ -905,8 +907,11 @@ static void hist_push(Vt *t, int y) {
     if (t->max_lines == 0) return;
     VtLineMeta *m = rowm(t, y);
     VtLineMeta meta = *m;
+    const bool shadow = m->dirty == 2 && m->hw >= PUSH_BYTES_MIN && m->hw <= PUSH_BYTES_MAX;
+    meta.dirty = 1;
     m->cache = NULL;
     m->dirty = 1;
+    if (shadow) { hist_add_compact(t, t->cur->sh + (size_t)t->cur->order[y] * (size_t)t->cols, m->hw, meta.sf, meta, true); return; }
     const VtCell *src = rowp(t, y);
     int len = m->hw < t->cols ? m->hw : t->cols;
     while (len > 0 && src[len - 1].cp == 0 && src[len - 1].sf == 0) len--;
@@ -1480,7 +1485,7 @@ static size_t utf8_run(Vt *t, const uint8_t *p, size_t n) {
 }
 
 
-static void put_ascii(Vt *t, const uint8_t *p, size_t n) {
+static inline __attribute__((always_inline)) void put_ascii_impl(Vt *t, const uint8_t *p, size_t n, const bool track) {
     if (t->g[t->gl] == CS_GRAPHICS || (t->modes & VT_M_INSERT) || !(t->modes & VT_M_AUTOWRAP)) {
         for (size_t i = 0; i < n; i++) put_cp(t, p[i]);
         return;
@@ -1488,23 +1493,38 @@ static void put_ascii(Vt *t, const uint8_t *p, size_t n) {
     const uint32_t sf = t->pen_style << 8;
     while (n) {
         if (t->cx == t->cols) {
-            dirty(t, t->cy);
+            VtLineMeta *wm = rowm(t, t->cy);
+            if (!track || wm->dirty != 2) wm->dirty = 1;
             t->cx = 0;
             do_linefeed(t);
         }
         VtCell *r = rowp(t, t->cy);
+        VtLineMeta *lm = rowm(t, t->cy);
         size_t room = (size_t)(t->cols - t->cx);
         size_t k = n < room ? n : room;
         VtCell *dst = r + t->cx;
+        /* dirty == 2 marks a row only this function has written, in one style, with no gaps; shadow bytes then hold its text for the scrollback */
+        if (track) {
+            if (lm->dirty == 2) { if (t->cx > lm->hw || lm->sf != sf) lm->dirty = 1; }
+            else if (lm->hw == 0 && t->cx == 0) { lm->sf = sf; lm->dirty = 2; }
+            if (lm->dirty == 2) memcpy(t->cur->sh + (size_t)t->cur->order[t->cy] * (size_t)t->cols + t->cx, p, k);
+        }
         fill_ascii(dst, p, k, sf);
         t->cx += (int)k;
         t->last_cp = p[k - 1];
         p += k;
         n -= k;
-        VtLineMeta *lm = rowm(t, t->cy);
-        lm->dirty = 1;
+        if (!track || lm->dirty != 2) lm->dirty = 1;
         if (t->cx > lm->hw) lm->hw = (uint16_t)t->cx;
     }
+}
+
+static void put_ascii(Vt *t, const uint8_t *p, size_t n) {
+#ifndef VT_NO_SHADOW
+    if (t->max_lines != 0 && t->cur == &t->main) put_ascii_impl(t, p, n, true);
+    else
+#endif
+    put_ascii_impl(t, p, n, false);
 }
 
 static void sgr(Vt *t) {

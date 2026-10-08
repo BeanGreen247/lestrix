@@ -120,3 +120,53 @@ Kept: (1) `hist_push` packs all-ASCII single-style rows of 32-512 cells into `hi
 Rejected on the gate: `-march=native` 1369, LTO 1399, PGO 1405, `-freorder-blocks-algorithm=simple -fvect-cost-model=unlimited` 1386 (baseline 1426); 16-bytes-per-step `fill_ascii` (no gain, short runs -10%); compacting rows under 32 cells (-20%).
 Remaining gap: the scrollback path is still about 2.6x below the 2.1 GB/s floor (history compaction pass over each row, block packing). Not measured: GUI benchmark, input latency, 1024x768 (parse engine only).
 Tests after the change: test-vt 120/0, test-lz 1005/0, test_fast_paths (ASan/UBSan differential) 34163/0, TSan 120/0.
+
+## Gap 1: scrollback path, shadow rows (2026-10-08, README row 37)
+
+Upper bound first (delete the row check and pack, fill with a constant): 85-char lines with scrollback 870 -> 990 MB/s, 170-char 1130 -> 1380 MB/s. The real change beat the bound because the check is gone and no cell is read at all.
+
+| Case | Before | After |
+|---|---|---|
+| Gate, 10,000-line scrollback | about 790 MB/s | 875-930 MB/s |
+| 85-char lines, scrollback | 870 MB/s | 1030 MB/s |
+| 170-char lines, scrollback | 1130 MB/s | 1400 MB/s |
+| 20-char lines, scrollback | 385 MB/s | 385 MB/s (below 32 cells the old path is kept) |
+| Gate, no scrollback | about 1580 MB/s | 1490-1530 MB/s (-4 to -6%) |
+| 85 / 170-char lines, no scrollback | 1700 / 2040 MB/s | 1640 / 1920 MB/s (-3 / -6%) |
+
+The no-scrollback loss is real in interleaved A/B runs and survived specializing `put_ascii` on a compile-time `track` flag, so it is code layout or register pressure in the shared loop, not the shadow work (which is skipped there). The real app always has scrollback on the main screen, so the trade is kept; to be revisited if alt-screen output (vim, less) is found to matter.
+Safety: a row is marked only when it was blank at column 0 and every later write was `put_ascii` with the same style and no gap; every other writer already sets `dirty = 1` for rendering, which clears the mark. Tests: `make test-shadow` (300 random streams, shadow vs `-DVT_NO_SHADOW`, identical; mutating the style check or the gap check is detected), test-vt 120/0, test-lz 1005/0, test_fast_paths 34163/0, TSan 120/0.
+Not measured: GUI benchmark, input latency, 1024x768 (parse engine only).
+
+## Gap 3: lxcat pipe path, splice (2026-10-08, README row 38)
+
+Method: 256 MB ASCII log, `/bin/cat file | lxcat -` typed into a real Lestrix window on a private Xvfb display (software GL, so absolute times are only comparable with each other), terminal answers with a cursor-position report, 7-9 repetitions, old and new `lxcat` binaries alternated. File path floor (`lxcat file`, no pipe): 0.26-0.38 s, median about 0.30 s.
+
+| Case | Before (read + write) | After (splice) |
+|---|---|---|
+| End to end, run A (median of 9) | 0.604 s | 0.578 s |
+| End to end, run B (median of 9) | 0.570 s | 0.519 s |
+| Stage alone: pipe -> new tmpfs file per chunk, no parser (C micro-benchmark, 3 runs) | 0.22 s | 0.17 s |
+| Stage alone, files overwritten in place instead of created and unlinked per chunk | - | 0.11 s |
+
+Result: about -4 to -9% end to end; kept because the stage micro-benchmark and the interleaved runs agree on the direction. The pipe path (0.52-0.58 s) is still well above the file floor (0.30 s): the stages do not overlap as well as they should. The next lever is the hand-off, see gap 4 (poll sleeps) and the in-place file idea above, which needs an acknowledgement channel from the terminal instead of "the file disappeared".
+Rejected by reasoning, not measured: `mmap` of the file in the terminal (saves the 1 MB `pread` copy, at most about 8% of the 0.30 s parse, but a truncated or rewritten file raises SIGBUS inside the terminal).
+Tests: `make test-lxcat` (new): empty, 6 B, 9 MB, 40 MB through the pipe (splice) and redirect (fallback) paths, byte-exact; no leftover `/dev/shm/lxcat-*`.
+
+## Gap 4: lxcat hand-off polling, inotify (2026-10-08, rejected)
+
+Change tried: replace the `access()` + 0.5 ms `nanosleep` loops that wait for the terminal to delete the previous chunk file with an `inotify` wait (`IN_ATTRIB | IN_DELETE_SELF`, 100 ms poll fallback). Same 256 MB pipe benchmark as gap 3, interleaved, median of 9: inotify 0.617 / 0.563 s against sleep polling 0.529 / 0.570 s. No win, so it was reverted (the rebuilt binary is byte-identical to the splice build measured in gap 3).
+Why it could not help: a timing build of `lxcat` (not kept) showed the pipe path is limited by the terminal, not by the hand-off. Per 256 MB run, 49-60 chunks of about 4.5 MB: `lxcat` spent 0.25-0.46 s waiting for a free slot (the terminal is still parsing the other chunk), 0.22-0.33 s in `splice` (mostly waiting for `cat` to produce), and 0.01-0.04 s sending requests.
+New finding: the terminal consumes the same bytes at about 0.5 s per 256 MB when they arrive as pipe chunks, against about 0.30 s when it reads one file. That is the real remaining gap (about 0.2 s) and it lives on the terminal side of `stream_file` / `feed_output` (per-request open, `fstat`, 1 MB `malloc`, `LOCK`, `vt_set_stream_nl` toggles, UI wake-ups on every slice, CPU shared with `cat` and `lxcat` on 6 cores). Next experiment: profile the parser thread during the pipe case (callgrind on `lestrix` is too slow; use a per-phase timer inside `stream_file`).
+
+## Gap 5: `sched_yield` spin in `feed_sliced` (2026-10-08, rejected)
+
+The parser yields up to 2000 times per 64 KB slice while the UI thread waits for the terminal lock. Built three variants with a compile-time limit (`-DYIELD_SPINS=` 2000 / 200 / 0) and ran the lxcat file flood (256 MB, real window on Xvfb, medians of 9, three rounds interleaved): 2000: 0.339 / 0.347 / 0.350 s; 0: 0.353 / 0.365 / 0.337 s; 200: 0.381 / 0.323 / 0.318 s. The spread inside one variant (0.32-0.38) is larger than any difference between variants, so there is nothing to keep; source reverted to the original. A plain `cat` flood is kernel-bound under this harness (8.4 s for 256 MB in every variant, 4.3 s terminal CPU), so it cannot show the effect.
+Not measured: a real GPU, where the UI thread holds the lock for a shorter time than under software GL.
+
+## Gap 6: input queue `memmove` (2026-10-08, README row 39)
+
+`flush_out` did `memmove(outq, outq + n, outlen - n)` after every partial write, so a queue of N bytes drained in 4 KB writes costs N^2 / 8 KB of copying. Fix: `outhead` offset, compact only when the buffer needs room (`tcore_send`), reset when empty.
+Micro-benchmark of the queue logic alone (C program, non-blocking pipe sized 4 KB, a thread draining 4 KB reads): 8 MB: memmove 0.420 s, head offset 0.073 s; head offset 64 MB: 0.320 s (the memmove version scales with the square of the size; measured only at 8 MB). Label: micro-benchmark plus end-to-end smoke test, not a GUI paste measurement (the SDL script can only inject 31 bytes per text event).
+Correctness: a command typed into a real window (Xvfb, `--script "t:touch typed_ok;k:return"`) still runs and creates the file; `make test-gui` passes.
+Not measured: real paste of megabytes through the GUI, typing echo latency (unchanged code path for small input: the queue holds a few bytes).

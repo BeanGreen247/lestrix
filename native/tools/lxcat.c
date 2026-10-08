@@ -43,29 +43,58 @@ static void request(const char *token, const char *path, unsigned flags) {
 
 static const char *prog = "lxcat";
 
+static void drop(char *name, int fd) { if (fd >= 0) close(fd); unlink(name); name[0] = 0; }
+
+/* Moves up to `room` bytes from the pipe on stdin into fd with splice (pipe to tmpfs inside the kernel, no user buffer).
+ * Returns bytes moved, 0 at EOF, -1 if stdin cannot be spliced (not a pipe), -2 on a real error. */
+static ssize_t splice_chunk(int fd, size_t room) {
+    size_t have = 0;
+    while (have < room) {
+        ssize_t n = splice(0, NULL, fd, NULL, room - have, SPLICE_F_MOVE);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return have == 0 && errno == EINVAL ? -1 : -2;
+        if (n == 0) break;
+        have += (size_t)n;
+        struct pollfd pf = {0, POLLIN, 0};
+        if (poll(&pf, 1, 0) <= 0) break;
+    }
+    return (ssize_t)have;
+}
+
 static int stream_stdin(const char *token) {
     enum { CHUNK = 8 << 20 };
-    char *buf = malloc(CHUNK);
+    char *buf = NULL;
     char names[2][64] = {"", ""};
     int rc = 0;
     long seq = 0;
-    if (!buf) return 1;
+    int spliceable = 1;
     fcntl(0, F_SETPIPE_SZ, 4 << 20);
     for (;;) {
-        size_t have = 0;
-        ssize_t n;
-        while (have < CHUNK && (n = read(0, buf + have, CHUNK - have)) > 0) {
-            have += (size_t)n;
-            struct pollfd pf = {0, POLLIN, 0};
-            if (poll(&pf, 1, 0) <= 0) break;
-        }
-        if (have == 0) break;
         char *old = names[seq & 1];
         for (int w = 0; old[0] && access(old, F_OK) == 0 && w < 20000; w++) { struct timespec ts = {0, 500000}; nanosleep(&ts, NULL); }
-        snprintf(old, 64, "/dev/shm/lxcat-%d-%ld", (int)getpid(), seq++);
+        snprintf(old, 64, "/dev/shm/lxcat-%d-%ld", (int)getpid(), seq);
         int fd = open(old, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0 || write_all(fd, buf, have)) { if (fd >= 0) close(fd); rc = 1; break; }
+        if (fd < 0) { old[0] = 0; rc = 1; break; }
+        ssize_t have = 0;
+        if (spliceable) {
+            have = splice_chunk(fd, CHUNK);
+            if (have == -1) spliceable = 0;
+            else if (have < 0) { drop(old, fd); rc = 1; break; }
+        }
+        if (!spliceable) {
+            if (!buf && !(buf = malloc(CHUNK))) { drop(old, fd); rc = 1; break; }
+            ssize_t n;
+            have = 0;
+            while ((size_t)have < CHUNK && (n = read(0, buf + have, CHUNK - have)) > 0) {
+                have += n;
+                struct pollfd pf = {0, POLLIN, 0};
+                if (poll(&pf, 1, 0) <= 0) break;
+            }
+            if (have > 0 && write_all(fd, buf, (size_t)have)) { drop(old, fd); rc = 1; break; }
+        }
+        if (have == 0) { drop(old, fd); break; }
         close(fd);
+        seq++;
         request(token, old, 3);
     }
     free(buf);

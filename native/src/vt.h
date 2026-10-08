@@ -34,8 +34,9 @@ enum { VT_F_WIDE = 1, VT_F_TAIL = 2 };
 #define VT_CELL_FLAGS(c) ((c).sf & 0xFFu)
 
 typedef struct {
-    uint8_t dirty;
+    uint8_t dirty;   /* 0 clean, 1 dirty, 2 dirty and the row holds only plain ASCII of one style (vt.c shadow bytes) */
     uint16_t hw;
+    uint32_t sf;     /* style of that ASCII row, valid while dirty == 2 */
     void *cache;
 } VtLineMeta;
 

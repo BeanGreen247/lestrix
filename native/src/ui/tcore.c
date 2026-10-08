@@ -58,7 +58,7 @@ struct TermCore {
     bool running, eof, child_done;
     int exit_status;
     pthread_mutex_t outlock, evlock;
-    uint8_t *outq; size_t outlen, outcap;
+    uint8_t *outq; size_t outhead, outlen, outcap;
     PendingEv *ev_head, *ev_tail;
     char **argv;
     char *cwd, *title;
@@ -278,13 +278,16 @@ static void wake_worker(TermCore *t) {
 void tcore_send(TermCore *t, const char *data, size_t len) {
     if (!len || !atomic_load(&t->running_flag)) return;
     pthread_mutex_lock(&t->outlock);
-    if (t->outlen + len > t->outcap) {
-        size_t nc = t->outcap ? t->outcap * 2 : 1024;
-        while (nc < t->outlen + len) nc *= 2;
-        uint8_t *nb = realloc(t->outq, nc);
-        if (nb) { t->outq = nb; t->outcap = nc; }
+    if (t->outhead + t->outlen + len > t->outcap) {
+        if (t->outhead) { memmove(t->outq, t->outq + t->outhead, t->outlen); t->outhead = 0; }
+        if (t->outlen + len > t->outcap) {
+            size_t nc = t->outcap ? t->outcap * 2 : 1024;
+            while (nc < t->outlen + len) nc *= 2;
+            uint8_t *nb = realloc(t->outq, nc);
+            if (nb) { t->outq = nb; t->outcap = nc; }
+        }
     }
-    if (t->outlen + len <= t->outcap) { memcpy(t->outq + t->outlen, data, len); t->outlen += len; }
+    if (t->outlen + len <= t->outcap) { memcpy(t->outq + t->outhead + t->outlen, data, len); t->outlen += len; }
     pthread_mutex_unlock(&t->outlock);
     wake_worker(t);
 }
@@ -317,11 +320,11 @@ static void term_print(TermCore *t, const char *s) {
 static void flush_out(TermCore *t, bool *still_pending) {
     pthread_mutex_lock(&t->outlock);
     while (t->outlen) {
-        ssize_t n = sd_pty_write(&t->pty, t->outq, t->outlen);
-        if (n > 0) { memmove(t->outq, t->outq + n, t->outlen - (size_t)n); t->outlen -= (size_t)n; }
+        ssize_t n = sd_pty_write(&t->pty, t->outq + t->outhead, t->outlen);
+        if (n > 0) { t->outhead += (size_t)n; t->outlen -= (size_t)n; if (!t->outlen) t->outhead = 0; }
         else if (errno == EINTR) continue;
         else if (errno == EAGAIN) break;
-        else { t->outlen = 0; break; }
+        else { t->outlen = 0; t->outhead = 0; break; }
     }
     *still_pending = t->outlen > 0;
     pthread_mutex_unlock(&t->outlock);
