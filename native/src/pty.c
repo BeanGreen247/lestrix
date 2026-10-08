@@ -55,6 +55,8 @@ int sd_pty_spawn(SdPty *p, char *const argv[], const char *cwd, char *const extr
     }
     if (pid == 0) {
         signal(SIGPIPE, SIG_DFL);
+        signal(SIGCHLD, SIG_DFL);
+        sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
         if (cwd && chdir(cwd) != 0) {  }
         execvpe(argv[0], argv, env);
         _exit(127);

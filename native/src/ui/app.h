@@ -18,7 +18,8 @@
 #include "ui.h"
 #include "uitheme.h"
 
-#define APP_VERSION "0.2.2"
+#define APP_VERSION "0.3.0"
+#define APP_CREDIT "Copyright (c) 2026 Thomas Mozdren (BeanGreen247)\nhttps://github.com/BeanGreen247/lestrix\n"
 
 typedef struct App App;
 typedef struct Dialog Dialog;
@@ -36,6 +37,7 @@ typedef struct {
     char *title, *color, *control_path;
     char **local_argv;
     TabState state;
+    bool asked;
     float x, w;
 } Tab;
 
@@ -137,6 +139,8 @@ void dlg_text(App *a, const char *title, const char *label, const char *initial,
 typedef void (*ConfirmCb)(App *a, void *user);
 void dlg_confirm(App *a, const char *title, const char *msg, const char *ok, ConfirmCb cb, void *user);
 void dlg_message(App *a, const char *title, const char *msg);
+typedef void (*ChoiceCb)(App *a, int index, void *user);
+void dlg_choice(App *a, const char *title, const char *msg, const char *const *labels, int n, ChoiceCb cb, void *user);
 typedef void (*PickCb)(App *a, char **paths, int n, void *user);
 void dlg_pick_file(App *a, const char *title, bool folder, bool multi, const char *start, PickCb cb, void *user);
 void dlg_conn_editor(App *a, const SdConn *c, bool copy_of_live);

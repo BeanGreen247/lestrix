@@ -6,13 +6,14 @@ set -euo pipefail
 umask 022
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
-PREFIX="/usr/local"; DEPS=ask; UNINSTALL=0; DEFAULT_TERM=1
+PREFIX="/usr/local"; DEPS=ask; UNINSTALL=0; DEFAULT_TERM=1; LIST_DEPS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) PREFIX="$2"; shift ;;
     --deps) DEPS=yes ;;
     --no-deps) DEPS=no ;;
     --uninstall) UNINSTALL=1 ;;
+    --list-deps) LIST_DEPS=1 ;;
     --no-default-terminal) DEFAULT_TERM=0 ;;
     -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -46,6 +47,8 @@ pkgs() {
     zypper)  echo gcc make pkg-config SDL2-devel freetype2-devel fontconfig-devel glib2-devel libcurl-devel openssh-clients Mesa-libGL1 Mesa-libEGL1 Mesa-libGLESv2-2 Mesa-dri ;;
   esac
 }
+
+if [ "$LIST_DEPS" = 1 ]; then echo "$PM"; pkgs; exit 0; fi
 
 profiling_pkgs() {
   case "$PM" in

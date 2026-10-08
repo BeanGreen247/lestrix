@@ -45,6 +45,7 @@ int tcore_cols(const TermCore *t);
 int tcore_rows(const TermCore *t);
 void tcore_resize(TermCore *t, int cols, int rows);
 bool tcore_running(const TermCore *t);
+void tcore_restart(TermCore *t);
 uint64_t tcore_bytes_fed(const TermCore *t);
 void tcore_set_fast_output(bool on);
 void tcore_cmd_begin(TermCore *t, double now);

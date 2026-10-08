@@ -938,6 +938,8 @@ static void reconnect(TermCore *t) {
     if (spawn(t) && t->hooks.restarted) t->hooks.restarted(t->user);
 }
 
+void tcore_restart(TermCore *t) { if (t && !t->running) reconnect(t); }
+
 bool tcore_key(TermCore *t, TKey key, uint32_t cp, int mods) {
     bool ctrl = mods & TM_CTRL, shift = mods & TM_SHIFT, alt = mods & TM_ALT;
     if (!t->running) {

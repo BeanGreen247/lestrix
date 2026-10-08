@@ -21,6 +21,7 @@
 
 #include "../bench.h"
 #include "fleetwm.h"
+#include <signal.h>
 #include "app.h"
 #include "appicon.h"
 #include "workpool.h"
@@ -240,6 +241,8 @@ Tab *app_cur_tab(App *a) { return a->cur >= 0 && a->cur < (int)a->tabs->len ? a-
 
 static int tab_index(App *a, Tab *t) { for (guint i = 0; i < a->tabs->len; i++) if (a->tabs->pdata[i] == t) return (int)i; return -1; }
 
+static void ended_prompt(App *a, Tab *t);
+
 static void select_tab(App *a, int i) {
     if (i < 0 || i >= (int)a->tabs->len) return;
     a->cur = i;
@@ -247,13 +250,19 @@ static void select_tab(App *a, int i) {
     if (t->state == ST_ACTIVITY || t->state == ST_BELL) t->state = ST_IDLE;
     a->strip_scroll = -1;
     app_redraw(a);
+    ended_prompt(a, t);
 }
 
 static void hook_wake(void *u) { (void)u; app_wake(); }
 static void hook_activity(void *u) { Tab *t = u; if (t->files) files_note_activity(t->files); if (app_cur_tab(t->app) != t && t->state == ST_IDLE) t->state = ST_ACTIVITY; }
 static void hook_bell(void *u) { Tab *t = u; if (app_cur_tab(t->app) != t && (t->state == ST_IDLE || t->state == ST_ACTIVITY)) t->state = ST_BELL; }
-static void hook_exited(void *u, int st) { (void)st; Tab *t = u; t->state = ST_ENDED; if (t->app->quit_on_exit) t->app->running = false; }
-static void hook_restarted(void *u) { Tab *t = u; t->state = ST_IDLE; }
+static void hook_exited(void *u, int st) {
+    (void)st; Tab *t = u;
+    t->state = ST_ENDED; t->asked = false;
+    if (t->app->quit_on_exit) t->app->running = false;
+    else ended_prompt(t->app, t);
+}
+static void hook_restarted(void *u) { Tab *t = u; t->state = ST_IDLE; t->asked = false; }
 static void hook_cwd(void *u, const char *p) { Tab *t = u; if (t->files) files_set_cwd(t->files, p); }
 static void hook_clip_set(void *u, const char *text, bool primary) { (void)u; if (primary) SDL_SetPrimarySelectionText(text); else SDL_SetClipboardText(text); }
 static void hook_clip_request(void *u, bool primary) {
@@ -287,6 +296,25 @@ static void close_confirmed(App *a, void *user) { Tab *t = user; if (tab_index(a
 void app_close_tab(App *a, Tab *t) {
     if (t->term && tcore_running(t->term)) dlg_confirm(a, "Close session", "This session is still running. Close it?", "Close", close_confirmed, t);
     else tab_destroy(a, t);
+}
+
+/* MobaXterm-style choices when a session ends (exit, logout, dropped ssh). Asked once per ending, for the visible tab. */
+static void ended_choice(App *a, int i, void *user) {
+    Tab *t = user;
+    if (tab_index(a, t) < 0) return;
+    if (i == 0) { if (t->term) tcore_restart(t->term); }
+    else if (i == 1) app_dup_tab(a, t);
+    else if (i == 2) tab_destroy(a, t);
+    app_redraw(a);
+}
+
+static void ended_prompt(App *a, Tab *t) {
+    if (t->state != ST_ENDED || t->asked || app_cur_tab(a) != t || dlg_active(a)) return;
+    t->asked = true;
+    static const char *const labels[] = {"Restart session", "Duplicate in a new tab", "Close tab", "Keep the tab open"};
+    char msg[200];
+    snprintf(msg, sizeof msg, "\"%s\" has ended. What do you want to do?", t->title);
+    dlg_choice(a, "Session ended", msg, labels, 4, ended_choice, t);
 }
 
 static Tab *tab_add(App *a, TabKind kind, const char *title) {
@@ -1561,11 +1589,12 @@ int main(int argc, char **argv) {
     mallopt(M_ARENA_MAX, 2);
     mallopt(M_MMAP_THRESHOLD, 64 * 1024);
     mallopt(M_TRIM_THRESHOLD, 256 * 1024);
+    signal(SIGCHLD, SIG_DFL);  /* a launcher may start us with SIGCHLD ignored; that survives exec and breaks waitpid here and in every shell child (git: "waitpid failed: No child processes") */
     Startup s = {0};
     char *flood = NULL, *run_cmd = NULL, *shot = NULL, *script_arg = NULL;
     double shot_after = 3.0;
     for (int i = 1; i < argc; i++) {
-        if (g_str_equal(argv[i], "--version")) { g_print("Lestrix %s\n", APP_VERSION); return 0; }
+        if (g_str_equal(argv[i], "--version")) { g_print("Lestrix %s\n" APP_CREDIT, APP_VERSION); return 0; }
         if (g_str_equal(argv[i], "--benchmark")) return sd_benchmark(stdout, 8.0);
         if (g_str_equal(argv[i], "--max-fps") && i + 1 < argc) { g_max_fps = atof(argv[++i]); continue; }
         if (g_str_equal(argv[i], "--read-delay") && i + 1 < argc) { tcore_read_delay_us = atoi(argv[++i]); continue; }
@@ -1594,7 +1623,7 @@ int main(int argc, char **argv) {
                     "  --compress-threads N  threads that compress old scrollback (default: a quarter of the cores, 2 to 8)\n"
                     "  --no-fastcat          do not let programs in a local tab use `lxcat` to print big files at memory speed\n"
                     "  --theme NAME          Xylonic Dark, Xylonic Light, Graphite, Nord, Gruvbox or Solarized Dark\n"
-                    "  -e COMMAND ...        run COMMAND in a new tab (works as x-terminal-emulator)\n");
+                    "  -e COMMAND ...        run COMMAND in a new tab (works as x-terminal-emulator)\n\n" APP_CREDIT);
             return 0;
         }
         if (g_str_equal(argv[i], "--local")) s.local = true;

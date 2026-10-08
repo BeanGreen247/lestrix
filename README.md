@@ -10,7 +10,7 @@ A fast, light SSH terminal manager in plain C. No GTK, no Qt: the window, the wi
   <img src="native/docs/welcome.png" alt="Lestrix start page with saved connections" width="900"/>
 </p>
 
-**Version:** 0.2.2  
+**Version:** 0.3.0  
 **Author:** BeanGreen247  
 **License:** MIT
 
@@ -32,19 +32,18 @@ You need a system with OpenGL 3.3, OpenGL ES 3.0 or ES 2.0 (any GPU from the las
 ```bash
 git clone https://github.com/BeanGreen247/lestrix.git
 cd lestrix
-./install.sh             # a full-screen installer (dialog or whiptail): pick the options, then confirm
+./install.sh             # numbered steps, one sudo prompt, missing packages installed automatically
 ```
 
-The installer is a `dialog` program from start to finish (if `dialog` is missing it offers to install it; `whiptail` and plain questions are fallbacks): the choices, the sudo password, and the build and test output all appear inside dialog boxes. It asks what you want (install, update or remove) and a few options: install the missing system packages, make Lestrix the default terminal, install only for your user instead of system-wide, and run the test suite. Nothing changes until you confirm on the last screen. Without `dialog` or `whiptail`, or with `--plain`, it asks plain questions in the terminal. To skip the questions:
+The installer works like the Fleetwm one: no dialogs and no questions. It prints numbered steps with a plain explanation of each, asks for your sudo password once at the start, installs the missing build packages itself (apt, dnf, pacman or zypper), then builds and installs Lestrix with a live progress line and makes it the default terminal. Options:
 
-```bash
-./install.sh --yes --deps                # install the build packages, build, install with the default settings
-./install.sh --yes --prefix ~/.local --no-default-terminal   # only for your user, no sudo for the files
+```sh
+./install.sh --prefix ~/.local --no-default-terminal   # only for your user, no sudo for the files
 ./install.sh --uninstall                 # --purge also deletes your saved data
 ./install.sh --dry-run                   # show what would be run, change nothing
 ```
 
-Lestrix runs on Linux (X11 or Wayland, through SDL2); there is no Windows or macOS build yet, and on macOS the installer says so in a dialog and changes nothing. By default it installs system-wide into `/usr/local` (the files are copied with `sudo`, so every user of the machine gets Lestrix); `--prefix ~/.local` or the "only for my user" option installs into your home folder instead. The installer calls `native/install.sh`, which does the build and the install and can be used directly. It is safe to re-run: it rebuilds and replaces the installed copy. `--no-deps` never touches system packages.
+Lestrix runs on Linux (X11 or Wayland, through SDL2); there is no Windows or macOS build yet, and on macOS the installer says so and changes nothing. By default it installs system-wide into `/usr/local` (the files are copied with `sudo`, so every user of the machine gets Lestrix); `--prefix ~/.local` installs into your home folder instead. The installer calls `native/install.sh`, which does the build and the install and can be used directly. It is safe to re-run: it rebuilds and replaces the installed copy. `--no-deps` never touches system packages.
 
 By default it also sets Lestrix as the default terminal, with settings that need no privileges where possible: the first entry in `~/.config/xdg-terminals.list` (the xdg-terminal-exec convention), GNOME's default-terminal setting, Xfce's preferred terminal, and KDE's `TerminalApplication`; on Debian and Ubuntu it also registers the `x-terminal-emulator` alternative, which needs `sudo`. It prints each thing it changed, and uninstalling gives them back (only entries that point at Lestrix are touched). It also installs `lxcat`, the fast `cat` described below.
 
@@ -345,6 +344,7 @@ Run `make test` in `native/` for the core, compressor and parser tests under ASa
 
 | Action | How |
 |---|---|
+| Session ended (`exit`, logout, dropped ssh) | A prompt offers Restart session, Duplicate in a new tab, Close tab or Keep the tab open; `Esc` keeps it, `Enter` in the tab still restarts |
 | New connection | `Ctrl+N` or the `+` button |
 | Open a connection | Double-click it, click it on the start page, or press `1`-`9` there |
 | Local shell | `Ctrl+Shift+T`, or File > New local shell as... to pick bash, zsh, fish |

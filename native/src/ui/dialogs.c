@@ -128,6 +128,30 @@ void dlg_confirm(App *a, const char *title, const char *msg, const char *ok, Con
     dlg_push(a, &c->d);
 }
 
+typedef struct { Dialog d; char title[160], msg[512], lab[5][40]; int n; ChoiceCb cb; void *user; } ChoiceDlg;
+
+static void choice_draw(App *a, Dialog *d) {
+    ChoiceDlg *c = (ChoiceDlg *)d;
+    ui_set_blocked(a->ui, ui_menu_is_open(a->ui));
+    Rect r = dlg_frame(a, c->title, 440, 130 + 40 * (float)c->n);
+    wrap_text(a, R(r.x, r.y, r.w, P(60)), c->msg, ui_colors(a->ui)->ink2);
+    float y = r.y + P(66);
+    for (int i = 0; i < c->n; i++, y += P(40))
+        if (ui_button(a->ui, R(r.x, y, r.w, P(32)), c->lab[i], i == 0 ? UB_PRIMARY : 0)) { d->done = true; c->cb(a, i, c->user); return; }
+    if (esc(a)) d->done = true;
+}
+
+void dlg_choice(App *a, const char *title, const char *msg, const char *const *labels, int n, ChoiceCb cb, void *user) {
+    ChoiceDlg *c = calloc(1, sizeof *c);
+    snprintf(c->title, sizeof c->title, "%s", title);
+    snprintf(c->msg, sizeof c->msg, "%s", msg);
+    c->n = n > 5 ? 5 : n;
+    for (int i = 0; i < c->n; i++) snprintf(c->lab[i], sizeof c->lab[i], "%s", labels[i]);
+    c->cb = cb; c->user = user;
+    c->d.draw = choice_draw;
+    dlg_push(a, &c->d);
+}
+
 typedef struct { Dialog d; char title[160], msg[512]; } MsgDlg;
 
 static void msg_draw(App *a, Dialog *d) {
