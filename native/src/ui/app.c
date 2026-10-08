@@ -1118,7 +1118,7 @@ static void draw_hud(App *a) {
         "Scrollback of the current tab: lines kept, memory they use (compressed), and how much was moved to the disk spill file.",
         "Last finished command: run time, then its output throughput in GB per second (output bytes / run time). Not measured for full-screen programs."};
     static const char *const widest[11] = {
-        "fps 999", "no terminal", "parse 99.999 GB/s", "cpu 800%", "irq 9999.9M/s", "memory 9999.9 MB", "99 thr/99c", "reads 9999.9k/s @9999K",
+        "fps 999", "no terminal", "parse 99.999 GB/s", "cpu 800% (99)", "irq 9999.9M/s", "memory 9999.9 MB", "99 thr/99c", "reads 9999.9k/s @9999K",
         "cache rows 100% glyphs 100% recyc 9999", "scrlbck 9999999 ln, 9999.9 MB mem, 9999.9 MB disk", "cmd 99.99 s, 99.999 GB/s"};
     static const int priority[11] = {0, 3, 2, 10, 5, 1, 8, 7, 6, 4, 9};
     float x0 = P(12), ty = lay.hud.y + (lay.hud.h - ui_line_h(u)) / 2, sepw = ui_text_mono_w(u, " \xc2\xb7 "), slot_w[11];
@@ -1197,7 +1197,7 @@ static void hud_tick(App *a) {
     snprintf(a->hud_seg[1], sizeof a->hud_seg[1], "%s", dims);
     snprintf(a->hud_seg[2], sizeof a->hud_seg[2], "parse %.3f GB/s", rate / 1024);
     snprintf(a->hud_parse_tip, sizeof a->hud_parse_tip, "Parse rate: program output the terminal engine consumed over the last second. Right now: %.0f MB/s.", rate);
-    snprintf(a->hud_seg[3], sizeof a->hud_seg[3], "cpu %.0f%%", cpu);
+    snprintf(a->hud_seg[3], sizeof a->hud_seg[3], "cpu %.0f%% (%ld)", cpu, sysconf(_SC_NPROCESSORS_ONLN));
     snprintf(a->hud_seg[4], sizeof a->hud_seg[4], "irq %s%s", irq_txt, a->hud_irq_total ? "" : "/s");
     snprintf(a->hud_seg[5], sizeof a->hud_seg[5], "memory %s", rss);
     snprintf(a->hud_seg[6], sizeof a->hud_seg[6], "%d thr/%uc", proc_threads(), (unsigned)sysconf(_SC_NPROCESSORS_ONLN));
