@@ -6,6 +6,10 @@
 #include "fleetwm.h"
 
 #include <glib.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/inotify.h>
+#include <unistd.h>
 #include <glib/gstdio.h>
 #include <stdio.h>
 #include <string.h>
@@ -108,3 +112,52 @@ const char *fleetwm_theme_name(const char *key) {
     if (!strcmp(key, "light")) return "fleetwm Light";
     return NULL;
 }
+
+/*
+ * Theme changes arrive through inotify on the Fleetwm config directories instead of a one second stat() poll: the poll woke
+ * an idle terminal every second and made four stat() calls each time. The thread only flags the change and wakes the UI;
+ * the UI still compares the file stamps, so a spurious event costs one stat pass.
+ */
+extern void app_wake(void);
+static atomic_int fleet_dirty;
+static int fleet_fd = -1;
+static char *fleet_dirs[7];
+
+static void fleet_add_watches(void) {
+    for (int i = 0; fleet_dirs[i]; i++)
+        inotify_add_watch(fleet_fd, fleet_dirs[i], IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE);
+}
+
+static void *fleet_watch_main(void *arg) {
+    (void)arg;
+    char buf[4096];
+    while (read(fleet_fd, buf, sizeof buf) > 0) {
+        fleet_add_watches();  /* a directory may have been created by the event; adding an existing watch is a no-op */
+        atomic_store(&fleet_dirty, 1);
+        app_wake();
+    }
+    return NULL;
+}
+
+bool fleetwm_watch_start(void) {
+    if (fleet_fd >= 0) return true;
+    int fd = inotify_init1(IN_CLOEXEC);
+    if (fd < 0) return false;
+    const char *cfg = g_get_user_config_dir();
+    fleet_dirs[0] = g_build_filename(cfg, "fleetwm", NULL);
+    fleet_dirs[1] = g_build_filename(cfg, "fleetwm", "themes", NULL);
+    fleet_dirs[2] = g_strdup("/etc/xdg/fleetwm");
+    fleet_dirs[3] = g_strdup("/etc/xdg/fleetwm/themes");
+    fleet_dirs[4] = g_strdup("/usr/local/etc/xdg/fleetwm");
+    fleet_dirs[5] = g_strdup("/usr/local/etc/xdg/fleetwm/themes");
+    fleet_fd = fd;
+    fleet_add_watches();
+    /* the user's fleetwm directory may not exist yet: watch the config directory for its creation */
+    inotify_add_watch(fd, cfg, IN_CREATE | IN_MOVED_TO);
+    pthread_t th;
+    if (pthread_create(&th, NULL, fleet_watch_main, NULL) != 0) { close(fd); fleet_fd = -1; return false; }
+    pthread_detach(th);
+    return true;
+}
+
+bool fleetwm_watch_take(void) { return atomic_exchange(&fleet_dirty, 0) != 0; }

@@ -18,5 +18,7 @@ typedef struct {
 
 void fleetwm_read(FleetCfg *out);
 double fleetwm_stamp(void);
+bool fleetwm_watch_start(void);  /* inotify thread; false: keep polling */
+bool fleetwm_watch_take(void);   /* true once after the config directories changed */
 const char *fleetwm_theme_name(const char *key);
 #endif

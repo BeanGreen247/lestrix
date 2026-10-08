@@ -1723,7 +1723,7 @@ int main(int argc, char **argv) {
             if (a->follow_fleet && a->next_fleet < due) due = a->next_fleet;
             if (focused && a->last_blink + 0.53 < due) due = a->last_blink + 0.53;
             double left = due - a->now;
-            wait = left < 0.001 ? 1 : left > 1.0 ? 1000 : (int)(left * 1000.0) + 1;
+            wait = left < 0.001 ? 1 : left > 5.0 ? 5000 : (int)(left * 1000.0) + 1;  /* idle: sleep to the next timer, not a fixed 1 s */
         }
         {
             Tab *wt = app_cur_tab(a);
@@ -1767,7 +1767,11 @@ int main(int argc, char **argv) {
             }
             break;
         }
-        if (a->now >= a->next_fleet) { a->next_fleet = a->now + 1.0; if (a->follow_fleet && fleetwm_stamp() != a->fleet.stamp) app_follow_fleetwm(a); }
+        if (a->follow_fleet && !a->fleet_watch) a->fleet_watch = fleetwm_watch_start();
+        if (fleetwm_watch_take() || a->now >= a->next_fleet) {
+            a->next_fleet = a->now + (a->fleet_watch ? 30.0 : 1.0);  /* with the watch the timer only catches a missed event */
+            if (a->follow_fleet && fleetwm_stamp() != a->fleet.stamp) app_follow_fleetwm(a);
+        }
         if (a->now >= a->next_hud) { a->next_hud = a->now + (focused ? 1 : 5); if (a->hud) hud_tick(a); }
         if (a->now >= a->next_trim) { a->next_trim = a->now + 5; trim_tick(a); }
         if (a->now >= a->next_probe) { a->next_probe = a->now + 30; if (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS) probe_all(a); }

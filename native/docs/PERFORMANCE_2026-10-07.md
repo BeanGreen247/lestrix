@@ -187,3 +187,14 @@ Even with fast output, a line-at-a-time writer reaches only about 14 MB/s (paste
 **Stream consumer lead (no fix).** Timing build (not kept): per 256 MB, `stream_file` total 0.48 s for pipe chunks against 0.30 s for one file; the extra 0.1 s is in `feed_sliced` (0.39 vs 0.26 s) plus 0.04 s of per-request unlink and free. Reusing the 1 MB read buffer across requests (instead of `malloc`/`free` each time) measured 0.604 vs 0.582 s and 0.591 vs 0.601 s, inside noise: reverted. `--parse-threads 1` did not close the gap (feed 0.41 s vs 0.29 s), so it is not worker contention alone. Left open.
 
 **Gap 10, render side (not measured).** Software GL under Xvfb cannot say anything about GPU drawing cost, and the dirty-row cache is already in place (rows 2-8 of the progression). Carried to the Fleetwm test list instead, where a GPU session exists.
+
+## Idle wake-ups and `--lite` (2026-10-08, measured under nested Fleetwm on a KVM VM, 2 vCPU i5-8500, headless/pixman, no governor)
+
+Question: should `--lite` use fewer resources than the normal window at the same throughput? Flood (`seq 1 4000000`, about 30 MB, 8 interleaved runs each): normal and lite are the same within noise (Lestrix CPU median about 326 vs 310 ms, wall 6.3-7.2 s both), because the parse and render engine does the work in both modes. The difference is at idle, and the causes were shared by both modes:
+- The idle loop never slept longer than 1 s (`wait = ... left > 1.0 ? 1000`), and every second it stat()ed four Fleetwm theme files to follow the theme. strace of an idle `--lite` window: three `poll` calls and four `stat` calls per second with nothing to do.
+- Fix 1: Fleetwm theme changes arrive through an inotify thread on the Fleetwm config directories (`fleetwm_watch_start`), which calls `app_wake()`; the timer check stays as a 30 s safety net (1 s if inotify is unavailable). A change shows up within 1 ms of the file write (strace).
+- Fix 2: the idle sleep goes to the next timer, capped at 5 s instead of 1 s.
+- Idle, 4 interleaved runs of 30 s each: `--lite` 1.43 -> 0.43 wake-ups/s, 4 -> 1-2 ms CPU per 30 s; normal 2.0 -> about 1.2 wake-ups/s, 9-10 -> 8-9 ms. The remaining normal-window cost is the stats bar redraw at every stats tick (software GL in the VM; not measured on a GPU).
+- Flood after the change (6 interleaved runs per variant): normal 6.40-6.82 s (before 6.22-6.77), lite 6.28-6.63 s (before 6.91-7.18): no regression; compositor CPU the same or lower.
+- Checks: `make test` and `xvfb-run -a make test-gui` pass.
+- Not done: the stats text is still rebuilt every tick (five `/proc` reads); the tick could back off when nothing changed.

@@ -70,6 +70,7 @@ struct App {
     bool follow_fleet, rounded;
     FleetCfg fleet;
     double next_fleet;
+    bool fleet_watch;
     size_t sb_ram_mb, sb_disk_mb;
     int panel_w;
     GPtrArray *tabs;
