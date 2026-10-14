@@ -1004,6 +1004,12 @@ static void draw_strip(App *a) {
         else if (hov && ui_mouse_pressed(u, 3, r)) { select_tab(a, (int)i); open_tab_menu(a, t, ui_mx(u), ui_my(u)); }
     }
     ui_unclip(u);
+    {   /* the free space right of the last tab: a double click there opens a new local tab, a single click does nothing */
+        float fx = view.x - a->strip_scroll + total;
+        if (fx < view.x) fx = view.x;
+        Rect free_r = R(fx, s.y, view.x + view.w - fx, s.h);
+        if (free_r.w > 0 && ui_mouse_pressed(u, 1, free_r) && ui_clicks(u) >= 2) do_new_local(a, "");
+    }
     if (a->drag_tab >= 0) {
         if (ui_mouse_down(u, 1) && a->drag_tab < (int)a->tabs.size()) {
             float mx = ui_mx(u);
@@ -1032,11 +1038,12 @@ static void draw_welcome(App *a, Rect r) {
     ui_text(u, x, y, "RECENT", c->muted);
     y += P(26);
     int nrecent = (int)recents.size();
+    bool on_row = false;
     for (int i = 0; i <= nrecent; i++) {
         bool local = i == nrecent;
         Rect row = R(x, y, w, P(38));
         bool hov = ui_hover(u, row);
-        if (hov) ui_rect(u, row, c->hover);
+        if (hov) { ui_rect(u, row, c->hover); on_row = true; }
         ui_rect(u, R(row.x, row.y + row.h - 1, row.w, 1), c->border);
         char key[16];
         snprintf(key, sizeof key, "%d", local ? 0 : i + 1);
@@ -1054,6 +1061,7 @@ static void draw_welcome(App *a, Rect r) {
         y += P(38);
     }
     if (recents.empty()) ui_text(u, x, y + P(14), "Double-click a host on the left, or press + to add one.", c->muted);
+    if (!on_row && ui_mouse_pressed(u, 1, r) && ui_clicks(u) >= 2) do_new_local(a, "");   /* a double click on the empty page opens a local tab; there is no strip to click yet */
 }
 
 static void draw_content(App *a) {
@@ -1482,12 +1490,12 @@ static void script_key(const std::string &spec) {
     SDL_PushEvent(&e);
 }
 
-static void script_mouse(int type, int button, int x, int y) {
+static void script_mouse(int type, int button, int x, int y, int clicks = 1) {
     SDL_Event e;
     SDL_zero(e);
     e.type = type;
     if (type == SDL_MOUSEMOTION) { e.motion.x = x; e.motion.y = y; }
-    else { e.button.x = x; e.button.y = y; e.button.button = (Uint8)button; e.button.clicks = 1; e.button.state = type == SDL_MOUSEBUTTONDOWN ? SDL_PRESSED : SDL_RELEASED; }
+    else { e.button.x = x; e.button.y = y; e.button.button = (Uint8)button; e.button.clicks = (Uint8)clicks; e.button.state = type == SDL_MOUSEBUTTONDOWN ? SDL_PRESSED : SDL_RELEASED; }
     SDL_PushEvent(&e);
 }
 
@@ -1498,10 +1506,17 @@ static bool script_run(App *a, Script &sc, std::string &shot_out) {
     double w;
     if (sscanf(st.c_str(), "w:%lf", &w) == 1) sc.wait_until = a->now + w;
     else if (sscanf(st.c_str(), "m:%d,%d", &x, &y) == 2) script_mouse(SDL_MOUSEMOTION, 0, x, y);
-    else if (sscanf(st.c_str(), "c:%d,%d", &x, &y) == 2 || sscanf(st.c_str(), "d:%d,%d", &x, &y) == 2) {
+    else if (sscanf(st.c_str(), "c:%d,%d", &x, &y) == 2) {
         script_mouse(SDL_MOUSEMOTION, 0, x, y);
         script_mouse(SDL_MOUSEBUTTONDOWN, 1, x, y);
         script_mouse(SDL_MOUSEBUTTONUP, 1, x, y);
+        sc.wait_until = a->now + 0.12;
+    } else if (sscanf(st.c_str(), "d:%d,%d", &x, &y) == 2) {   /* a double click: the second press carries clicks = 2 */
+        script_mouse(SDL_MOUSEMOTION, 0, x, y);
+        script_mouse(SDL_MOUSEBUTTONDOWN, 1, x, y, 1);
+        script_mouse(SDL_MOUSEBUTTONUP, 1, x, y, 1);
+        script_mouse(SDL_MOUSEBUTTONDOWN, 1, x, y, 2);
+        script_mouse(SDL_MOUSEBUTTONUP, 1, x, y, 2);
         sc.wait_until = a->now + 0.12;
     } else if (sscanf(st.c_str(), "r:%d,%d", &x, &y) == 2) {
         script_mouse(SDL_MOUSEMOTION, 0, x, y);

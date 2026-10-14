@@ -133,6 +133,10 @@ A terminal sits between you and everything you run. When it is slow, `tail -f` o
 - The bar along the bottom of the window shows them live (every figure is explained under [What the overlay shows](#what-the-overlay-shows), and hovering one in the app shows the same text). It is on by default; View > Show performance overlay turns it off.
 - `make test` includes a speed gate that fails if parsing gets more than about ten times slower, so a slowdown cannot slip in unnoticed.
 
+### Tabs like VS Code
+
+With no session open Lestrix shows the start page and no tab strip. A double click on the empty page opens a local shell tab. With tabs open, a double click on the free space right of the last tab opens another one; a single click there does nothing. Closing the last tab brings the start page back with no strip. The menu, the shortcuts and the session list open tabs as before. This applies to full and lite mode (basic has no tabs).
+
 ### Scrollback: adjustable, up to unlimited
 
 View > Scrollback offers Off, 1,000, 10,000 (default), 100,000, 1,000,000 or Unlimited, and applies to open tabs at once. Settings under `[ui]` in `~/.config/lestrix/settings.ini` go further: `scrollback` (a line count, `-1` for unlimited), `scrollback_ram_mb` (default 32) and `scrollback_disk_mb` (default 4096).

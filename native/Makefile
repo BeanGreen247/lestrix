@@ -108,11 +108,11 @@ perf-gate: $(BUILD)/perf_gate
 
 test-gui: $(BUILD)/lestrix
 	@set -e; d=$$(mktemp -d); mkdir -p $$d/lestrix; \
-	 for s in "w:0.5;s:$$d/a.ppm" "w:0.5;c:28,15;w:0.3;s:$$d/b.ppm" "w:0.5;c:303,56;w:0.4;t:name;k:escape;w:0.2;s:$$d/c.ppm"; do \
+	 for s in "w:0.5;s:$$d/a.ppm" "w:0.5;c:28,15;w:0.3;s:$$d/b.ppm" "w:0.5;c:303,56;w:0.4;t:name;k:escape;w:0.2;s:$$d/c.ppm" "w:0.5;d:800,600;w:0.6;c:900,46;w:0.3;d:900,46;w:0.6;s:$$d/e.ppm"; do \
 	   XDG_CONFIG_HOME=$$d timeout 30 $(BUILD)/lestrix --script "$$s" || { echo "test-gui: failed on $$s"; exit 1; }; \
 	 done; \
 	 XDG_CONFIG_HOME=$$d timeout 30 $(BUILD)/lestrix --basic --script "w:0.5;t:echo basic;k:return;w:0.3;s:$$d/d.ppm" || { echo "test-gui: --basic failed"; exit 1; }; \
-	 for f in a b c d; do test -s $$d/$$f.ppm || { echo "test-gui: no frame $$f"; exit 1; }; done; \
+	 for f in a b c d e; do test -s $$d/$$f.ppm || { echo "test-gui: no frame $$f"; exit 1; }; done; \
 	 rm -rf $$d; echo "test-gui: ok"
 
 $(BUILD)/test_fast_paths: tests/test_fast_paths.cpp src/vt.cpp src/lz.cpp src/vt.h | $(BUILD)
