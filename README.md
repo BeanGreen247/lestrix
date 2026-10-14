@@ -102,6 +102,29 @@ Tuning on the C++ base. First step (colour output was the slowest engine test, s
 | Colour-heavy engine speed (`make bench`, 16 MB, 5 interleaved runs, median) | 270 MB/s | 372 MB/s | faster, but this machine has two cores and the runs vary from 212 to 375 MB/s, so treat the size as indicative; the instruction counts above are the exact figure |
 | Plain log, no scrollback / 10,000 lines (`perf_gate`) | 1478 / 928 MB/s | 1532 / 897 MB/s | unchanged to about 3% lower on this machine (no escape sequences in that test; run-to-run spread is about 3% too, probably code layout) |
 
+### Resource use of the three modes (0.4.0)
+
+Measured in the test VM with Mesa's software OpenGL (llvmpipe), so the absolute drawing costs are higher than on a GPU; the idle and thread numbers do not depend on that. "Idle" is 10 seconds after the window has been left alone for 13 seconds. Before = the first 0.4.0 build, after = this build.
+
+| Measure | Full before | Full after | Lite before | Lite after | Basic before | Basic after |
+|---|---|---|---|---|---|---|
+| Idle CPU, share of one core | 2.50% | 0.30% | 1.50% | 0.00% | 1.40% | 0.00% |
+| Idle wake-ups per second (context switches) | 40 | 5 | 27 | 0 | 25 | 0 |
+| Threads at idle | 14 | 12 | 14 | 8 | 14 | 8 |
+| Start to first frame (best of 7 after, single run before) | 169 ms | 130 ms | 155 ms | 140 ms | 140 ms | 111 ms |
+| 128 MB flood through the pty (`--no-fastcat`), user + sys CPU | about 1.9 s | 1.64 s | about 1.9 s | 1.51 s | about 1.9 s | 1.59 s |
+| Frames drawn during that flood | about 100 | 51 - 61 | about 100 | 41 - 49 | about 100 | 48 - 49 |
+
+What changed, each step in every mode unless noted:
+
+- **The cursor blinks for 10 seconds after the last key, mouse event or output, then stays solid.** A window nobody touches now sleeps completely (0 wake-ups) instead of redrawing twice a second.
+- **Job threads start when there is work.** The six helper threads for the host checks and file transfers used to start at launch in every mode; Lite and Basic never run a job now, so they have none.
+- **Lite and Basic skip work they cannot show:** the saved-connection list and `~/.ssh/config` parse, the host reachability checks every 30 seconds, and (Basic) the list of installed shells. The 34-pixel start page font is opened when the start page is first drawn, in every mode.
+- **An idle performance bar refreshes every 3 seconds** instead of every second (Full only; the bar does not exist in Lite and Basic).
+- **While output pours in, a frame may cost at most a third of the time.** The program measures what a frame costs to draw and present and lowers the frame rate while a flood lasts if that is too much: on software GL it halves the frames drawn and cuts the flood's CPU by about 20%; on a fast GPU the cap never applies. Typing and ordinary use are not affected. The average frame cost is shown in the cache statistics.
+
+Memory is unchanged at about 137 MB in all three modes in this VM: 56 MB of it is Mesa's LLVM software renderer and 10 MB is fontconfig; Lestrix's own heap is about 2 MB at start. On a real GPU the first figure is not there, but I have not measured that.
+
 ### Speed is a feature
 
 A terminal sits between you and everything you run. When it is slow, `tail -f` on a busy log lags, a build scrolls in jerks, and pasting a large file freezes the window. When it is wasteful, it takes memory and battery from the editor, the compiler and the browser next to it. So speed is treated as a requirement, not a nice extra:

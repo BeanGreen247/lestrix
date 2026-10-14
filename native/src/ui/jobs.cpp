@@ -27,6 +27,7 @@ std::deque<Job> &queued = *new std::deque<Job>;
 std::deque<Job> &finished = *new std::deque<Job>;
 std::vector<std::thread> &workers = *new std::vector<std::thread>;
 bool quitting;
+int busy;  /* workers running a job; guarded by mu */
 std::atomic<int> pending;
 void (*wake_fn)();
 
@@ -39,10 +40,12 @@ void worker() {
             if (queued.empty()) return;
             j = std::move(queued.front());
             queued.pop_front();
+            busy++;
         }
         if (j.work) j.work();
         {
             std::lock_guard<std::mutex> lk(mu);
+            busy--;
             finished.push_back(std::move(j));
         }
         if (wake_fn) wake_fn();
@@ -51,12 +54,8 @@ void worker() {
 
 }
 
-void jobs_init(void (*wake)()) {
-    wake_fn = wake;
-    for (int i = 0; i < NWORKERS; i++) {
-        try { workers.emplace_back(worker); } catch (...) { break; }
-    }
-}
+/* Threads are started when work arrives (up to NWORKERS), so a window that never runs a job has none. */
+void jobs_init(void (*wake)()) { wake_fn = wake; }
 
 void jobs_shutdown() {
     {
@@ -73,6 +72,9 @@ void jobs_run(std::function<void()> work, std::function<void()> done) {
     {
         std::lock_guard<std::mutex> lk(mu);
         queued.push_back({std::move(work), std::move(done)});
+        if (workers.size() < (size_t)NWORKERS && queued.size() > workers.size() - (size_t)busy) {
+            try { workers.emplace_back(worker); } catch (...) {}
+        }
     }
     cv.notify_one();
 }

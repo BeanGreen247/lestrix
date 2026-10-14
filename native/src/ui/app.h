@@ -121,6 +121,7 @@ struct App {
     bool running = false, dirty = false, blocked_for_term = false;
     bool blink_on = true;
     double last_blink = 0;
+    double last_active = 0;  /* last key, mouse event or terminal output */
 };
 
 extern App *g_app;

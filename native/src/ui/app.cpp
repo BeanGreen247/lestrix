@@ -55,7 +55,7 @@ static void tmark(const char *what) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
     if (on < 0) { on = getenv("LESTRIX_TIMING") != NULL; t0 = now; }
-    if (on) fprintf(stderr, "%7.1f ms  %s\n", (now - t0) * 1000.0, what);
+    if (on) fprintf(stderr, "%7.1f ms  %6.1f MB heap  %s\n", (now - t0) * 1000.0, (double)mallinfo2().uordblks / 1048576.0, what);
 }
 
 static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9; }
@@ -123,6 +123,7 @@ static void fmt_count(double v, char *out, size_t cap) {
 static std::string fmt_mb(double bytes) { return bytes >= 1048576 ? lx::strprintf("%.1f MB", bytes / 1048576) : lx::strprintf("%.0f KB", bytes / 1024); }
 
 static bool g_lite, g_basic;
+static double g_frame_cost;  /* running average of what one frame costs to draw and present, seconds */
 
 /* "ctrl+shift+i" -> modifiers and key. Modifiers are super (logo, win, meta), alt, ctrl (control) and shift; the combo must match
  * exactly when pressed, like fleetwm's keybinds.toml. Returns false for an empty, "off" or unusable text (the shortcut is then disabled). */
@@ -540,6 +541,7 @@ static std::string cache_stats_text(App *a) {
                        (unsigned long long)sd_cache.glyph_miss, pct(sd_cache.glyph_hit, sd_cache.glyph_miss), (unsigned long long)sd_cache.glyph_recycle);
     o += lx::strprintf("Row cache: %llu hits, %llu misses (%.1f%% hit), %llu rebuilt in place\n", (unsigned long long)sd_cache.row_hit,
                        (unsigned long long)sd_cache.row_miss, pct(sd_cache.row_hit, sd_cache.row_miss), (unsigned long long)sd_cache.row_recycle);
+    o += lx::strprintf("Frames: %llu drawn, average cost %.2f ms (%s)\n", (unsigned long long)a->frames, g_frame_cost * 1000.0, a->gl_desc);
     Tab *t = app_cur_tab(a);
     if (t && t->term) {
         VtHistoryStats st;
@@ -1022,6 +1024,7 @@ static void draw_welcome(App *a, Rect r) {
     const UiColors *c = &a->colors;
     ui_rect(u, r, a->pal.bg);
     float w = fminf(P(620), r.w - P(60)), x = r.x + (r.w - w) / 2, y = r.y + fmaxf(P(40), (r.h - P(120) - ((float)recents.size() + 1) * P(40)) / 3);
+    if (!a->big_font) a->big_font = font_open("sans", 34 * a->scale, false);  /* only the start page uses it */
     ui_text_font(u, a->big_font, FS_BOLD, x, y, "Lestrix", c->ink);
     y += font_cell_h(a->big_font) + P(2);
     ui_text(u, x, y, meta_text, c->muted);
@@ -1078,7 +1081,11 @@ static int g_parse_threads = -1, g_compress_threads = -1, g_render_threads = -1;
 static double frame_gap(bool flooding) {
     double f = g_max_fps, io = g_io_fps;
     if (flooding && io > 0 && (f <= 0 || io < f)) f = io;
-    return f > 0 ? 1.0 / f : 0.0;
+    double gap = f > 0 ? 1.0 / f : 0.0;
+    /* while output pours in, frames are never allowed to take more than about a third of the time: a slow renderer (software GL in
+     * a VM, a weak GPU) then draws fewer frames, and a fast one is not affected */
+    if (flooding && g_frame_cost * 3.0 > gap) gap = g_frame_cost * 3.0;
+    return gap;
 }
 static void hud_tick(App *a);
 
@@ -1312,6 +1319,7 @@ static void cell_at(App *a, double x, double y, int *col, int *row) {
 
 static void handle_event(App *a, SDL_Event *e) {
     ui_event(a->ui, e);
+    if (e->type != EV_WAKE && e->type != SDL_WINDOWEVENT) a->last_active = a->now;
     Tab *t = app_cur_tab(a);
     TermCore *term = t ? t->term : NULL;
     bool kbd_ui = dlg_active(a) || ui_keyboard_taken(a->ui);
@@ -1542,7 +1550,7 @@ static void pump_all(App *a) {
     if (jobs_pump()) app_redraw(a);
     for (size_t i = 0; i < a->tabs.size(); i++) {
         Tab *t = a->tabs[i].get();
-        if (t->term && tcore_pump(t->term)) app_redraw(a);
+        if (t->term && tcore_pump(t->term)) { app_redraw(a); a->last_active = a->now; }
         if (t->files) t->files->tick(a);
     }
 }
@@ -1657,10 +1665,9 @@ int main(int argc, char **argv) {
     if (s.theme) a->theme = ui_theme_find(s.theme);
     if (a->font_family.empty()) a->font_family = pick_font_family();
     a->ui_font = font_open("sans", 13 * a->scale, false);
-    a->big_font = font_open("sans", 34 * a->scale, false);
     a->term_font = font_open(a->font_family.c_str(), a->font_size * 96.0 / 72.0 * a->scale, true);
     if (!a->term_font) a->term_font = font_open("monospace", a->font_size * 96.0 / 72.0 * a->scale, true);
-    if (!a->ui_font || !a->term_font || !a->big_font) { fprintf(stderr, "no usable fonts found\n"); return 1; }
+    if (!a->ui_font || !a->term_font) { fprintf(stderr, "no usable fonts found\n"); return 1; }
     tmark("fonts opened");
     a->ui_mono = font_open("monospace", 12 * a->scale, true);
     tmark("atlas and renderer ready");
@@ -1679,12 +1686,9 @@ int main(int argc, char **argv) {
     tmark("store loaded");
     tcore_set_history_defaults(a->scrollback, a->sb_ram_mb, a->sb_disk_mb, a->sb_spill);
     jobs_init(app_wake);
-    find_shells();
+    if (!a->basic) find_shells();
     tmark("shells found");
-    app_refresh(a);
-    tmark("connections refreshed");
-    probe_all(a);
-    tmark("probes started");
+    if (!a->lite) { app_refresh(a); tmark("connections refreshed"); probe_all(a); tmark("probes started"); }  /* lite and basic have no session list to fill */
     SDL_StartTextInput();
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
 
@@ -1713,11 +1717,16 @@ int main(int argc, char **argv) {
         a->now = now_s();
         int wait = 250;
         bool focused = (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS) != 0;
+        /* the cursor blinks for 10 s after the last key, mouse event or output, then stays solid: an untouched window sleeps for good */
+        const double BLINK_FOR = 10.0;
+        bool blinking_over = a->now - a->last_active >= BLINK_FOR;
+        bool blinking = focused && !blinking_over;
         {
-            double due = a->next_trim < a->next_probe ? a->next_trim : a->next_probe;
+            double due = !a->lite && a->next_probe < a->next_trim ? a->next_probe : a->next_trim;
             if (a->hud && a->next_hud < due) due = a->next_hud;
             if (a->follow_fleet && a->next_fleet < due) due = a->next_fleet;
-            if (focused && a->last_blink + 0.53 < due) due = a->last_blink + 0.53;
+            if (blinking && a->last_blink + 0.53 < due) due = a->last_blink + 0.53;
+            if (focused && !blinking_over && a->last_active + BLINK_FOR < due) due = a->last_active + BLINK_FOR;
             double left = due - a->now;
             wait = left < 0.001 ? 1 : left > 5.0 ? 5000 : (int)(left * 1000.0) + 1;  /* idle: sleep to the next timer, not a fixed 1 s */
         }
@@ -1757,10 +1766,10 @@ int main(int argc, char **argv) {
             a->next_fleet = a->now + (a->fleet_watch ? 30.0 : 1.0);  /* with the watch the timer only catches a missed event */
             if (a->follow_fleet && fleetwm_stamp() != a->fleet.stamp) app_follow_fleetwm(a);
         }
-        if (a->now >= a->next_hud) { a->next_hud = a->now + (focused ? 1 : 5); if (a->hud) hud_tick(a); }
+        if (a->now >= a->next_hud) { a->next_hud = a->now + (!focused ? 5 : a->now - a->last_active > 3.0 ? 3 : 1); if (a->hud) hud_tick(a); }  /* an idle bar is refreshed every 3 s */
         if (a->now >= a->next_trim) { a->next_trim = a->now + 5; trim_tick(a); }
-        if (a->now >= a->next_probe) { a->next_probe = a->now + 30; if (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS) probe_all(a); }
-        if (!focused) { if (!a->blink_on) { a->blink_on = true; app_redraw(a); } a->last_blink = a->now; }
+        if (a->now >= a->next_probe) { a->next_probe = a->now + 30; if (!a->lite && (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS)) probe_all(a); }
+        if (!focused || a->now - a->last_active >= BLINK_FOR) { if (!a->blink_on) { a->blink_on = true; app_redraw(a); } a->last_blink = a->now; }
         else if (a->now - a->last_blink > 0.53) { a->last_blink = a->now; a->blink_on = !a->blink_on; if (app_cur_tab(a) && app_cur_tab(a)->term) app_redraw(a); }
         Tab *ct = app_cur_tab(a);
         uint64_t fed = ct && ct->term ? tcore_bytes_fed(ct->term) : 0;
@@ -1769,6 +1778,7 @@ int main(int argc, char **argv) {
             last_draw = a->now;
             last_draw_bytes = fed;
             a->dirty = false;
+            const double frame_t0 = now_s();
             r_begin(a->r, a->W, a->H, a->colors.bg0);
             build_frame(a);
             r_end(a->r);
@@ -1784,6 +1794,7 @@ int main(int argc, char **argv) {
                 a->running = false;
             }
             SDL_GL_SwapWindow(a->win);
+            { double cost = now_s() - frame_t0; g_frame_cost = g_frame_cost == 0 ? cost : g_frame_cost * 0.9 + cost * 0.1; }
         }
     }
     if (print_stats_at_exit) printf("%s\n", cache_stats_text(a).c_str());
