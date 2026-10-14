@@ -52,6 +52,7 @@ for p in "${PREFIXES[@]}"; do
   rm_path "$p/bin/lxcat"
   rm_path "$p/share/applications/lestrix.desktop"
   rm_path "$p/share/applications/lestrix-lite.desktop"
+  rm_path "$p/share/applications/lestrix-basic.desktop"
   for sz in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do rm_path "$p/share/icons/hicolor/$sz/apps/lestrix.png"; done
   rm_path "$p/share/icons/hicolor/scalable/apps/lestrix.svg"
   have update-desktop-database && [ -d "$p/share/applications" ] && update-desktop-database "$p/share/applications" 2>/dev/null

@@ -394,6 +394,14 @@ Run `make test` in `native/` for the core, compressor and parser tests under ASa
 
 Command line: `lestrix --local`, `lestrix -e htop`, `lestrix --working-directory ~/src --local`.
 
+Three window modes, each with its own menu entry and window class so a window manager can tell them apart:
+
+| Mode | Start with | What you get |
+|---|---|---|
+| Full | `lestrix` | menu bar, tabs, sidebar with sessions and the file browser, performance bar |
+| Lite | `lestrix --lite` | the terminal with the menu bar and tabs, no sidebar and no performance bar; fps, cpu and cache stats go in the title bar |
+| Basic | `lestrix --basic` | one bare terminal like a classic terminal window: no menu bar, no tabs, no copy/paste buttons, no sidebar, no stats. The program's own title (what the shell sets) is the window title, the window closes when the shell exits, `Ctrl+Shift+C` / `Ctrl+Shift+V` and the mouse still copy and paste, `Ctrl+=` / `Ctrl+-` still change the font size, and every other key goes to the program. Also installed as "Lestrix Basic" in the application menu |
+
 Connections are stored in `~/.config/lestrix/connections.json` (permissions `600`). No passwords are saved: ssh asks in the terminal, or uses your key and agent.
 
 ### How the file browser works

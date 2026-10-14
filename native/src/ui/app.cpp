@@ -122,7 +122,7 @@ static void fmt_count(double v, char *out, size_t cap) {
 
 static std::string fmt_mb(double bytes) { return bytes >= 1048576 ? lx::strprintf("%.1f MB", bytes / 1048576) : lx::strprintf("%.0f KB", bytes / 1024); }
 
-static bool g_lite;
+static bool g_lite, g_basic;
 
 static void settings_load(App *a) {
     a->settings_path = lx::path_join(sd_config_dir(), "settings.ini");
@@ -150,6 +150,7 @@ static void settings_load(App *a) {
     a->panel_w = s.get_int("ui", "panel_width", 300);
     if (a->panel_w < 200 || a->panel_w > 700) a->panel_w = 300;
     if (g_lite) { a->lite = true; a->hud = true; a->pinned = false; a->dock_shown = false; a->side_open = false; }
+    if (g_basic) { a->basic = true; a->hud = false; a->quit_on_exit = true; }
 }
 
 void app_settings_save(App *a) {
@@ -262,6 +263,10 @@ static void hook_exited(void *u, int) {
     if (t->app->quit_on_exit) t->app->running = false;
     else ended_prompt(t->app, t);
 }
+static void hook_title(void *u, const char *title) {
+    Tab *t = static_cast<Tab *>(u);
+    if (t->app->basic && app_cur_tab(t->app) == t) SDL_SetWindowTitle(t->app->win, title && *title ? title : "Lestrix");
+}
 static void hook_restarted(void *u) { Tab *t = static_cast<Tab *>(u); t->state = ST_IDLE; t->asked = false; }
 static void hook_cwd(void *u, const char *p) { Tab *t = static_cast<Tab *>(u); if (t->files) t->files->set_cwd(p); }
 static void hook_clip_set(void *, const char *text, bool primary) { if (primary) SDL_SetPrimarySelectionText(text); else SDL_SetClipboardText(text); }
@@ -323,7 +328,7 @@ void app_fastcat_apply(App *a) { tcore_set_native_cat(a->fast_cat && g_fastcat);
 static TermCore *make_term(App *a, Tab *t, const std::vector<std::string> &args, const char *cwd, bool fastcat) {
     TermHooks h{};
     h.wake = hook_wake; h.activity = hook_activity; h.bell = hook_bell; h.exited = hook_exited; h.restarted = hook_restarted;
-    h.cwd = hook_cwd; h.clip_set = hook_clip_set; h.clip_request = hook_clip_request;
+    h.cwd = hook_cwd; h.title = hook_title; h.clip_set = hook_clip_set; h.clip_request = hook_clip_request;
     int cols, rows;
     float cw = (float)a->W - (a->pinned && a->dock_shown ? P(a->panel_w) : 0) - P(34), ch = (float)a->H - P(130);
     tv_fit(a->term_font, cw, ch, &cols, &rows);
@@ -662,7 +667,7 @@ static bool term_dragging;
 static float side_t(App *a) { return a->side_anim; }
 
 static void compute_layout(App *a) {
-    float bar_h = P(30), rail_w = a->lite ? 0 : P(30);
+    float bar_h = a->basic ? 0 : P(30), rail_w = a->lite ? 0 : P(30);
     float hud_h = a->hud && !a->lite ? ui_line_h(a->ui) + P(10) : 0;
     float pw = P(a->panel_w);
     lay.bar = R(0, 0, (float)a->W, bar_h);
@@ -676,7 +681,7 @@ static void compute_layout(App *a) {
     float px = a->pinned ? rail_w : rail_w - (1.f - anim) * pw;
     lay.panel = R(px, top, pw, bottom - top);
     float cx = rail_w + docked;
-    float strip_h = a->tabs.size() ? P(36) : 0;
+    float strip_h = a->tabs.size() && !a->basic ? P(36) : 0;
     lay.strip = R(cx, top, a->W - cx, strip_h);
     lay.content = R(cx, top + strip_h, a->W - cx, bottom - top - strip_h);
 }
@@ -1162,9 +1167,9 @@ static void build_frame(App *a) {
     ui_set_blocked(u, base_blocked || block_under);
     a->blocked_for_term = base_blocked || block_under;
     draw_content(a);
-    draw_strip(a);
+    if (!a->basic) draw_strip(a);
     ui_set_blocked(u, base_blocked);
-    draw_menubar(a);
+    if (!a->basic) draw_menubar(a);
     if (!a->lite) { draw_rail(a); if (lay.panel_vis) draw_panel(a); draw_hud(a); }
     if (dlg) { ui_set_blocked(u, ui_menu_is_open(u)); dlg_draw_top(a); }
     ui_end(u);
@@ -1172,6 +1177,11 @@ static void build_frame(App *a) {
 
 static bool shortcut(App *a, SDL_Keycode k, Uint16 m) {
     bool ctrl = m & KMOD_CTRL, shift = m & KMOD_SHIFT, alt = m & KMOD_ALT;
+    if (a->basic) {  /* one bare terminal: only the font size keys are Lestrix's, everything else goes to the program */
+        if (ctrl && !shift && !alt && (k == SDLK_EQUALS || k == SDLK_PLUS || k == SDLK_KP_PLUS)) { run_action(a, A_BIGGER); return true; }
+        if (ctrl && !shift && !alt && (k == SDLK_MINUS || k == SDLK_KP_MINUS)) { run_action(a, A_SMALLER); return true; }
+        return false;
+    }
     int n = (int)a->tabs.size();
     if (ctrl && !shift && !alt) {
         if (k == SDLK_n) { run_action(a, A_NEW_CONN); return true; }
@@ -1484,6 +1494,7 @@ static const char *HELP_TEXT =
     "Usage: lestrix [--local] [--working-directory DIR] [-e COMMAND [ARGS...]]\n"
     "  --local               open a local shell on startup\n"
     "  --no-fast-output      keep the kernel's newline processing on the pty while cat, grep, ls, find and similar print (default: switch it off for them and let the terminal add the carriage returns; about 3x faster)\n"
+    "  --basic               one bare terminal like a classic terminal window: no menu bar, tabs, buttons, sidebar or stats; the program's title is the window title\n"
     "  --lite                terminal only: no sidebar, no stats bar; fps, cpu and cache stats go in the title bar\n"
     "  --working-directory   start the local shell in DIR\n"
     "  --benchmark           measure this machine's terminal throughput and exit\n"
@@ -1525,6 +1536,7 @@ int main(int argc, char **argv) {
         if (arg == "--help" || arg == "-h") { fputs(HELP_TEXT, stdout); return 0; }
         if (arg == "--local") s.local = true;
         else if (arg == "--lite") { g_lite = true; s.local = true; }
+        else if (arg == "--basic") { g_basic = g_lite = true; s.local = true; }
         else if (arg == "--no-fast-output") tcore_set_fast_output(false);
         else if (arg == "--working-directory" && more) s.cwd = argv[++i];
         else if (arg == "--theme" && more) s.theme = argv[++i];
@@ -1539,9 +1551,10 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--lite")) g_lite = true;
-    setenv("SDL_VIDEO_X11_WMCLASS", g_lite ? "lestrix-lite" : "lestrix", 0);
-    setenv("SDL_VIDEO_WAYLAND_WMCLASS", g_lite ? "lestrix-lite" : "lestrix", 0);
+    for (int i = 1; i < argc; i++) { if (!strcmp(argv[i], "--basic")) g_basic = g_lite = true; else if (!strcmp(argv[i], "--lite")) g_lite = true; }
+    const char *wmclass = g_basic ? "lestrix-basic" : g_lite ? "lestrix-lite" : "lestrix";
+    setenv("SDL_VIDEO_X11_WMCLASS", wmclass, 0);
+    setenv("SDL_VIDEO_WAYLAND_WMCLASS", wmclass, 0);
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     tmark("main entered");

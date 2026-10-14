@@ -430,7 +430,7 @@ static bool nc_examine(TermCore *t, pid_t pid, const struct stat *slave, NcJob *
         if (!j->pipe && arg1[0] == '-') return false;
         if (!j->pipe) {
             struct stat sf, sn;
-            char full[4096 + 64];
+            char full[8192 + 128];
             if (arg1[0] == '/') snprintf(full, sizeof full, "%s", arg1);
             else {
                 char cwd[4096];

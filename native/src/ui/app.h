@@ -104,6 +104,7 @@ struct App {
     bool quit_on_exit = false;
     char hud_cache_tip[448] = "", hud_parse_tip[256] = "", title_last[400] = "";
     bool lite = false;
+    bool basic = false;  /* --basic: one bare terminal, no menu bar, tabs, sidebar or stats; the shell's title goes in the window title */
     uint64_t hud_prev_reads = 0;
     char hud_seg[11][256] = {};
     uint64_t hud_prev_bytes = 0, trim_prev_bytes = 0;

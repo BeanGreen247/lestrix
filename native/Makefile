@@ -77,14 +77,15 @@ install: $(BUILD)/lestrix
 	install -m 644 data/lestrix.png $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png
 	sed 's|@BINDIR@|$(BINDIR)|g' data/lestrix.desktop.in > $(DATADIR)/applications/lestrix.desktop
 	sed 's|@BINDIR@|$(BINDIR)|g' data/lestrix-lite.desktop.in > $(DATADIR)/applications/lestrix-lite.desktop
-	chmod 644 $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop
-	-desktop-file-validate $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop 2>&1 | sed 's/^/desktop-file-validate: /'
+	sed 's|@BINDIR@|$(BINDIR)|g' data/lestrix-basic.desktop.in > $(DATADIR)/applications/lestrix-basic.desktop
+	chmod 644 $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop $(DATADIR)/applications/lestrix-basic.desktop
+	-desktop-file-validate $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop $(DATADIR)/applications/lestrix-basic.desktop 2>&1 | sed 's/^/desktop-file-validate: /'
 	-update-desktop-database $(DATADIR)/applications 2>/dev/null
 	-chmod 644 $(DATADIR)/applications/mimeinfo.cache 2>/dev/null
 		-chmod -R a+rX $(DATADIR)/icons/hicolor 2>/dev/null
 
 uninstall:
-	rm -f $(BINDIR)/lestrix $(BINDIR)/lxcat $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png
+	rm -f $(BINDIR)/lestrix $(BINDIR)/lxcat $(DATADIR)/applications/lestrix.desktop $(DATADIR)/applications/lestrix-lite.desktop $(DATADIR)/applications/lestrix-basic.desktop $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png
 	-update-desktop-database $(DATADIR)/applications 2>/dev/null
 	
 $(BUILD)/test_lz: tests/test_lz.cpp src/lz.cpp src/lz.h | $(BUILD)
@@ -110,7 +111,8 @@ test-gui: $(BUILD)/lestrix
 	 for s in "w:0.5;s:$$d/a.ppm" "w:0.5;c:28,15;w:0.3;s:$$d/b.ppm" "w:0.5;c:303,56;w:0.4;t:name;k:escape;w:0.2;s:$$d/c.ppm"; do \
 	   XDG_CONFIG_HOME=$$d timeout 30 $(BUILD)/lestrix --script "$$s" || { echo "test-gui: failed on $$s"; exit 1; }; \
 	 done; \
-	 for f in a b c; do test -s $$d/$$f.ppm || { echo "test-gui: no frame $$f"; exit 1; }; done; \
+	 XDG_CONFIG_HOME=$$d timeout 30 $(BUILD)/lestrix --basic --script "w:0.5;t:echo basic;k:return;w:0.3;s:$$d/d.ppm" || { echo "test-gui: --basic failed"; exit 1; }; \
+	 for f in a b c d; do test -s $$d/$$f.ppm || { echo "test-gui: no frame $$f"; exit 1; }; done; \
 	 rm -rf $$d; echo "test-gui: ok"
 
 $(BUILD)/test_fast_paths: tests/test_fast_paths.cpp src/vt.cpp src/lz.cpp src/vt.h | $(BUILD)
