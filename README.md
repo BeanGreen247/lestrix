@@ -91,14 +91,16 @@ Measured on the same machine (Intel i5-8265U, Debian 13, g++ 14.2 against gcc 14
 
 So the rewrite is a maintenance change, not a speed change: throughput is unchanged, start-up is slightly slower and the binary is larger. No speed-up was expected or found.
 
-First tuning step on the C++ base (colour output was the slowest engine test, so it went first): the common SGR sequences (`ESC[m`, `ESC[0m`, `ESC[1m`, and one plain colour such as `ESC[31m`, `ESC[44m`, `ESC[92m`) are applied straight to the pen from the CSI fast parser, without filling the parameter array, going through the CSI dispatch switch and the general SGR loop. A new test feeds every `ESC[Nm` form for N = -2..111, under three starting pens, once whole and once byte by byte and requires the same style; changing one constant makes it fail 24 checks. The original C engine and the new one also give byte-identical screens on 600 random streams (`tests/dump_vt`).
+Tuning on the C++ base. First step (colour output was the slowest engine test, so it went first): the common SGR sequences (`ESC[m`, `ESC[0m`, `ESC[1m`, and one plain colour such as `ESC[31m`, `ESC[44m`, `ESC[92m`) are applied straight to the pen from the CSI fast parser, without filling the parameter array, going through the CSI dispatch switch and the general SGR loop. A new test feeds every `ESC[Nm` form for N = -2..111, under three starting pens, once whole and once byte by byte and requires the same style; changing one constant makes it fail 24 checks. Further steps, all in `vt.cpp`: the scrollback packer stops scanning a row at the first second style or non-ASCII cell (colour rows can never be packed as one-style text, and the scan used to run to the end of the row); the default pen skips the style cache lookup; `ESC[r;cH` is applied inline; scrolling the screen rotates the row order with one `memmove`. The terminal drawing code no longer clears its 512-row work arrays every frame, only the rows in use, and no longer paints the background twice. The original C engine and the new one also give byte-identical screens on 600 random streams (`tests/dump_vt`).
 
 | Measure | before (0.3.0 C / 0.4.0 first cut) | after the SGR shortcut | Change |
 |---|---|---|---|
 | Colour-heavy engine run, instructions executed (callgrind, 4 MB; includes about 95 M for generating the test text) | 224 M | 200 M | 18% fewer for the engine alone (about 130 M to 106 M) |
 | `csi_dispatch` instructions in that run | 25.6 M | 5.1 M | 5x fewer |
+| Colour-heavy engine run, engine alone (callgrind inclusive cost of `vt_feed`, 4 MB), after all of the steps below | 146.4 M | 105.7 M | 28% fewer instructions |
+| Full-screen redraw run (cursor addressing, erase, SGR; 2 MB), engine alone | 60.0 M | 56.0 M | 6.5% fewer |
 | Colour-heavy engine speed (`make bench`, 16 MB, 5 interleaved runs, median) | 270 MB/s | 372 MB/s | faster, but this machine has two cores and the runs vary from 212 to 375 MB/s, so treat the size as indicative; the instruction counts above are the exact figure |
-| Plain log, no scrollback / 10,000 lines (`perf_gate`) | 1478 / 928 MB/s | 1532 / 897 MB/s | none (no escape sequences in that test) |
+| Plain log, no scrollback / 10,000 lines (`perf_gate`) | 1478 / 928 MB/s | 1532 / 897 MB/s | unchanged to about 3% lower on this machine (no escape sequences in that test; run-to-run spread is about 3% too, probably code layout) |
 
 ### Speed is a feature
 

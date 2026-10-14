@@ -1147,7 +1147,7 @@ static void region_up(Vt *t, int top, int bottom, int n) {
     int *ord = t->cur->order;
     if (n == 1) {
         int first = ord[top];
-        memmove(ord + top, ord + top + 1, (size_t)(bottom - top) * sizeof(int));
+        for (int i = top; i < bottom; i++) ord[i] = ord[i + 1];
         ord[bottom] = first;
         clear_row(t, bottom);
         return;

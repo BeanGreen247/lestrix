@@ -247,7 +247,6 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
     float ox = x + TV_PAD, oy = y + TV_PAD;
     r_rect(r, x, y, w, h, pal->bg);
     r_clip(r, (int)x, (int)y, (int)w, (int)h);
-    r_rect(r, x, y, w, h, pal->bg);
 
     RowCopy copies[MAX_ROWS];
     VtLineMeta *metas[MAX_ROWS];
@@ -260,7 +259,7 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
         r_rewind(r, mark);
         uint32_t gen0 = atlas_generation(a);
         uint32_t fid = font_id(f);
-        memset(copies, 0, sizeof copies);
+        memset(copies, 0, (size_t)rows * sizeof *copies);
         tcore_lock(t);
         for (int row = 0; row < rows; row++) {
             metas[row] = vt_line_meta(vt, row - off);
@@ -289,12 +288,12 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
         tcore_unlock(t);
 
         Out outs[MAX_ROWS];
-        memset(outs, 0, sizeof outs);
+        memset(outs, 0, (size_t)rows * sizeof *outs);
         {
             int todo[MAX_ROWS], nt = 0;
             for (int row = 0; row < rows; row++) if (need[row]) todo[nt++] = row;
             bool missed[MAX_ROWS];
-            memset(missed, 0, sizeof missed);
+            memset(missed, 0, (size_t)rows * sizeof *missed);
             if (nt >= 8 && wp_workers() > 0) {
                 RTask ctx = {r, f, pal, copies, outs, missed, todo};
                 wp_run(rtask_fn, &ctx, nt);
