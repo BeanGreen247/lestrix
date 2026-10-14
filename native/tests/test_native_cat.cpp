@@ -33,7 +33,8 @@ static bool wait_for(TermCore *t, const char *text, double secs) {
     return false;
 }
 
-static void run_case(const char *label, const char *shell_cmd, long lines, bool expect_native) {
+/* expect_native: 1 it must be taken over, 0 it must not be, -1 either is fine (small outputs race with the detection) */
+static void run_case(const char *label, const char *shell_cmd, long lines, int expect_native) {
     std::string dir = lx::make_temp_dir("nc-");
     std::string file = lx::path_join(dir, "big file.txt");
     {
@@ -54,12 +55,14 @@ static void run_case(const char *label, const char *shell_cmd, long lines, bool 
     CHECK(t != nullptr);
     usleep(300000);
     tcore_send_str(t, (cmd + "\r").c_str());
+    double t_start = now();
     bool done = wait_for(t, "DONE_42", 60);
+    double secs = now() - t_start;
     CHECK(done);
     bool native = tcore_native_cat_count() > before;
-    if (expect_native && !native) printf("  %s: not taken over (ptrace restrictions? the output still has to be right)\n", label);
-    CHECK(!expect_native || native || true);
-    if (!expect_native) CHECK(!native);
+    if (expect_native == 1 && !native) printf("  %s: not taken over (ptrace restrictions? the output still has to be right)\n", label);
+    if (expect_native == 1) CHECK(native);
+    if (expect_native == 0) CHECK(!native);
     /* every line once and in order: the history holds the lines above the screen */
     Vt *vt = tcore_vt(t);
     tcore_lock(t);
@@ -83,7 +86,7 @@ static void run_case(const char *label, const char *shell_cmd, long lines, bool 
     if (seen != lines) printf("  %s: saw %ld of %ld lines, history %ld\n", label, seen, lines, hist);
     CHECK(seen == lines);
     CHECK(bad == 0);
-    printf("  %-34s %8ld lines %s\n", label, lines, native ? "taken over by the terminal" : "through the pty");
+    printf("  %-34s %8ld lines %5.2f s  %s\n", label, lines, secs, native ? "taken over by the terminal" : "through the pty");
     tcore_close(t);
     tcore_free(t);
     unlink(file.c_str());
@@ -91,7 +94,7 @@ static void run_case(const char *label, const char *shell_cmd, long lines, bool 
 }
 
 /* Ctrl-C while the terminal has taken a cat over must end it like a plain cat and leave the shell running, not stopped. */
-static void run_interrupt_case(long lines) {
+static void run_interrupt_case(long lines, bool pipe_form) {
     std::string dir = lx::make_temp_dir("nc-");
     std::string file = lx::path_join(dir, "big.txt");
     {
@@ -104,7 +107,7 @@ static void run_interrupt_case(long lines) {
     tcore_set_history_defaults(1000, 64, 0, false);
     TermCore *t = tcore_new(argv, dir.c_str(), 100, 30, nullptr, nullptr, true);
     usleep(300000);
-    tcore_send_str(t, ("cat '" + file + "'\r").c_str());
+    tcore_send_str(t, (std::string(pipe_form ? "cat '" + file + "' | cat" : "cat '" + file + "'") + "\r").c_str());
     double end = now() + 0.4;
     while (now() < end) { tcore_pump(t); usleep(2000); }
     tcore_send(t, "\x03", 1);
@@ -112,7 +115,7 @@ static void run_interrupt_case(long lines) {
     while (now() < end) { tcore_pump(t); usleep(2000); }
     tcore_send_str(t, "echo BACK_$((6*7))\r");
     CHECK(wait_for(t, "BACK_42", 60));
-    printf("  %-34s shell answers after Ctrl-C\n", "interrupt");
+    printf("  %-34s shell answers after Ctrl-C\n", pipe_form ? "interrupt (pipe)" : "interrupt");
     tcore_close(t);
     tcore_free(t);
     unlink(file.c_str());
@@ -121,11 +124,18 @@ static void run_interrupt_case(long lines) {
 
 int main() {
     if (getenv("NC_ONLY")) { run_case("probe", getenv("NC_ONLY"), 3000, false); return 0; }
-    run_case("cat FILE", "cat @FILE@", 1200000, true);
-    run_case("cat FILE, small (below the limit)", "cat @FILE@", 20000, false);
-    run_case("cat FILE | tail (a pipe)", "cat @FILE@ | cat", 600000, false);
-    run_case("cat -n style option is left alone", "cat -u @FILE@", 600000, false);
-    run_interrupt_case(4000000);
+    run_case("cat FILE", "cat @FILE@", 1200000, 1);
+    run_case("cat FILE, small (below the limit)", "cat @FILE@", 20000, 0);
+    run_case("cat FILE | cat (a pipe)", "cat @FILE@ | cat", 1200000, 1);
+    run_case("producer | cat", "awk 'BEGIN{for(i=1;i<=1200000;i++) print \"line \" i}' | cat", 1200000, 1);
+    run_case("producer | cat -", "awk 'BEGIN{for(i=1;i<=1200000;i++) print \"line \" i}' | cat -", 1200000, 1);
+    run_case("bursty producer | cat", "awk 'BEGIN{for(i=1;i<=900000;i++){print \"line \" i; if(i%300000==0) system(\"sleep 0.4\")}}' | cat", 900000, true);
+    run_case("three stages | cat", "awk 'BEGIN{for(i=1;i<=1000000;i++) print \"line \" i}' | tr a-z a-z | cat", 1000000, true);
+    run_case("pipe, small output", "awk 'BEGIN{for(i=1;i<=20000;i++) print \"line \" i}' | cat", 20000, -1);
+    run_case("producer pauses for a second", "(seq -f \"line %.0f\" 1 600000; sleep 1; seq -f \"line %.0f\" 600001 1200000) | cat", 1200000, 1);
+    run_case("cat -n style option is left alone", "cat -u @FILE@", 600000, 0);
+    run_interrupt_case(4000000, false);
+    run_interrupt_case(4000000, true);
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

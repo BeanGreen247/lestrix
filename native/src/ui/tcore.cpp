@@ -15,6 +15,7 @@
 #include <new>
 #include <dirent.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/random.h>
 #include <sys/stat.h>
@@ -55,7 +56,7 @@ struct TermCore {
     struct { bool on, saw_child, alt; double t0, t_last, t_back; uint64_t fed0, fed_last; } cmd;
     struct { bool active, suspect, th_started; struct termios saved; pid_t fg, last_checked; double release_at; pthread_t th; std::atomic<int> restored, cancel; int pidfd; } fo;
     char fastcat_token[33];
-    struct { std::atomic<int> busy; pthread_t th; bool started; pid_t last; } nc;
+    struct { std::atomic<int> busy; pthread_t th; bool started; pid_t last; std::atomic<int> pipe_fd, stream_done; } nc;
     std::atomic<unsigned> intr_seq;  /* counts Ctrl-C keystrokes sent to the program, so a take-over can tell it was interrupted */
     std::atomic<unsigned long long> reads;
     bool running, eof, child_done;
@@ -342,22 +343,26 @@ static void flush_out(TermCore *t, bool *still_pending) {
 
 
 /*
- * Built-in fast `cat`. A tty moves about 30 MB/s, so `cat bigfile` is limited by the kernel, not by the terminal. When the
- * foreground job of a local tab is a plain `cat FILE` that writes to this terminal, the terminal takes the rest of the
- * file over and reads it itself:
- *   1. stop the shell (its parent), so it cannot print the next prompt in the middle of this;
- *   2. stop cat for an instant, read how far into the file it is, and move its file offset to the end (pidfd_getfd gives us
- *      the same open file description), then let it go: it finishes the chunk it already holds and exits normally;
- *   3. when cat has exited, everything it wrote is in the pty ahead of us, so write an in-band stream request after it
- *      (the same request the terminal already understands) for the bytes from where cat stopped to the end of the file;
- *   4. let the shell go. It reaps cat and prints its prompt after the file.
- * Anything unusual (options, several files, a pipe or redirect, a small file, no permission for pidfd_getfd) is declined
- * before anything is stopped, so those run through the pty as before. Ctrl-C while it waits leaves the file unfinished,
- * as it would with a plain cat.
+ * Built-in fast `cat`. A tty moves about 30 MB/s, so `cat bigfile` and `producer | cat` are limited by the kernel, not by the
+ * terminal. When the foreground job of a local tab ends in a plain `cat` that writes to this terminal, the terminal takes the
+ * rest of the input over and reads it itself, then lets cat and the shell carry on. Both forms keep the shell stopped for the
+ * whole hand-over so it cannot print its next prompt in the middle, and write one in-band request (the same escape request the
+ * terminal already understands) into the pty after everything cat had written, which is what keeps the order exact.
+ *
+ *   cat FILE        stop cat for an instant, read how far into the file it is, move its file offset to the end (pidfd_getfd
+ *                   gives the same open file), let it go: it finishes the chunk it holds and exits. The request names the
+ *                   file and the offset; the terminal streams the rest.
+ *   producer | cat  ptrace cat and run it until it is about to call read(0) (so it holds no data and has written all of it),
+ *                   park it there, and let the terminal read the pipe itself (pidfd_getfd again) until end of file; then
+ *                   detach cat: its read sees end of file and it exits.
+ *
+ * Anything unusual (options, several files, a redirect, a small file, no permission for pidfd_getfd or ptrace, cat not a direct
+ * child of the shell) is declined before anything is stopped, so those run through the pty as before. Ctrl-C ends the job as it
+ * would with a plain cat.
  */
-enum { NC_MIN_FILE = 1 << 20, NC_MIN_REST = 256 << 10 };
+enum { NC_MIN_FILE = 1 << 20, NC_MIN_REST = 256 << 10, NC_FLAG_NL = 2, NC_FLAG_PIPE = 4 };
 
-typedef struct { TermCore *t; pid_t cat; char path[4096]; int fdnum; unsigned intr0; } NcJob;
+typedef struct { TermCore *t; pid_t cat; bool pipe; char path[4096]; int fdnum; unsigned intr0; } NcJob;
 
 static bool nc_read(const char *path, char *buf, size_t cap, size_t *len) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -370,17 +375,18 @@ static bool nc_read(const char *path, char *buf, size_t cap, size_t *len) {
     return true;
 }
 
-/* state letter and parent of a process from /proc/PID/stat */
-static bool nc_stat(pid_t pid, char *state, pid_t *ppid, long *exit_code) {
+/* state letter, parent and process group of a process from /proc/PID/stat, and optionally its exit code (zombies) */
+static bool nc_stat(pid_t pid, char *state, pid_t *ppid, pid_t *pgrp, long *exit_code) {
     char path[48], buf[1024];
     size_t n;
     snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
     if (!nc_read(path, buf, sizeof buf, &n)) return false;
     char *rp = strrchr(buf, ')');
     if (!rp) return false;
-    int pp = 0;
-    if (sscanf(rp + 2, "%c %d", state, &pp) != 2) return false;
-    *ppid = pp;
+    int pp = 0, pg = 0;
+    if (sscanf(rp + 2, "%c %d %d", state, &pp, &pg) != 3) return false;
+    if (ppid) *ppid = pp;
+    if (pgrp) *pgrp = pg;
     if (exit_code) {
         *exit_code = 0;
         const char *f = rp + 2;
@@ -393,72 +399,206 @@ static bool nc_stat(pid_t pid, char *state, pid_t *ppid, long *exit_code) {
 static bool nc_wait_stopped(pid_t pid) {
     for (int i = 0; i < 100; i++) {
         char st; pid_t pp;
-        if (nc_stat(pid, &st, &pp, NULL) && (st == 'T' || st == 't')) return true;
+        if (nc_stat(pid, &st, &pp, NULL, NULL) && (st == 'T' || st == 't')) return true;
         struct timespec ts = {0, 500000};
         nanosleep(&ts, NULL);
     }
     return false;
 }
 
-static bool nc_candidate(TermCore *t, pid_t fg, NcJob *j) {
+/* Is `pid` a plain cat of ours, writing to this terminal? Fills the job for the file form (`cat FILE`) or the pipe form (`cat`, `cat -`). */
+static bool nc_examine(TermCore *t, pid_t pid, const struct stat *slave, NcJob *j) {
     char path[96], buf[8192], comm[32];
     size_t n;
-    snprintf(path, sizeof path, "/proc/%d/comm", (int)fg);
+    snprintf(path, sizeof path, "/proc/%d/comm", (int)pid);
     if (!nc_read(path, comm, sizeof comm, &n) || strcmp(comm, "cat\n") != 0) return false;
     char st; pid_t pp;
-    if (!nc_stat(fg, &st, &pp, NULL) || pp != t->pty.pid) return false;
-    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)fg);
+    if (!nc_stat(pid, &st, &pp, NULL, NULL) || pp != t->pty.pid) return false;
+    struct stat so;
+    snprintf(path, sizeof path, "/proc/%d/fd/1", (int)pid);
+    if (stat(path, &so) != 0 || !S_ISCHR(so.st_mode) || so.st_rdev != slave->st_rdev) return false;
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pid);
     if (!nc_read(path, buf, sizeof buf, &n)) return false;
     const char *argv0 = buf, *arg1 = argv0 + strlen(argv0) + 1;
-    if ((size_t)(arg1 - buf) >= n) return false;
-    const char *end = arg1 + strlen(arg1) + 1;
-    if (!*arg1 || arg1[0] == '-' || (size_t)(end - buf) != n) return false;
-    char slave[128];
-    struct stat ss, so, sf, sn;
-    if (ptsname_r(t->pty.fd, slave, sizeof slave) != 0 || stat(slave, &ss) != 0) return false;
-    snprintf(path, sizeof path, "/proc/%d/fd/1", (int)fg);
-    if (stat(path, &so) != 0 || !S_ISCHR(so.st_mode) || so.st_rdev != ss.st_rdev) return false;
-    char full[4096 + 64];
-    if (arg1[0] == '/') snprintf(full, sizeof full, "%s", arg1);
-    else {
-        char cwd[4096];
-        snprintf(path, sizeof path, "/proc/%d/cwd", (int)fg);
-        ssize_t l = readlink(path, cwd, sizeof cwd - 1);
-        if (l <= 0) return false;
-        cwd[l] = 0;
-        snprintf(full, sizeof full, "%s/%s", cwd, arg1);
+    j->t = t; j->cat = pid; j->intr0 = t->intr_seq.load();
+    if ((size_t)(arg1 - buf) >= n) {  /* no argument: reads its standard input */
+        j->pipe = true;
+    } else {
+        const char *end = arg1 + strlen(arg1) + 1;
+        if ((size_t)(end - buf) != n || !*arg1) return false;
+        j->pipe = !strcmp(arg1, "-");
+        if (!j->pipe && arg1[0] == '-') return false;
+        if (!j->pipe) {
+            struct stat sf, sn;
+            char full[4096 + 64];
+            if (arg1[0] == '/') snprintf(full, sizeof full, "%s", arg1);
+            else {
+                char cwd[4096];
+                snprintf(path, sizeof path, "/proc/%d/cwd", (int)pid);
+                ssize_t l = readlink(path, cwd, sizeof cwd - 1);
+                if (l <= 0) return false;
+                cwd[l] = 0;
+                snprintf(full, sizeof full, "%s/%s", cwd, arg1);
+            }
+            if (!realpath(full, j->path) || stat(j->path, &sf) != 0 || !S_ISREG(sf.st_mode) || sf.st_size < NC_MIN_FILE) return false;
+            snprintf(path, sizeof path, "/proc/%d/fd", (int)pid);
+            DIR *d = opendir(path);
+            if (!d) return false;
+            j->fdnum = -1;
+            while (struct dirent *e = readdir(d)) {
+                int num = atoi(e->d_name);
+                if (num < 3) continue;
+                char fp[96];
+                snprintf(fp, sizeof fp, "/proc/%d/fd/%d", (int)pid, num);
+                if (stat(fp, &sn) == 0 && sn.st_dev == sf.st_dev && sn.st_ino == sf.st_ino) { j->fdnum = num; break; }
+            }
+            closedir(d);
+            return j->fdnum >= 0;
+        }
     }
-    if (!realpath(full, j->path) || stat(j->path, &sf) != 0 || !S_ISREG(sf.st_mode) || sf.st_size < NC_MIN_FILE) return false;
-    snprintf(path, sizeof path, "/proc/%d/fd", (int)fg);
-    DIR *d = opendir(path);
-    if (!d) return false;
-    j->fdnum = -1;
-    while (struct dirent *e = readdir(d)) {
-        int num = atoi(e->d_name);
-        if (num < 3) continue;
-        char fp[96];
-        snprintf(fp, sizeof fp, "/proc/%d/fd/%d", (int)fg, num);
-        if (stat(fp, &sn) == 0 && sn.st_dev == sf.st_dev && sn.st_ino == sf.st_ino) { j->fdnum = num; break; }
-    }
-    closedir(d);
-    j->t = t; j->cat = fg; j->intr0 = t->intr_seq.load();
-    return j->fdnum >= 0;
+    struct stat si;
+    snprintf(path, sizeof path, "/proc/%d/fd/0", (int)pid);
+    if (stat(path, &si) != 0 || !S_ISFIFO(si.st_mode)) return false;
+    j->fdnum = 0;
+    return true;
 }
 
-static void nc_request(TermCore *t, int slave_fd, const char *path, uint64_t off) {
+/* The cat that matters is the last stage of the job, not necessarily its process group leader: look through the group. */
+static bool nc_find(TermCore *t, pid_t fg, NcJob *j) {
+    char slave[128];
+    struct stat ss;
+    if (ptsname_r(t->pty.fd, slave, sizeof slave) != 0 || stat(slave, &ss) != 0) return false;
+    if (nc_examine(t, fg, &ss, j)) return true;
+    DIR *d = opendir("/proc");
+    if (!d) return false;
+    bool found = false;
+    while (!found) {
+        struct dirent *e = readdir(d);
+        if (!e) break;
+        int pid = atoi(e->d_name);
+        if (pid <= 1 || pid == fg) continue;
+        char st; pid_t pp, pg;
+        if (!nc_stat(pid, &st, &pp, &pg, NULL) || pg != fg || pp != t->pty.pid) continue;
+        found = nc_examine(t, pid, &ss, j);
+    }
+    closedir(d);
+    return found;
+}
+
+static void nc_request(TermCore *t, int slave_fd, const char *path, uint64_t off, unsigned flags) {
     char msg[4096 * 3 + 160];
     size_t n = (size_t)snprintf(msg, sizeof msg, "\x1b]7777;cat;%s;", t->fastcat_token);
     for (const unsigned char *p = (const unsigned char *)path; *p && n < sizeof msg - 80; p++) {
         if (*p < 0x20 || *p == 0x7f || *p == '%' || *p == ';' || *p > 0x7e) n += (size_t)snprintf(msg + n, 4, "%%%02X", *p);
         else msg[n++] = (char)*p;
     }
-    n += (size_t)snprintf(msg + n, 80, ";%llu;0;2\a", (unsigned long long)off);
+    n += (size_t)snprintf(msg + n, 80, ";%llu;0;%u\a", (unsigned long long)off, flags);
     size_t done = 0;
     while (done < n) {
         ssize_t w = write(slave_fd, msg + done, n - done);
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) break;
         done += (size_t)w;
+    }
+}
+
+static void nc_file_job(NcJob *j, int pidfd, int dupfd, int sfd) {
+    TermCore *t = j->t;
+    pid_t shell = t->pty.pid;
+    bool shell_stopped = false, cat_stopped = false, handed_over = false;
+    kill(shell, SIGSTOP);
+    shell_stopped = nc_wait_stopped(shell);
+    if (shell_stopped) {
+        syscall(SYS_pidfd_send_signal, pidfd, SIGSTOP, NULL, 0);
+        cat_stopped = nc_wait_stopped(j->cat);
+    }
+    off_t pos = -1;
+    struct stat st = {};
+    if (cat_stopped) {
+        pos = lseek(dupfd, 0, SEEK_CUR);
+        if (fstat(dupfd, &st) == 0 && pos >= 0 && st.st_size - pos >= NC_MIN_REST && lseek(dupfd, 0, SEEK_END) >= 0) handed_over = true;
+    }
+    if (cat_stopped) syscall(SYS_pidfd_send_signal, pidfd, SIGCONT, NULL, 0);
+    if (handed_over) {
+        struct pollfd p = {pidfd, POLLIN, 0};
+        bool gone = false;
+        while (!t->stop.load() && !(gone = poll(&p, 1, 50) > 0)) {}
+        if (gone) {
+            char state; pid_t pp; long code = 0;
+            bool signaled = nc_stat(j->cat, &state, &pp, NULL, &code) && (code & 0x7f) != 0;  /* Ctrl-C: do not finish the file */
+            if (!signaled && t->intr_seq.load() == j->intr0) {
+                nc_request(t, sfd, j->path, (uint64_t)pos, NC_FLAG_NL);
+                g_native_cat_count.fetch_add(1);
+            }
+        }
+    }
+    kill(shell, SIGCONT);
+}
+
+/* PTRACE_GET_SYSCALL_INFO (Linux 5.3): is the tracee stopped at the entry of read(0, ...)? */
+static bool nc_at_read_entry(pid_t pid) {
+    unsigned char info[128];
+    memset(info, 0, sizeof info);
+    long r = ptrace((enum __ptrace_request)0x420e, pid, (void *)sizeof info, info);
+    if (r <= 0) return false;
+    uint64_t nr, arg0;
+    memcpy(&nr, info + 24, 8);
+    memcpy(&arg0, info + 32, 8);
+    return info[0] == 1 && nr == (uint64_t)SYS_read && arg0 == 0;
+}
+
+static void nc_pipe_job(NcJob *j, int pidfd, int dupfd, int sfd) {
+    TermCore *t = j->t;
+    pid_t shell = t->pty.pid, cat = j->cat;
+    if (ptrace(PTRACE_SEIZE, cat, 0, (void *)(long)PTRACE_O_TRACESYSGOOD) != 0) return;
+    bool parked = false, dead = false;
+    int sig = 0, st = 0;
+    ptrace(PTRACE_INTERRUPT, cat, 0, 0);
+    if (waitpid(cat, &st, __WALL) != cat || !WIFSTOPPED(st)) { dead = !WIFSTOPPED(st); }
+    double give_up = 0;
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    give_up = (double)t0.tv_sec + (double)t0.tv_nsec * 1e-9 + 3.0;
+    while (!dead && !parked && !t->stop.load()) {
+        if (nc_at_read_entry(cat)) { parked = true; break; }
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        if ((double)t1.tv_sec + (double)t1.tv_nsec * 1e-9 > give_up) break;
+        ptrace(PTRACE_SYSCALL, cat, 0, (void *)(long)sig);
+        sig = 0;
+        if (waitpid(cat, &st, __WALL) != cat || WIFEXITED(st) || WIFSIGNALED(st)) { dead = true; break; }
+        if (WIFSTOPPED(st)) {
+            int s = WSTOPSIG(st);
+            if (s != (SIGTRAP | 0x80) && s != SIGTRAP && (st >> 16) == 0) sig = s;  /* a real signal (Ctrl-C): hand it on when cat resumes */
+        }
+    }
+    if (parked && t->intr_seq.load() == j->intr0) {
+        kill(shell, SIGSTOP);
+        bool shell_stopped = nc_wait_stopped(shell);
+        if (shell_stopped) {
+            t->nc.pipe_fd.store(dupfd);
+            t->nc.stream_done.store(0);
+            nc_request(t, sfd, "/", 0, NC_FLAG_NL | NC_FLAG_PIPE);
+            while (!t->stop.load() && !t->nc.stream_done.load()) { struct timespec ts = {0, 2000000}; nanosleep(&ts, NULL); }
+            if (t->nc.stream_done.load()) g_native_cat_count.fetch_add(1);
+            t->nc.pipe_fd.store(-1);
+        }
+        sig = 0;
+        for (;;) {  /* a signal that reached cat while it was parked has to be passed on, or Ctrl-C would be swallowed */
+            pid_t w = waitpid(cat, &st, WNOHANG | __WALL);
+            if (w != cat || !WIFSTOPPED(st)) break;
+            int s = WSTOPSIG(st);
+            if (s != (SIGTRAP | 0x80) && s != SIGTRAP && (st >> 16) == 0) { sig = s; ptrace(PTRACE_SYSCALL, cat, 0, (void *)(long)sig); sig = 0; }
+            else break;
+        }
+        ptrace(PTRACE_DETACH, cat, 0, (void *)(long)sig);
+        struct pollfd p = {pidfd, POLLIN, 0};
+        while (!t->stop.load() && poll(&p, 1, 50) <= 0) {}
+        kill(shell, SIGCONT);
+        (void)dupfd;
+        return;
+    }
+    if (!dead) {
+        if (sig) ptrace(PTRACE_SYSCALL, cat, 0, (void *)(long)sig);
+        ptrace(PTRACE_DETACH, cat, 0, (void *)(long)sig);
     }
 }
 
@@ -470,36 +610,9 @@ static void *nc_main(void *arg) {
     int dupfd = pidfd >= 0 ? (int)syscall(SYS_pidfd_getfd, pidfd, j->fdnum, 0) : -1;
     char slave[128];
     int sfd = dupfd >= 0 && ptsname_r(t->pty.fd, slave, sizeof slave) == 0 ? open(slave, O_WRONLY | O_NOCTTY | O_CLOEXEC) : -1;
-    pid_t shell = t->pty.pid;
     if (sfd >= 0) {
-        bool shell_stopped = false, cat_stopped = false, handed_over = false;
-        kill(shell, SIGSTOP);
-        shell_stopped = nc_wait_stopped(shell);
-        if (shell_stopped) {
-            syscall(SYS_pidfd_send_signal, pidfd, SIGSTOP, NULL, 0);
-            cat_stopped = nc_wait_stopped(j->cat);
-        }
-        off_t pos = -1;
-        struct stat st = {};
-        if (cat_stopped) {
-            pos = lseek(dupfd, 0, SEEK_CUR);
-            if (fstat(dupfd, &st) == 0 && pos >= 0 && st.st_size - pos >= NC_MIN_REST && lseek(dupfd, 0, SEEK_END) >= 0) handed_over = true;
-        }
-        if (cat_stopped) syscall(SYS_pidfd_send_signal, pidfd, SIGCONT, NULL, 0);
-        if (handed_over) {
-            struct pollfd p = {pidfd, POLLIN, 0};
-            bool gone = false;
-            while (!t->stop.load() && !(gone = poll(&p, 1, 50) > 0)) {}
-            if (gone) {
-                char state; pid_t pp; long code = 0;
-                bool signaled = nc_stat(j->cat, &state, &pp, &code) && (code & 0x7f) != 0;  /* Ctrl-C: do not finish the file */
-                if (!signaled && t->intr_seq.load() == j->intr0) {
-                    nc_request(t, sfd, j->path, (uint64_t)pos);
-                    g_native_cat_count.fetch_add(1);
-                }
-            }
-        }
-        kill(shell, SIGCONT);
+        if (j->pipe) nc_pipe_job(j, pidfd, dupfd, sfd);
+        else nc_file_job(j, pidfd, dupfd, sfd);
     }
     if (sfd >= 0) close(sfd);
     if (dupfd >= 0) close(dupfd);
@@ -515,7 +628,7 @@ static void nc_join(TermCore *t) {
     t->nc.started = false;
 }
 
-/* Called by the reader after a sizeable read: is the foreground job a plain `cat FILE` of a big file? */
+/* Called by the reader after a sizeable read: is the foreground job one that ends in a plain `cat`? */
 static void nc_probe(TermCore *t) {
     if (!t->fastcat_token[0] || !g_native_cat.load() || t->nc.busy.load() || t->pty.fd < 0) return;
     pid_t fg = tcgetpgrp(t->pty.fd);
@@ -524,7 +637,7 @@ static void nc_probe(TermCore *t) {
     t->nc.last = fg;
     NcJob *j = static_cast<NcJob*>(calloc(1, sizeof *j));
     if (!j) return;
-    if (!nc_candidate(t, fg, j)) { free(j); return; }
+    if (!nc_find(t, fg, j)) { free(j); return; }
     nc_join(t);
     t->nc.busy.store(1);
     if (pthread_create(&t->nc.th, NULL, nc_main, j) != 0) { t->nc.busy.store(0); free(j); return; }
@@ -544,7 +657,33 @@ static void feed_sliced(TermCore *t, const uint8_t *p, size_t n, bool notify) {
     }
 }
 
+/* The pipe form of the built-in cat: read the pipe cat was parked on until every writer has closed it. */
+static void stream_pipe(TermCore *t) {
+    int fd = t->nc.pipe_fd.load();
+    if (fd >= 0) {
+        enum { CH = 1 << 20 };
+        uint8_t *in = static_cast<uint8_t*>(malloc(CH));
+        if (in) {
+            const unsigned intr0 = t->intr_seq.load();
+            LOCK(t); vt_set_stream_nl(t->vt, true); UNLOCK(t);
+            while (!t->stop.load() && t->intr_seq.load() == intr0) {
+                struct pollfd p = {fd, POLLIN, 0};
+                int pr = poll(&p, 1, 50);
+                if (pr == 0) continue;
+                if (pr < 0 && errno == EINTR) continue;
+                ssize_t n = read(fd, in, CH);
+                if (n > 0) feed_sliced(t, in, (size_t)n, true);
+                else if (n == 0 || (errno != EINTR && errno != EAGAIN)) break;
+            }
+            LOCK(t); vt_set_stream_nl(t->vt, false); UNLOCK(t);
+            free(in);
+        }
+    }
+    t->nc.stream_done.store(1);
+}
+
 static void stream_file(TermCore *t, const char *path, uint64_t off, uint64_t len, unsigned flags) {
+    if (flags & NC_FLAG_PIPE) { stream_pipe(t); return; }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
     if (fd < 0) return;
     struct stat st;

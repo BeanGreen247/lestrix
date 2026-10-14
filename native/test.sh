@@ -10,7 +10,7 @@ test.sh - installs what the tests need and runs all of them.
   ./test.sh --no-deps       never touch system packages
   ./test.sh --arm           also build and run the engine tests for aarch64 and armhf under qemu (Raspberry Pi, ODROID, Tinker Board)
   ./test.sh --bench         also run the quick benchmark (Lestrix only, about a minute)
-  ./test.sh --only NAME     one group: engine, fast, lz, tsan, store, xfer, ftp, perf, gui
+  ./test.sh --only NAME     one group: engine, fast, lz, tsan, store, xfer, ftp, perf, gui, cat
 What runs: the terminal engine under ASan/UBSan (and against pyte when it is installed), the UTF-8 fast-path fuzz test, the compressor,
 the engine under ThreadSanitizer, the store/transfer/FTP tests, the speed gate and the window test (a real window driven by scripted
 input; under xvfb when there is no display). Exit status is 0 only if everything that ran passed.
@@ -97,7 +97,7 @@ run() {
 run engine make test-vt
 run fast   make test-fast
 run shadow make test-shadow
-run lxcat  make test-lxcat
+run cat     make test-native-cat
 run lz     make test-lz
 run tsan   make test-vt-tsan
 run store  make test-store
