@@ -6,23 +6,26 @@
 #ifndef SD_JSON_H
 #define SD_JSON_H
 
-#include <glib.h>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 
-typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } JType;
-typedef struct JVal {
-    JType type;
-    double num;
-    gboolean b;
-    char *str;
-    GPtrArray *items;
-    GPtrArray *keys;
-} JVal;
+enum JType { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ };
 
-JVal *json_parse(const char *text, GError **err);
-void json_free(JVal *v);
-const JVal *json_get(const JVal *obj, const char *key);
+struct JVal {
+    JType type = J_NULL;
+    double num = 0;
+    bool b = false;
+    std::string str;
+    std::vector<std::unique_ptr<JVal>> items;
+    std::vector<std::string> keys;
+};
+
+std::unique_ptr<JVal> json_parse(std::string_view text, std::string *err = nullptr);
+const JVal *json_get(const JVal *obj, std::string_view key);
 const char *json_str(const JVal *v, const char *def);
 double json_num(const JVal *v, double def);
-void json_append_string(GString *out, const char *s);
+void json_append_string(std::string &out, std::string_view s);
 
 #endif

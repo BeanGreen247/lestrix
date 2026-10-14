@@ -24,8 +24,7 @@ for spec in "$@"; do
   bytes=$(stat -c %s "$file")
   sleep 0.5
   c0=$(cpu); s=$(now)
-  if [ -n "$LESTRIX_BENCH_LXCAT" ]; then "$LESTRIX_BENCH_LXCAT" "$file"
-  else cat "$file"; fi
+  cat "$file"
   printf '\033[6n'; IFS= read -r -s -d R -t 900 _ </dev/tty
   e=$(now); c1=$(cpu)
   wall=$(echo "$e - $s" | bc -l); cpus=$(echo "$c1 - $c0" | bc -l)

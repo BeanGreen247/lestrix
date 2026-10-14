@@ -4,13 +4,13 @@
   <img src="native/data/lestrix.png" alt="Lestrix logo" width="96"/>
 </p>
 
-A fast, light SSH terminal manager in plain C. No GTK, no Qt: the window, the widgets and the text rendering are its own code on SDL2 and OpenGL. Saved connections on the left, terminal tabs on the right, an SFTP/FTP file browser that follows your shell, and a live performance bar along the bottom. Think MobaXterm, built to start instantly and stay small.
+A fast, light SSH terminal manager in C++. No GTK, no Qt: the window, the widgets and the text rendering are its own code on SDL2 and OpenGL. Saved connections on the left, terminal tabs on the right, an SFTP/FTP file browser that follows your shell, and a live performance bar along the bottom. Think MobaXterm, built to start instantly and stay small.
 
 <p align="center">
   <img src="native/docs/welcome.png" alt="Lestrix start page with saved connections" width="900"/>
 </p>
 
-**Version:** 0.3.0  
+**Version:** 0.4.0  
 **Author:** BeanGreen247  
 **License:** MIT
 
@@ -68,7 +68,62 @@ Connections live in `~/.config/lestrix/connections.json`. No passwords are saved
 
 ## Under the hood
 
-The program lives in `native/` and is plain C (GNU C11, not C++): its own terminal engine, its own widget toolkit, drawing and text rendering on SDL2 (windowing and input) and OpenGL (3.3, ES 3.0 or ES 2.0), FreeType and fontconfig for fonts, and `libcurl` for FTP. (An earlier Python/Qt prototype where the features were worked out was removed in 0.2.2; it is still in the git history before commit `26beddf`.)
+The program lives in `native/` and is C++20 (`g++`, built with `-fno-rtti`): its own terminal engine, its own widget toolkit, drawing and text rendering on SDL2 (windowing and input) and OpenGL (3.3, ES 3.0 or ES 2.0), FreeType and fontconfig for fonts, and `libcurl` for FTP. Since 0.4.0 nothing depends on GLib any more: strings, containers, files, processes and settings use the C++ standard library plus a small `util.h` of Lestrix's own. (An earlier Python/Qt prototype where the features were worked out was removed in 0.2.2; it is still in the git history before commit `26beddf`.)
+
+### 0.4.0: the rewrite from C to C++, and what it did to speed
+
+The whole program was moved from C11 to C++20 to make it easier to maintain: ownership is now `std::string`, `std::vector`, `std::unique_ptr` and `std::shared_ptr` instead of `g_strdup`/`g_free` pairs, dialogs are classes with `std::function` callbacks instead of `void *` context structs, background work is a `std::function` job pool, the file browser is a class that stays valid while a transfer is still running after its tab closed, and the JSON, inventory, store and transfer code return values and `std::optional` instead of `GError`. The terminal engine (`vt.cpp`, `lz.cpp`) and the per-tab threading (`tcore.cpp`) keep their C-style hot loops on purpose and are only compiled as C++; the earlier research (`native/docs/CPP_PORT_RESEARCH.md`) had found that the language does not change their speed.
+
+Measured on the same machine (Intel i5-8265U, Debian 13, g++ 14.2 against gcc 14.2, same flags apart from the language), C build of 0.3.0 against the C++ build of 0.4.0, interleaved runs:
+
+| Measure | 0.3.0 (C) | 0.4.0 (C++) | Change |
+|---|---|---|---|
+| Engine, plain log, no scrollback (`make bench`, 3 runs) | 1453 / 1507 / 1521 MB/s | 1538 / 1495 / 1532 MB/s | none (within the run-to-run spread) |
+| Engine, plain log, 10,000-line scrollback | 882 / 815 / 889 MB/s | 869 / 873 / 882 MB/s | none |
+| Engine, colour output, 10,000-line scrollback | 320 / 295 / 324 MB/s | 262 / 314 / 311 MB/s | none (one low run) |
+| Engine, unlimited scrollback | 449 - 878 MB/s | 330 - 841 MB/s | none (this row varies by 2x from run to run in both builds) |
+| Scrollback compressor | 9.6 - 9.9 GB/s per core | 9.3 - 9.6 GB/s per core | about 2% lower, within noise |
+| Speed gate (`perf_gate`), no scrollback / 10,000 lines | 1486 / 915 MB/s | 1478 / 928 MB/s | none |
+| Start to first frame (median of 5, Xvfb) | 165 ms | 178 ms | about 8% slower, noisy |
+| Memory at rest (RSS, 5 runs) | 139.5 MB | 138.2 MB | about 1% less |
+| Executable size | 488 KB | 1.0 MB | about 2x larger (the C++ standard library templates) |
+| Tests | 32 + 52 + 16 + 1005 + 120 + 120 + 34163 checks | the same checks, all passing | |
+
+So the rewrite is a maintenance change, not a speed change: throughput is unchanged, start-up is slightly slower and the binary is larger. No speed-up was expected or found.
+
+Tuning on the C++ base. First step (colour output was the slowest engine test, so it went first): the common SGR sequences (`ESC[m`, `ESC[0m`, `ESC[1m`, and one plain colour such as `ESC[31m`, `ESC[44m`, `ESC[92m`) are applied straight to the pen from the CSI fast parser, without filling the parameter array, going through the CSI dispatch switch and the general SGR loop. A new test feeds every `ESC[Nm` form for N = -2..111, under three starting pens, once whole and once byte by byte and requires the same style; changing one constant makes it fail 24 checks. Further steps, all in `vt.cpp`: the scrollback packer stops scanning a row at the first second style or non-ASCII cell (colour rows can never be packed as one-style text, and the scan used to run to the end of the row); the default pen skips the style cache lookup; `ESC[r;cH` is applied inline; scrolling the screen rotates the row order with one `memmove`. The terminal drawing code no longer clears its 512-row work arrays every frame, only the rows in use, and no longer paints the background twice. The original C engine and the new one also give byte-identical screens on 600 random streams (`tests/dump_vt`).
+
+| Measure | before (0.3.0 C / 0.4.0 first cut) | after the SGR shortcut | Change |
+|---|---|---|---|
+| Colour-heavy engine run, instructions executed (callgrind, 4 MB; includes about 95 M for generating the test text) | 224 M | 200 M | 18% fewer for the engine alone (about 130 M to 106 M) |
+| `csi_dispatch` instructions in that run | 25.6 M | 5.1 M | 5x fewer |
+| Colour-heavy engine run, engine alone (callgrind inclusive cost of `vt_feed`, 4 MB), after all of the steps below | 146.4 M | 105.7 M | 28% fewer instructions |
+| Full-screen redraw run (cursor addressing, erase, SGR; 2 MB), engine alone | 60.0 M | 56.0 M | 6.5% fewer |
+| Colour-heavy engine speed (`make bench`, 16 MB, 5 interleaved runs, median) | 270 MB/s | 372 MB/s | faster, but this machine has two cores and the runs vary from 212 to 375 MB/s, so treat the size as indicative; the instruction counts above are the exact figure |
+| Plain log, no scrollback / 10,000 lines (`perf_gate`) | 1478 / 928 MB/s | 1532 / 897 MB/s | unchanged to about 3% lower on this machine (no escape sequences in that test; run-to-run spread is about 3% too, probably code layout) |
+
+### Resource use of the three modes (0.4.0)
+
+Measured in the test VM with Mesa's software OpenGL (llvmpipe), so the absolute drawing costs are higher than on a GPU; the idle and thread numbers do not depend on that. "Idle" is 10 seconds after the window has been left alone for 13 seconds. Before = the first 0.4.0 build, after = this build.
+
+| Measure | Full before | Full after | Lite before | Lite after | Basic before | Basic after |
+|---|---|---|---|---|---|---|
+| Idle CPU, share of one core | 2.50% | 0.30% | 1.50% | 0.00% | 1.40% | 0.00% |
+| Idle wake-ups per second (context switches) | 40 | 5 | 27 | 0 | 25 | 0 |
+| Threads at idle | 14 | 12 | 14 | 8 | 14 | 8 |
+| Start to first frame (best of 7 after, single run before) | 169 ms | 130 ms | 155 ms | 140 ms | 140 ms | 111 ms |
+| 128 MB flood through the pty (`--no-fastcat`), user + sys CPU | about 1.9 s | 1.64 s | about 1.9 s | 1.51 s | about 1.9 s | 1.59 s |
+| Frames drawn during that flood | about 100 | 51 - 61 | about 100 | 41 - 49 | about 100 | 48 - 49 |
+
+What changed, each step in every mode unless noted:
+
+- **The cursor blinks for 10 seconds after the last key, mouse event or output, then stays solid.** A window nobody touches now sleeps completely (0 wake-ups) instead of redrawing twice a second.
+- **Job threads start when there is work.** The six helper threads for the host checks and file transfers used to start at launch in every mode; Lite and Basic never run a job now, so they have none.
+- **Lite and Basic skip work they cannot show:** the saved-connection list and `~/.ssh/config` parse, the host reachability checks every 30 seconds, and (Basic) the list of installed shells. The 34-pixel start page font is opened when the start page is first drawn, in every mode.
+- **An idle performance bar refreshes every 3 seconds** instead of every second (Full only; the bar does not exist in Lite and Basic).
+- **While output pours in, a frame may cost at most a third of the time.** The program measures what a frame costs to draw and present and lowers the frame rate while a flood lasts if that is too much: on software GL it halves the frames drawn and cuts the flood's CPU by about 20%; on a fast GPU the cap never applies. Typing and ordinary use are not affected. The average frame cost is shown in the cache statistics.
+
+Memory is unchanged at about 137 MB in all three modes in this VM: 56 MB of it is Mesa's LLVM software renderer and 10 MB is fontconfig; Lestrix's own heap is about 2 MB at start. On a real GPU the first figure is not there, but I have not measured that.
 
 ### Speed is a feature
 
@@ -77,6 +132,10 @@ A terminal sits between you and everything you run. When it is slow, `tail -f` o
 - The numbers above are measured on one 8-core machine, not estimated, and `lestrix --benchmark` measures them on your machine.
 - The bar along the bottom of the window shows them live (every figure is explained under [What the overlay shows](#what-the-overlay-shows), and hovering one in the app shows the same text). It is on by default; View > Show performance overlay turns it off.
 - `make test` includes a speed gate that fails if parsing gets more than about ten times slower, so a slowdown cannot slip in unnoticed.
+
+### Tabs like VS Code
+
+With no session open Lestrix shows the start page and no tab strip. A double click on the empty page opens a local shell tab. With tabs open, a double click on the free space right of the last tab opens another one; a single click there does nothing. Closing the last tab brings the start page back with no strip. The menu, the shortcuts and the session list open tabs as before. This applies to full and lite mode (basic has no tabs).
 
 ### Scrollback: adjustable, up to unlimited
 
@@ -97,7 +156,7 @@ Each terminal parses on its own thread, so the window stays responsive during a 
 
 Same machine as below (Intel i5-8265U, 8 threads, Debian 13, X11, `powersave` governor; `performance` is 7-12% faster, see native/docs/PERFORMANCE_2026-10-07.md), 200x50 windows at default settings, one run each, the `native/benchmark` script with this revision of Lestrix (rows 15-27 of the progression below). Every test ends with a cursor-position request that a terminal only answers after it has parsed everything before it, so the times are "until it has taken it all". **Lestrix (cat)** is Lestrix running plain `cat`, the same test every terminal gets; **Lestrix (lxcat)** is Lestrix's fast file path, which other terminals cannot do, so it is a separate column and not a like-for-like comparison. mate-terminal is left out: it hands its command to an already running server, so the script cannot measure it reliably. Best of the like-for-like terminals is in bold.
 
-| Total time, seconds | Lestrix (cat) | Lestrix (lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
+| Total time, seconds | Lestrix (cat) | Lestrix (built-in cat, was lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
 |---|---|---|---|---|---|---|---|
 | 107 MB log | **1.29** | 0.25 | 2.28 | 2.29 | 2.72 | 2.69 | 5.39 |
 | 40 MB colour text | **0.56** | 0.18 | 0.78 | 0.90 | 1.01 | 1.08 | 2.03 |
@@ -111,7 +170,7 @@ Same machine as below (Intel i5-8265U, 8 threads, Debian 13, X11, `powersave` go
 | 1 GB random text | **30.64** | 5.80 | 33.94 | 33.56 | 58.70 | 59.77 | 70.77 |
 | 2 GB random text | **63.01** | 11.98 | 68.43 | 67.41 | 117.90 | 120.25 | 141.71 |
 
-| CPU used, seconds | Lestrix (cat) | Lestrix (lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
+| CPU used, seconds | Lestrix (cat) | Lestrix (built-in cat, was lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
 |---|---|---|---|---|---|---|---|
 | 107 MB log | **1.01** | 0.61 | 2.40 | 3.33 | 2.29 | 2.28 | 5.37 |
 | 40 MB colour text | **0.43** | 0.26 | 0.83 | 1.11 | 0.93 | 0.99 | 2.01 |
@@ -120,7 +179,7 @@ Same machine as below (Intel i5-8265U, 8 threads, Debian 13, X11, `powersave` go
 | 1 GB random text | **24.85** | 20.57 | 36.11 | 58.28 | 51.54 | 52.77 | 70.69 |
 | 2 GB random text | **51.62** | 42.14 | 72.86 | 117.03 | 104.14 | 105.77 | 141.57 |
 
-| | Lestrix (cat) | Lestrix (lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
+| | Lestrix (cat) | Lestrix (built-in cat, was lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
 |---|---|---|---|---|---|---|---|
 | Start-up to first prompt | 0.18 s | 0.19 s | 0.24 s | 0.81 s | 0.38 s | 0.27 s | **0.10 s** |
 | Memory at rest | 97 MB | 97 MB | 99 MB | 126 MB | 55 MB | 53 MB | **11 MB** |
@@ -231,18 +290,36 @@ Reading it: on this file the kernel's pseudo-terminal is the bottleneck. A bare 
 
 Lestrix draws at most 60 frames a second, and while a big dump is pouring in it slows itself to 24 (`--io-fps 24`), so the CPU goes to reading the output instead of drawing frames nobody can read; it returns to the normal rate as soon as the output slows. Both limits are command-line flags: `--max-fps N` (0 removes the cap and turns vsync off) and `--io-fps N` (lower is faster for output; 0 adds no extra limit). When nothing changes it draws nothing: an idle window with a focused cursor draws two frames a second (the blink), an unfocused one almost none, and the loop sleeps until the next timer instead of polling. On this machine 256 MB through `lxcat` took 1.98 s at 60 fps, 2.06 s at 120, 2.25 s at 240 and 3.2 s with no limit (about 700 frames a second), so a lower dump rate is the faster way to print a lot of text; for reference, kitty documents about 100 fps as "more than sufficient for most uses" and Ghostty defaults to vsync.
 
-### lxcat: big files without the kernel's tty layer
+### Built-in fast `cat`: big files without the kernel's tty layer
 
-Everything a program prints goes through the kernel's pseudo-terminal, which works on every line and caps big output at about 35 MB/s on this machine, whichever terminal is on the other end. `lxcat` is `cat` for Lestrix: in a local Lestrix tab it sends the terminal one escape sequence naming the file, and Lestrix reads the file itself at memory speed and prints it at exactly that point in the output, so ordering is unchanged. Elsewhere, or when its output is not a terminal, it behaves like `cat`. Piped input is copied to `/dev/shm` first and handed over the same way.
+Everything a program prints goes through the kernel's pseudo-terminal, which works on every line and caps big output at about 35 MB/s on this machine, whichever terminal is on the other end. Since 0.4.0 Lestrix deals with the commonest big dumps, `cat bigfile` and `some-command | cat`, by itself, with no helper program, no `cat` wrapper on `PATH` and no environment variable: when the foreground job of a local tab ends in a plain `cat` that prints to the terminal, the terminal reads the rest of the input itself at memory speed. (Before 0.4.0 a separate `lxcat` binary did this; the columns called `lxcat` in the older benchmark tables below are the same fast path.)
+
+How it works. In both forms the shell, which is the parent of `cat`, is stopped for the whole hand-over so it cannot print its next prompt in the middle, and the terminal writes one in-band request into the pty after everything `cat` had already written, which is what keeps the order exact. Then it is either:
+
+- **`cat FILE`**: `cat` is stopped for an instant, the terminal reads how far into the file it is, moves its file offset to the end of the file (it gets at the same open file with `pidfd_getfd`) and lets it go. `cat` finishes the chunk it already holds and exits normally. The request names the file and the offset where `cat` stopped, and the terminal streams the rest.
+- **`producer | cat`** (also `cat -`, and any number of stages in front): the terminal attaches to `cat` with `ptrace`, runs it until it is about to call `read(0, ...)` (at that point it holds no data and has written all it read), parks it there, and reads the pipe itself (again through `pidfd_getfd`) until every writer has closed it. Then it detaches `cat`, whose read sees end of file and exits.
+
+Nothing is lost or repeated: the bytes `cat` had already read are written by `cat`, the bytes after them by the terminal, in that order. `make test-native-cat` runs a real shell on a pty: a 1.2 million line file must arrive every line once and in order, with the shell's next output after the last line; pipelines (`cat file | cat`, `producer | cat`, `producer | cat -`, three stages, a producer that comes in bursts or pauses for a second) must arrive complete and in order the same way; small output and options (`cat -u file`) must be left alone or arrive correct; and Ctrl-C while a hand-over is going on, for either form, must end it and leave the shell running. It declines before stopping anything when: there are options or more than one file, output is a pipe or a redirect, the file is under 1 MB or less than 256 KB of it is left, `cat` is not a direct child of the tab's shell, or the kernel refuses `pidfd_getfd` or `ptrace` (for example under a strict `ptrace_scope` or a container's seccomp profile), or `cat` does not reach a `read(0)` within 3 seconds. In all those cases the output goes through the pty as it always did, so the result is the same, only slower.
+
+It is on by default and a toggle: View > Fast cat in local tabs (saved in the settings), or `--no-fastcat` to turn it off everywhere. SSH tabs never use it. Every tab gets a random secret that the in-band request must carry, so a remote host over SSH, or the contents of any file, cannot make Lestrix read local files; only regular files are read. Measured end to end (256 MB of random text, `cat` typed into a local tab, 3 runs): 0.32 - 0.38 s with the built-in path, against 6.2 - 7.1 s with `--no-fastcat`. Pipelines, 14 MB of numbered lines through the test harness: `cat file | cat` 1.08 s -> 0.30 s, `awk ... | cat` 1.45 s -> 0.46 s (the gain grows with the size; the pty is capped at about 35 MB/s).
+
+### Cache statistics on demand
+
+The overlay shows the glyph and row caches as rates over the last second. For the totals since start, three ways (they work in every mode, including `--basic` where there is no overlay):
+
+- **`Ctrl+Shift+I`** (remappable, see below), or View > Cache statistics: a dialog with the glyph atlas (glyphs cached, ASCII slots filled out of 512, texture size, how many times it was cleared), the glyph cache (hits, misses, hit rate, entries dropped by atlas clears), the row cache (hits, misses, hit rate, rows rebuilt in place) and the scrollback of the current tab (lines, memory, disk, decoded cache).
+
+The shortcut does not collide with fleetwm's defaults (the compositor's only global `Ctrl+Shift` combination is the Task Manager on `Ctrl+Shift+Esc`; the frame-time overlay is on `Alt+Shift+I` and `Ctrl+Alt+I`). To move it, edit `~/.config/lestrix/settings.ini`, which gets a `[keys]` section the first time Lestrix saves its settings:
 
 ```
-lxcat big.log            # same output as cat, 3-4x faster on big files
-some-command | lxcat
+[keys]
+cache_stats=ctrl+shift+i
 ```
 
-In local Lestrix tabs plain `cat file` and `x | cat` use it automatically (View > Fast cat in local tabs): Lestrix puts a `cat` that points at `lxcat` first on `PATH` and, for bash, exports a `cat` function so it still works when a startup file rewrites `PATH`. Anything with options (`cat -n`, `-A`, ...) is passed to the real `cat`, and when output is not a terminal it simply copies, so scripts behave the same. Piped input is handed over in 8 MB chunks as it arrives (`tail -f x | cat` still shows lines live, and at most two chunks wait in memory).
+The syntax is the one of fleetwm's `keybinds.toml`: modifiers `super` (also `logo`, `win`, `meta`), `alt`, `ctrl` (or `control`) and `shift`, then a key name (`i`, `F9`, `Escape`, ...); the pressed modifiers must match exactly. `off` or an empty value switches the shortcut off; the View menu entry and the command-line ways below keep working, and the menu shows the key you set. It is read when Lestrix starts.
 
-It is built to be safe: every tab gets a random secret in `$LESTRIX_FASTCAT` that the escape sequence must carry, so a remote host over SSH, or any file's contents, cannot make Lestrix read local files; only regular files are read (no devices, pipes or sockets); SSH tabs have it switched off; and `--no-fastcat` turns it off everywhere. A unit test checks the refusals. It is not a replacement for `cat` in the cross-terminal benchmark (other terminals cannot do it), so the table lists it as a separate Lestrix row.
+- **`kill -USR1 $(pidof lestrix)`**: prints the same text to the standard error of the running Lestrix, handy from a script or another terminal.
+- **`lestrix --cache-stats`**: prints it to the terminal you started Lestrix from when Lestrix exits.
 
 ### What the overlay shows
 
@@ -361,6 +438,14 @@ Run `make test` in `native/` for the core, compressor and parser tests under ASa
 | Copy selection / copy entire scrollback | the buttons at the right end of the tab strip |
 
 Command line: `lestrix --local`, `lestrix -e htop`, `lestrix --working-directory ~/src --local`.
+
+Three window modes, each with its own menu entry and window class so a window manager can tell them apart:
+
+| Mode | Start with | What you get |
+|---|---|---|
+| Full | `lestrix` | menu bar, tabs, sidebar with sessions and the file browser, performance bar |
+| Lite | `lestrix --lite` | the terminal with the menu bar and tabs, no sidebar and no performance bar; fps, cpu and cache stats go in the title bar |
+| Basic | `lestrix --basic` | one bare terminal like a classic terminal window: no menu bar, no tabs, no copy/paste buttons, no sidebar, no stats. The program's own title (what the shell sets) is the window title, the window closes when the shell exits, `Ctrl+Shift+C` / `Ctrl+Shift+V` and the mouse still copy and paste, `Ctrl+=` / `Ctrl+-` still change the font size, and every other key goes to the program. Also installed as "Lestrix Basic" in the application menu |
 
 Connections are stored in `~/.config/lestrix/connections.json` (permissions `600`). No passwords are saved: ssh asks in the terminal, or uses your key and agent.
 

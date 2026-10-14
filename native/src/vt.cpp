@@ -1,0 +1,2649 @@
+/*
+ * Copyright (c) 2026 BeanGreen247
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "vt.h"
+#ifdef __SSE2__
+#include <sys/prctl.h>
+#include <emmintrin.h>
+#endif
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#define VT_NEON 1
+#endif
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <time.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+#include <atomic>
+#include <new>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "lz.h"
+
+#define MAX_PARAMS 24
+#define OSC_MAX 4096
+#define MAX_STYLES (1u << 20)
+#define MAX_COMBS 2047
+
+typedef enum { ST_GROUND, ST_ESC, ST_CSI, ST_OSC, ST_OSC_ESC, ST_STR, ST_STR_ESC, ST_CHARSET, ST_SKIP1 } State;
+enum { CS_US = 0, CS_GRAPHICS = 1 };
+
+typedef struct {
+    VtCell *cells;
+    VtLineMeta *meta;
+    int *order;
+    uint8_t *sh;
+} Scr;
+
+typedef struct HSeg {
+    uint8_t *buf;
+    VtCell *cells;
+    size_t used, cap;
+    uint8_t *bytes, *bbuf;
+    size_t bused, bcap;
+    int lines, live;
+} HSeg;
+typedef struct { VtLineMeta meta; VtCell *cells; HSeg *seg; const uint8_t *cb; uint32_t csf; int len; int promoted; } HEnt;
+
+typedef struct {
+    int x, y;
+    uint32_t fg, bg;
+    uint16_t attrs;
+    uint8_t g[2], gl;
+} Saved;
+
+#define BLOCK_LINES 128
+#define COMPACT_HDR (6 * BLOCK_LINES)
+#define HOT_KEEP 1024
+#define CACHE_ENTRIES 6
+#define PENDING_MAX ((size_t)8 << 20)
+#define DEFER_MAX ((size_t)16 << 20)
+#define DEFAULT_RAM_BUDGET ((size_t)32 << 20)
+#define DEFAULT_DISK_BUDGET ((size_t)4 << 30)
+
+typedef struct Job {
+    std::atomic<int> refs, done;
+    uint8_t *raw; size_t raw_size;
+    uint8_t *out; size_t out_size;
+    int stored;
+    int nlines;
+    int plain;
+    struct Job *qnext;
+} Job;
+
+typedef struct {
+    uint64_t id;
+    int nlines;
+    uint32_t raw_size, comp_size;
+    uint8_t *data;
+    int64_t disk_off;
+    int stored;
+    int shuffled;
+    int deferred;
+    int v2;
+    Job *job;
+} Block;
+
+typedef struct {
+    uint64_t id;
+    int nlines;
+    VtCell *cells;
+    int off[BLOCK_LINES + 1];
+    VtLineMeta meta[BLOCK_LINES];
+    uint64_t stamp;
+} CacheEntry;
+
+
+struct Vt {
+    HSeg *hseg;
+    int cols, rows;
+    Scr main, alt, *cur;
+    int max_lines;
+    HEnt *hist;
+    int hcap, hhead, hcount;
+    int hmask;
+    size_t hot_bytes;
+    Block *blocks;
+    int bcap, bhead, bcount;
+    long block_lines;
+    uint64_t next_block_id;
+    size_t ram_budget, disk_budget, packed_bytes, pending_bytes, disk_bytes, raw_total;
+    int compact_ok, compact_probe, esc_scan;
+    bool force_nl, stream_nl;
+    int pending_blocks, defer_n;
+    size_t defer_bytes;
+    bool spill;
+    int spill_fd;
+    int64_t spill_end;
+    uint64_t spill_next_id;
+    CacheEntry *cache[CACHE_ENTRIES];
+    uint64_t cache_clock;
+
+    int cx, cy;
+    uint32_t pen_fg, pen_bg;
+    uint16_t pen_attrs;
+    uint32_t pen_style, erase_style;
+    uint32_t sc_fg[64], sc_bg[64], sc_id[64]; uint16_t sc_attr[64];
+    bool erase_valid;
+    int top, bottom;
+    uint32_t modes;
+    uint8_t *tabs;
+    Saved saved_main, saved_alt, saved_1049;
+    uint8_t g[2], gl;
+    int cursor_style;
+    uint32_t last_cp;
+
+    VtStyle *styles;
+    uint32_t nstyles, cstyles;
+    uint32_t *style_hash;
+    uint32_t hash_mask;
+    uint32_t combs[MAX_COMBS + 1];
+    unsigned ncombs;
+
+    State st;
+    int utf_need;
+    uint32_t utf_cp;
+    int par[MAX_PARAMS];
+    uint8_t sub[MAX_PARAMS];
+    int np;
+    bool have_digit;
+    char priv, inter;
+    int charset_slot;
+    char osc[OSC_MAX + 1];
+    int osc_len;
+
+    VtWriteFn write_fn;
+    VtEventFn event_fn;
+    char stream_token[40];
+    bool stream_pending;
+    char stream_path[OSC_MAX + 1];
+    uint64_t stream_off, stream_len;
+    double rate_bulk, rate_serial;
+    unsigned batch_no;
+    bool bulk_warm;
+    unsigned stream_flags;
+    VtCacheFree cache_free;
+    void *user;
+};
+
+typedef struct { uint32_t lo, hi; } Range;
+
+static const Range ZERO_WIDTH[] = {
+    {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD}, {0x05BF, 0x05BF}, {0x05C1, 0x05C2}, {0x05C4, 0x05C5},
+    {0x0610, 0x061A}, {0x064B, 0x065F}, {0x0670, 0x0670}, {0x06D6, 0x06DC}, {0x06DF, 0x06E4}, {0x0711, 0x0711},
+    {0x0730, 0x074A}, {0x0900, 0x0902}, {0x093C, 0x093C}, {0x0941, 0x0948}, {0x094D, 0x094D}, {0x0E31, 0x0E31},
+    {0x0E34, 0x0E3A}, {0x0E47, 0x0E4E}, {0x1AB0, 0x1AFF}, {0x1DC0, 0x1DFF}, {0x200B, 0x200F}, {0x2028, 0x202E},
+    {0x2060, 0x2064}, {0x20D0, 0x20FF}, {0x302A, 0x302D}, {0x3099, 0x309A}, {0xFE00, 0xFE0F}, {0xFE20, 0xFE2F},
+    {0xFEFF, 0xFEFF}, {0xE0100, 0xE01EF},
+};
+static const Range WIDE[] = {
+    {0x1100, 0x115F}, {0x231A, 0x231B}, {0x2329, 0x232A}, {0x23E9, 0x23EC}, {0x23F0, 0x23F0}, {0x23F3, 0x23F3},
+    {0x25FD, 0x25FE}, {0x2614, 0x2615}, {0x2648, 0x2653}, {0x267F, 0x267F}, {0x2693, 0x2693}, {0x26A1, 0x26A1},
+    {0x26AA, 0x26AB}, {0x26BD, 0x26BE}, {0x26C4, 0x26C5}, {0x26CE, 0x26CE}, {0x26D4, 0x26D4}, {0x26EA, 0x26EA},
+    {0x26F2, 0x26F3}, {0x26F5, 0x26F5}, {0x26FA, 0x26FA}, {0x26FD, 0x26FD}, {0x2705, 0x2705}, {0x270A, 0x270B},
+    {0x2728, 0x2728}, {0x274C, 0x274C}, {0x274E, 0x274E}, {0x2753, 0x2755}, {0x2757, 0x2757}, {0x2795, 0x2797},
+    {0x27B0, 0x27B0}, {0x27BF, 0x27BF}, {0x2B1B, 0x2B1C}, {0x2B50, 0x2B50}, {0x2B55, 0x2B55}, {0x2E80, 0x303E},
+    {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xA000, 0xA4CF}, {0xA960, 0xA97F}, {0xAC00, 0xD7A3},
+    {0xF900, 0xFAFF}, {0xFE10, 0xFE19}, {0xFE30, 0xFE6F}, {0xFF00, 0xFF60}, {0xFFE0, 0xFFE6}, {0x16FE0, 0x16FE4},
+    {0x17000, 0x18AFF}, {0x1B000, 0x1B2FF}, {0x1F004, 0x1F004}, {0x1F0CF, 0x1F0CF}, {0x1F18E, 0x1F18E},
+    {0x1F191, 0x1F19A}, {0x1F200, 0x1F320}, {0x1F32D, 0x1F335}, {0x1F337, 0x1F37C}, {0x1F37E, 0x1F393},
+    {0x1F3A0, 0x1F3CA}, {0x1F3CF, 0x1F3D3}, {0x1F3E0, 0x1F3F0}, {0x1F3F4, 0x1F3F4}, {0x1F3F8, 0x1F43E},
+    {0x1F440, 0x1F440}, {0x1F442, 0x1F4FC}, {0x1F4FF, 0x1F53D}, {0x1F54B, 0x1F54E}, {0x1F550, 0x1F567},
+    {0x1F57A, 0x1F57A}, {0x1F595, 0x1F596}, {0x1F5A4, 0x1F5A4}, {0x1F5FB, 0x1F64F}, {0x1F680, 0x1F6C5},
+    {0x1F6CC, 0x1F6CC}, {0x1F6D0, 0x1F6D2}, {0x1F6D5, 0x1F6D7}, {0x1F6EB, 0x1F6EC}, {0x1F6F4, 0x1F6FC},
+    {0x1F7E0, 0x1F7EB}, {0x1F90C, 0x1F93A}, {0x1F93C, 0x1F945}, {0x1F947, 0x1F9FF}, {0x1FA70, 0x1FAFF},
+    {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
+};
+
+static bool in_table(uint32_t cp, const Range *tab, size_t n) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cp < tab[mid].lo) hi = mid;
+        else if (cp > tab[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+int vt_wcwidth(uint32_t cp) {
+    if (cp == 0) return 0;
+    if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return -1;
+    if (cp < 0x300) return 1;
+    if (in_table(cp, ZERO_WIDTH, sizeof ZERO_WIDTH / sizeof *ZERO_WIDTH)) return 0;
+    if (cp >= 0x1100 && in_table(cp, WIDE, sizeof WIDE / sizeof *WIDE)) return 2;
+    return 1;
+}
+
+
+
+static inline uint32_t hash_style(uint32_t fg, uint32_t bg, uint16_t attrs) {
+    uint32_t h = fg * 2654435761u;
+    h ^= bg + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= attrs * 40503u;
+    h ^= h >> 15;
+    return h;
+}
+
+static void style_table_init(Vt *t) {
+    t->cstyles = 64;
+    t->styles = static_cast<VtStyle*>(calloc(t->cstyles, sizeof(VtStyle)));
+    t->nstyles = 1;
+    t->hash_mask = 127;
+    t->style_hash = static_cast<uint32_t*>(calloc(t->hash_mask + 1, sizeof(uint32_t)));
+}
+
+static uint32_t intern_style(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
+    if (!fg && !bg && !attrs) return 0;
+    uint32_t i = hash_style(fg, bg, attrs) & t->hash_mask;
+    while (t->style_hash[i]) {
+        const VtStyle *s = &t->styles[t->style_hash[i]];
+        if (s->fg == fg && s->bg == bg && s->attrs == attrs) return t->style_hash[i];
+        i = (i + 1) & t->hash_mask;
+    }
+    if (t->nstyles >= MAX_STYLES) return 0;
+    if (t->nstyles == t->cstyles) {
+        t->cstyles *= 2;
+        t->styles = static_cast<VtStyle*>(realloc(t->styles, t->cstyles * sizeof(VtStyle)));
+    }
+    uint32_t id = t->nstyles++;
+    t->styles[id] = (VtStyle){fg, bg, attrs};
+    if (t->nstyles * 2 > t->hash_mask) {
+        uint32_t nm = (t->hash_mask + 1) * 2 - 1;
+        uint32_t *nh = static_cast<uint32_t*>(calloc(nm + 1, sizeof(uint32_t)));
+        for (uint32_t k = 1; k < t->nstyles; k++) {
+            uint32_t j = hash_style(t->styles[k].fg, t->styles[k].bg, t->styles[k].attrs) & nm;
+            while (nh[j]) j = (j + 1) & nm;
+            nh[j] = k;
+        }
+        free(t->style_hash);
+        t->style_hash = nh;
+        t->hash_mask = nm;
+    } else {
+        t->style_hash[i] = id;
+        return id;
+    }
+    return id;
+}
+
+static inline uint32_t intern_cached(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
+    uint32_t k = ((fg * 0x9e3779b1u) ^ (bg * 0x85ebca6bu) ^ ((uint32_t)attrs * 0xc2b2ae35u)) >> 26;
+    if (t->sc_id[k] && t->sc_fg[k] == fg && t->sc_bg[k] == bg && t->sc_attr[k] == attrs) return t->sc_id[k];
+    uint32_t id = intern_style(t, fg, bg, attrs);
+    if (id) { t->sc_fg[k] = fg; t->sc_bg[k] = bg; t->sc_attr[k] = attrs; t->sc_id[k] = id; }
+    return id;
+}
+
+static inline void pen_commit(Vt *t) {
+    t->pen_style = (t->pen_fg | t->pen_bg | t->pen_attrs) ? intern_cached(t, t->pen_fg, t->pen_bg, t->pen_attrs) : 0;
+    t->erase_valid = false;
+}
+
+static inline uint32_t erase_style(Vt *t) {
+    if (!t->erase_valid) { t->erase_style = t->pen_bg ? intern_cached(t, 0, t->pen_bg, 0) : 0; t->erase_valid = true; }
+    return t->erase_style;
+}
+
+const VtStyle *vt_style(const Vt *t, uint32_t id) { return id < t->nstyles ? &t->styles[id] : &t->styles[0]; }
+uint32_t vt_comb_char(const Vt *t, unsigned idx) { return idx && idx <= t->ncombs ? t->combs[idx] : 0; }
+
+static unsigned comb_index(Vt *t, uint32_t cp) {
+    for (unsigned i = 1; i <= t->ncombs; i++) if (t->combs[i] == cp) return i;
+    if (t->ncombs >= MAX_COMBS) return 0;
+    t->combs[++t->ncombs] = cp;
+    return t->ncombs;
+}
+
+static void scr_alloc(Scr *s, int cols, int rows) {
+    s->cells = static_cast<VtCell*>(calloc((size_t)cols * (size_t)rows, sizeof(VtCell)));
+    s->meta = static_cast<VtLineMeta*>(calloc((size_t)rows, sizeof(VtLineMeta)));
+    s->order = static_cast<int*>(malloc((size_t)rows * sizeof(int)));
+    s->sh = static_cast<uint8_t*>(malloc((size_t)cols * (size_t)rows));
+    for (int i = 0; i < rows; i++) { s->order[i] = i; s->meta[i].dirty = 1; }
+}
+
+static void scr_release_caches(Vt *t, Scr *s, int rows) {
+    if (!s->meta) return;
+    for (int i = 0; i < rows; i++) {
+        if (s->meta[i].cache && t->cache_free) t->cache_free(s->meta[i].cache, t->user);
+        s->meta[i].cache = NULL;
+    }
+}
+
+static void scr_free(Vt *t, Scr *s, int rows) {
+    scr_release_caches(t, s, rows);
+    free(s->cells); free(s->meta); free(s->order); free(s->sh);
+    memset(s, 0, sizeof *s);
+}
+
+static inline VtCell *rowp(Vt *t, int y) { return t->cur->cells + (size_t)t->cur->order[y] * (size_t)t->cols; }
+static inline VtLineMeta *rowm(Vt *t, int y) { return &t->cur->meta[t->cur->order[y]]; }
+static inline void dirty(Vt *t, int y) { rowm(t, y)->dirty = 1; }
+
+static inline VtCell fill_cell(Vt *t) { VtCell c = {0, erase_style(t) << 8}; return c; }
+
+static void clear_cells(Vt *t, VtCell *p, int n) {
+    VtCell f = fill_cell(t);
+    for (int i = 0; i < n; i++) p[i] = f;
+}
+
+static inline void touch_row(Vt *t, int y) {
+    VtLineMeta *m = rowm(t, y);
+    m->dirty = 1;
+    m->hw = (uint16_t)t->cols;
+}
+
+static void clear_row(Vt *t, int y) {
+    VtLineMeta *m = rowm(t, y);
+    VtCell *r = rowp(t, y);
+    if (erase_style(t) == 0) {
+        size_t hw = m->hw;
+        if (hw <= 32) {
+            size_t i = 0;
+#ifdef __SSE2__
+            for (; i + 2 <= hw; i += 2) { _mm_storeu_si128((__m128i *)(r + i), _mm_setzero_si128()); __asm__ volatile("" ::: "memory"); }
+#endif
+            for (; i < hw; i++) { r[i].cp = 0; r[i].sf = 0; __asm__ volatile("" ::: "memory"); }
+        } else memset(r, 0, hw * sizeof(VtCell));
+        m->hw = 0;
+    } else {
+        clear_cells(t, r, t->cols);
+        m->hw = (uint16_t)t->cols;
+    }
+    m->dirty = 1;
+}
+
+static long total_lines(const Vt *t) { return (long)t->hcount + t->block_lines; }
+
+static HSeg *seg_new(Vt *t) {
+    size_t cap = (size_t)BLOCK_LINES * (size_t)t->cols;
+    HSeg *g = static_cast<HSeg*>(malloc(sizeof *g));
+    uint8_t *buf = g ? static_cast<uint8_t*>(malloc(2 * (size_t)BLOCK_LINES + cap * sizeof(VtCell))) : NULL;
+    if (!buf) { free(g); return NULL; }
+    g->buf = buf; g->cells = (VtCell *)(buf + 2 * (size_t)BLOCK_LINES); g->used = 0; g->cap = cap; g->lines = g->live = 0;
+    g->bytes = g->bbuf = NULL; g->bused = 0; g->bcap = 0;
+    return g;
+}
+
+static inline void fill_ascii(VtCell *dst, const uint8_t *p, size_t k, uint32_t sf);
+
+static void seg_line_gone(Vt *t, HSeg *g) {
+    if (--g->live > 0) return;
+    if (g == t->hseg) { g->used = 0; g->lines = 0; g->bused = 0; return; }
+    free(g->buf); free(g->bbuf); free(g);
+}
+
+static size_t hent_bytes(const HEnt *e) {
+    return sizeof(HEnt) + (e->cb ? (size_t)e->len : (size_t)e->len * sizeof(VtCell)) + (e->promoted ? (size_t)e->len * sizeof(VtCell) : 0);
+}
+
+static void hist_release(Vt *t, HEnt *e) {
+    if (e->meta.cache && t->cache_free) t->cache_free(e->meta.cache, t->user);
+    t->hot_bytes -= hent_bytes(e);
+    if (e->promoted) free(e->cells);
+    seg_line_gone(t, e->seg);
+}
+
+static int cfg_parse_workers = -1, cfg_compress_workers = -1;
+
+static struct { pthread_mutex_t m; pthread_cond_t c; Job *head, *tail; int started, idle, qlen; } pool = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0};
+
+static void job_unref(Job *j) {
+    if (j->refs.fetch_sub(1) == 1) { free(j->raw); free(j->out); delete j; }
+}
+
+static uint8_t *shuffle_block(const uint8_t *raw, size_t raw_size, int nlines) {
+    uint8_t *sh = static_cast<uint8_t*>(malloc(raw_size ? raw_size : 1));
+    if (!sh) return NULL;
+    size_t head = 2 * (size_t)nlines, ncells = (raw_size - head) / 8;
+    memcpy(sh, raw, head);
+    const uint8_t *cells = raw + head;
+    uint8_t *planes = sh + head;
+    size_t c = 0;
+#ifdef __SSE2__
+    for (; c + 8 <= ncells; c += 8) {
+        const uint8_t *src = cells + 8 * c;
+        __m128i r0 = _mm_loadl_epi64((const __m128i *)(src)), r1 = _mm_loadl_epi64((const __m128i *)(src + 8)),
+                r2 = _mm_loadl_epi64((const __m128i *)(src + 16)), r3 = _mm_loadl_epi64((const __m128i *)(src + 24)),
+                r4 = _mm_loadl_epi64((const __m128i *)(src + 32)), r5 = _mm_loadl_epi64((const __m128i *)(src + 40)),
+                r6 = _mm_loadl_epi64((const __m128i *)(src + 48)), r7 = _mm_loadl_epi64((const __m128i *)(src + 56));
+        __m128i a0 = _mm_unpacklo_epi8(r0, r1), a1 = _mm_unpacklo_epi8(r2, r3), a2 = _mm_unpacklo_epi8(r4, r5), a3 = _mm_unpacklo_epi8(r6, r7);
+        __m128i b0 = _mm_unpacklo_epi16(a0, a1), b1 = _mm_unpackhi_epi16(a0, a1), c0 = _mm_unpacklo_epi16(a2, a3), c1 = _mm_unpackhi_epi16(a2, a3);
+        __m128i p01 = _mm_unpacklo_epi32(b0, c0), p23 = _mm_unpackhi_epi32(b0, c0), p45 = _mm_unpacklo_epi32(b1, c1), p67 = _mm_unpackhi_epi32(b1, c1);
+        _mm_storel_epi64((__m128i *)(planes + 0 * ncells + c), p01); _mm_storel_epi64((__m128i *)(planes + 1 * ncells + c), _mm_srli_si128(p01, 8));
+        _mm_storel_epi64((__m128i *)(planes + 2 * ncells + c), p23); _mm_storel_epi64((__m128i *)(planes + 3 * ncells + c), _mm_srli_si128(p23, 8));
+        _mm_storel_epi64((__m128i *)(planes + 4 * ncells + c), p45); _mm_storel_epi64((__m128i *)(planes + 5 * ncells + c), _mm_srli_si128(p45, 8));
+        _mm_storel_epi64((__m128i *)(planes + 6 * ncells + c), p67); _mm_storel_epi64((__m128i *)(planes + 7 * ncells + c), _mm_srli_si128(p67, 8));
+    }
+#endif
+#ifdef VT_NEON
+    for (; c + 8 <= ncells; c += 8) {
+        const uint8_t *src = cells + 8 * c;
+        uint8x8_t r0 = vld1_u8(src), r1 = vld1_u8(src + 8), r2 = vld1_u8(src + 16), r3 = vld1_u8(src + 24),
+                  r4 = vld1_u8(src + 32), r5 = vld1_u8(src + 40), r6 = vld1_u8(src + 48), r7 = vld1_u8(src + 56);
+        uint8x8x2_t t01 = vtrn_u8(r0, r1), t23 = vtrn_u8(r2, r3), t45 = vtrn_u8(r4, r5), t67 = vtrn_u8(r6, r7);
+        uint16x4x2_t u02 = vtrn_u16(vreinterpret_u16_u8(t01.val[0]), vreinterpret_u16_u8(t23.val[0]));
+        uint16x4x2_t u13 = vtrn_u16(vreinterpret_u16_u8(t01.val[1]), vreinterpret_u16_u8(t23.val[1]));
+        uint16x4x2_t u46 = vtrn_u16(vreinterpret_u16_u8(t45.val[0]), vreinterpret_u16_u8(t67.val[0]));
+        uint16x4x2_t u57 = vtrn_u16(vreinterpret_u16_u8(t45.val[1]), vreinterpret_u16_u8(t67.val[1]));
+        uint32x2x2_t v04 = vtrn_u32(vreinterpret_u32_u16(u02.val[0]), vreinterpret_u32_u16(u46.val[0]));
+        uint32x2x2_t v15 = vtrn_u32(vreinterpret_u32_u16(u13.val[0]), vreinterpret_u32_u16(u57.val[0]));
+        uint32x2x2_t v26 = vtrn_u32(vreinterpret_u32_u16(u02.val[1]), vreinterpret_u32_u16(u46.val[1]));
+        uint32x2x2_t v37 = vtrn_u32(vreinterpret_u32_u16(u13.val[1]), vreinterpret_u32_u16(u57.val[1]));
+        vst1_u8(planes + 0 * ncells + c, vreinterpret_u8_u32(v04.val[0]));
+        vst1_u8(planes + 1 * ncells + c, vreinterpret_u8_u32(v15.val[0]));
+        vst1_u8(planes + 2 * ncells + c, vreinterpret_u8_u32(v26.val[0]));
+        vst1_u8(planes + 3 * ncells + c, vreinterpret_u8_u32(v37.val[0]));
+        vst1_u8(planes + 4 * ncells + c, vreinterpret_u8_u32(v04.val[1]));
+        vst1_u8(planes + 5 * ncells + c, vreinterpret_u8_u32(v15.val[1]));
+        vst1_u8(planes + 6 * ncells + c, vreinterpret_u8_u32(v26.val[1]));
+        vst1_u8(planes + 7 * ncells + c, vreinterpret_u8_u32(v37.val[1]));
+    }
+#endif
+    for (; c < ncells; c++) {
+        const uint8_t *src = cells + 8 * c;
+        for (int pl = 0; pl < 8; pl++) planes[(size_t)pl * ncells + c] = src[pl];
+    }
+    return sh;
+}
+
+static void job_run(Job *j) {
+    uint8_t *sh = j->plain ? NULL : shuffle_block(j->raw, j->raw_size, j->nlines);
+    const uint8_t *src = j->plain ? j->raw : sh;
+    uint8_t *out = src ? static_cast<uint8_t*>(malloc(sd_lz_bound(j->raw_size))) : NULL;
+    size_t n = out ? sd_lz_compress(src, j->raw_size, out, sd_lz_bound(j->raw_size)) : 0;
+    free(sh);
+    if (n == 0 || n >= j->raw_size) { free(out); j->out = NULL; j->stored = 1; j->out_size = j->raw_size; }
+    else {
+        uint8_t *shrunk = static_cast<uint8_t*>(realloc(out, n));
+        j->out = shrunk ? shrunk : out;
+        j->out_size = n;
+    }
+    j->done.store(1, std::memory_order_release);
+    job_unref(j);
+}
+
+static void *pool_worker(void *arg) {
+    prctl(PR_SET_NAME, "lx-compress", 0, 0, 0);
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&pool.m);
+        while (!pool.head) { pool.idle++; pthread_cond_wait(&pool.c, &pool.m); pool.idle--; }
+        Job *j = pool.head;
+        pool.head = j->qnext;
+        if (!pool.head) pool.tail = NULL;
+        pool.qlen--;
+        pthread_mutex_unlock(&pool.m);
+        job_run(j);
+    }
+    return NULL;
+}
+static void pool_submit(Job *j) {
+    static int nopool = -1;
+    if (nopool < 0) nopool = getenv("SD_NOPOOL") != NULL;
+    if (nopool) { job_run(j); return; }
+    j->qnext = NULL;
+    pthread_mutex_lock(&pool.m);
+    if (!pool.started) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN) / 4;
+        if (n < 2) n = 2;
+        if (n > 8) n = 8;
+        if (cfg_compress_workers >= 0) n = cfg_compress_workers > 16 ? 16 : cfg_compress_workers;
+        for (long i = 0; i < n; i++) {
+            pthread_t th;
+            pthread_attr_t at;
+            pthread_attr_init(&at);
+            pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            pthread_attr_setstacksize(&at, 256 * 1024);
+            if (pthread_create(&th, &at, pool_worker, NULL) == 0) pool.started++;
+            pthread_attr_destroy(&at);
+        }
+        if (!pool.started) pool.started = -1;
+    }
+    int usable = pool.started > 0;
+    if (usable) {
+        if (pool.tail) pool.tail->qnext = j; else pool.head = j;
+        pool.tail = j;
+        pool.qlen++;
+        if (pool.idle > 0 && pool.qlen >= 4) pthread_cond_broadcast(&pool.c);
+    }
+    pthread_mutex_unlock(&pool.m);
+    if (!usable) job_run(j);
+}
+
+static inline Block *blk(const Vt *t, int i) { return &t->blocks[(t->bhead + i) & (t->bcap - 1)]; }
+
+static void block_apply(Vt *t, Block *b) {
+    Job *j = b->job;
+    if (!j || !j->done.load(std::memory_order_acquire)) return;
+    t->pending_bytes -= b->raw_size;
+    t->pending_blocks--;
+    if (j->stored) { b->data = j->raw; j->raw = NULL; b->comp_size = b->raw_size; b->stored = 1; b->shuffled = 0; }
+    else { b->data = j->out; j->out = NULL; b->comp_size = (uint32_t)j->out_size; b->stored = 0; b->shuffled = !j->plain; }
+    t->packed_bytes += b->comp_size;
+    b->job = NULL;
+    job_unref(j);
+}
+
+static void blocks_poll(Vt *t) {
+    int left = t->pending_blocks;
+    for (int i = t->bcount - 1; i >= 0 && left > 0; i--) {
+        Block *b = blk(t, i);
+        if (!b->job) continue;
+        left--;
+        block_apply(t, b);
+    }
+}
+
+static void cache_drop_id(Vt *t, uint64_t id) {
+    for (int i = 0; i < CACHE_ENTRIES; i++) {
+        CacheEntry *e = t->cache[i];
+        if (!e || e->id != id) continue;
+        for (int k = 0; k < e->nlines; k++)
+            if (e->meta[k].cache && t->cache_free) t->cache_free(e->meta[k].cache, t->user);
+        free(e->cells); free(e);
+        t->cache[i] = NULL;
+    }
+}
+
+static void spill_close(Vt *t) { if (t->spill_fd >= 0) close(t->spill_fd); t->spill_fd = -1; t->spill_end = 0; }
+
+static void block_free_storage(Vt *t, Block *b) {
+    if (b->job) { t->pending_bytes -= b->raw_size; t->pending_blocks--; job_unref(b->job); b->job = NULL; }
+    if (b->data) { free(b->data); t->packed_bytes -= b->comp_size; b->data = NULL; }
+    if (b->disk_off >= 0) {
+#ifdef FALLOC_FL_PUNCH_HOLE
+        if (t->spill_fd >= 0) (void)fallocate(t->spill_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, b->disk_off, b->comp_size);
+#endif
+        t->disk_bytes -= b->comp_size;
+        b->disk_off = -1;
+    }
+}
+
+static void block_submit(Vt *t, Block *b) {
+    Job *j = b->job;
+    if (t->pending_bytes - t->defer_bytes > PENDING_MAX) {
+        job_run(j);
+        block_apply(t, b);
+        return;
+    }
+    pool_submit(j);
+}
+
+static void defer_flush(Vt *t, size_t limit) {
+    while (t->defer_n > 0 && t->defer_bytes > limit) {
+        Block *d = blk(t, t->bcount - t->defer_n);
+        d->deferred = 0;
+        t->defer_n--;
+        t->defer_bytes -= d->raw_size;
+        block_submit(t, d);
+    }
+}
+
+static void evict_oldest_block(Vt *t) {
+    if (!t->bcount) return;
+    Block *b = blk(t, 0);
+    if (b->deferred) {
+        b->deferred = 0;
+        t->defer_n--;
+        t->defer_bytes -= b->raw_size;
+        if (b->job) job_unref(b->job);
+    }
+    cache_drop_id(t, b->id);
+    block_free_storage(t, b);
+    t->raw_total -= b->raw_size;
+    t->block_lines -= b->nlines;
+    t->bhead = (t->bhead + 1) & (t->bcap - 1);
+    t->bcount--;
+    if (t->bcount == 0) { spill_close(t); t->bhead = 0; }
+}
+
+static int spill_open(Vt *t) {
+    if (t->spill_fd >= 0) return 0;
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (!dir || !*dir) dir = "/tmp";
+    int fd = -1;
+#ifdef O_TMPFILE
+    fd = open(dir, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+#endif
+    if (fd < 0) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s/lestrix-hist-XXXXXX", dir);
+        fd = mkstemp(path);
+        if (fd >= 0) { unlink(path); fcntl(fd, F_SETFD, FD_CLOEXEC); }
+    }
+    if (fd < 0) return -1;
+    t->spill_fd = fd;
+    t->spill_end = 0;
+    return 0;
+}
+
+static int block_spill(Vt *t, Block *b) {
+    if (b->job || !b->data || spill_open(t) != 0) return -1;
+    const uint8_t *p = b->data;
+    size_t left = b->comp_size;
+    int64_t off = t->spill_end;
+    while (left) {
+        ssize_t w = pwrite(t->spill_fd, p, left, off + (int64_t)(p - b->data));
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        p += w; left -= (size_t)w;
+    }
+    t->spill_end += b->comp_size;
+    free(b->data);
+    b->data = NULL;
+    b->disk_off = off;
+    t->packed_bytes -= b->comp_size;
+    t->disk_bytes += b->comp_size;
+    return 0;
+}
+
+static void enforce_limits(Vt *t) {
+    if (t->max_lines > 0)
+        while (total_lines(t) > t->max_lines) {
+            if (t->bcount) evict_oldest_block(t);
+            else if (t->hcount) {
+                hist_release(t, &t->hist[t->hhead]);
+                t->hhead = (t->hhead + 1) & t->hmask;
+                t->hcount--;
+            } else break;
+        }
+    while (t->bcount && t->packed_bytes + t->pending_bytes > t->ram_budget) {
+        if (t->spill && t->disk_bytes < t->disk_budget) {
+            if (t->spill_next_id < blk(t, 0)->id) t->spill_next_id = blk(t, 0)->id;
+            uint64_t idx = t->spill_next_id - blk(t, 0)->id;
+            if (idx >= (uint64_t)t->bcount) break;
+            Block *b = blk(t, (int)idx);
+            if (b->job) block_apply(t, b);
+            if (b->job || !b->data) break;
+            if (block_spill(t, b) != 0) { t->spill = false; continue; }
+            t->spill_next_id++;
+        } else {
+            evict_oldest_block(t);
+        }
+    }
+    while (t->bcount && t->disk_bytes > t->disk_budget) evict_oldest_block(t);
+}
+
+static inline void copy_cells(VtCell *dst, const VtCell *src, size_t len) {
+    if (len > 48) { memcpy(dst, src, len * sizeof(VtCell)); return; }
+    size_t i = 0;
+#ifdef __SSE2__
+    for (; i + 2 <= len; i += 2) { _mm_storeu_si128((__m128i *)(dst + i), _mm_loadu_si128((const __m128i *)(src + i))); __asm__ volatile("" ::: "memory"); }
+#endif
+    for (; i < len; i++) { dst[i] = src[i]; __asm__ volatile("" ::: "memory"); }
+}
+
+static void block_push(Vt *t, uint8_t *raw, size_t raw_size, Job *j, int n, int v2) {
+    if (t->bcount == t->bcap) {
+        int ncap = t->bcap ? t->bcap * 2 : 16;
+        Block *nb = static_cast<Block*>(malloc((size_t)ncap * sizeof(Block)));
+        if (!nb) { free(raw); delete j; return; }
+        for (int i = 0; i < t->bcount; i++) nb[i] = *blk(t, i);
+        free(t->blocks);
+        t->blocks = nb; t->bcap = ncap; t->bhead = 0;
+    }
+    Block *b = &t->blocks[(t->bhead + t->bcount) & (t->bcap - 1)];
+    memset(b, 0, sizeof *b);
+    b->id = t->next_block_id++;
+    b->nlines = n;
+    b->raw_size = (uint32_t)raw_size;
+    b->disk_off = -1;
+    j->refs.store(2, std::memory_order_relaxed);
+    j->done.store(0, std::memory_order_relaxed);
+    j->raw = raw; j->raw_size = raw_size; j->out = NULL; j->out_size = 0; j->stored = 0; j->nlines = n; j->plain = v2;
+    b->v2 = v2;
+    b->job = j;
+    t->bcount++;
+    t->block_lines += n;
+    t->raw_total += raw_size;
+    t->pending_bytes += raw_size;
+    t->pending_blocks++;
+    if (t->max_lines > 0) {
+        b->deferred = 1;
+        t->defer_n++;
+        t->defer_bytes += raw_size;
+        size_t lim = t->ram_budget / 2 < DEFER_MAX ? t->ram_budget / 2 : DEFER_MAX;
+        defer_flush(t, lim);
+        return;
+    }
+    block_submit(t, b);
+}
+
+static void pack_oldest_v2(Vt *t);
+
+static void pack_oldest(Vt *t) {
+    int n = BLOCK_LINES;
+    if (t->hcount < n) return;
+    blocks_poll(t);
+    {
+        HEnt *f = &t->hist[t->hhead], *l = &t->hist[(t->hhead + n - 1) & t->hmask];
+        HSeg *cg = f->seg;
+        if (f->cb && cg->bbuf && cg->lines == BLOCK_LINES && cg->live == BLOCK_LINES && l->seg == cg && cg != t->hseg && cg->used == 0 && f->cb == cg->bytes && l->cb + l->len == cg->bytes + cg->bused) {
+            Job *j3 = new (std::nothrow) Job;
+            if (j3) {
+                size_t raw_size = COMPACT_HDR + cg->bused;
+                uint8_t *small = static_cast<uint8_t*>(realloc(cg->bbuf, raw_size));
+                uint8_t *raw = small ? small : cg->bbuf;
+                for (int i = 0; i < n; i++) {
+                    HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
+                    unsigned lv = (unsigned)h->len | 0x8000u;
+                    raw[2 * i] = (uint8_t)lv;
+                    raw[2 * i + 1] = (uint8_t)(lv >> 8);
+                    memcpy(raw + 2 * (size_t)n + 4 * (size_t)i, &h->csf, 4);
+                }
+                cg->bbuf = NULL; cg->bytes = NULL;
+                for (int i = 0; i < n; i++) hist_release(t, &t->hist[(t->hhead + i) & t->hmask]);
+                t->hhead = (t->hhead + n) & t->hmask;
+                t->hcount -= n;
+                block_push(t, raw, raw_size, j3, n, 2);
+                return;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) if (t->hist[(t->hhead + i) & t->hmask].cb) { pack_oldest_v2(t); return; }
+    HEnt *first = &t->hist[t->hhead], *last = &t->hist[(t->hhead + n - 1) & t->hmask];
+    HSeg *g = first->seg;
+    bool whole = g->lines == BLOCK_LINES && g->live == BLOCK_LINES && last->seg == g && first->cells == g->cells && g != t->hseg && !g->bytes;
+    size_t ncells = 0;
+    if (whole) ncells = g->used;
+    else for (int i = 0; i < n; i++) ncells += (size_t)t->hist[(t->hhead + i) & t->hmask].len;
+    size_t raw_size = 2 * (size_t)n + 8 * ncells;
+    uint8_t *raw = whole ? g->buf : static_cast<uint8_t*>(malloc(raw_size));
+    Job *j = new (std::nothrow) Job;
+    if (!raw || !j || raw_size > UINT32_MAX) {
+        if (!whole) free(raw);
+        delete j;
+        hist_release(t, &t->hist[t->hhead]);
+        t->hhead = (t->hhead + 1) & t->hmask;
+        t->hcount--;
+        return;
+    }
+    uint8_t *lens = raw, *cells = raw + 2 * (size_t)n;
+    for (int i = 0; i < n; i++) {
+        HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
+        lens[2 * i] = (uint8_t)h->len;
+        lens[2 * i + 1] = (uint8_t)((unsigned)h->len >> 8);
+        if (!whole) { copy_cells((VtCell *)cells, h->cells, (size_t)h->len); cells += (size_t)h->len * sizeof(VtCell); }
+    }
+    if (whole) {
+        uint8_t *small = static_cast<uint8_t*>(realloc(raw, raw_size));
+        if (small) raw = small;
+        g->buf = NULL;
+        free(g);
+        for (int i = 0; i < n; i++) {
+            HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
+            if (h->meta.cache && t->cache_free) t->cache_free(h->meta.cache, t->user);
+            t->hot_bytes -= sizeof(HEnt) + (size_t)h->len * sizeof(VtCell);
+        }
+    } else for (int i = 0; i < n; i++) hist_release(t, &t->hist[(t->hhead + i) & t->hmask]);
+    t->hhead = (t->hhead + n) & t->hmask;
+    t->hcount -= n;
+
+    block_push(t, raw, raw_size, j, n, 0);
+}
+
+static void pack_oldest_v2(Vt *t) {
+    int n = BLOCK_LINES;
+    size_t raw_size = 2 * (size_t)n;
+    for (int i = 0; i < n; i++) {
+        HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
+        raw_size += h->cb ? 4 + (size_t)h->len : 8 * (size_t)h->len;
+    }
+    uint8_t *raw = raw_size <= UINT32_MAX ? static_cast<uint8_t*>(malloc(raw_size)) : NULL;
+    Job *j = new (std::nothrow) Job;
+    if (!raw || !j) {
+        free(raw);
+        delete j;
+        hist_release(t, &t->hist[t->hhead]);
+        t->hhead = (t->hhead + 1) & t->hmask;
+        t->hcount--;
+        return;
+    }
+    uint8_t *lens = raw, *w = raw + 2 * (size_t)n;
+    for (int i = 0; i < n; i++) {
+        HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
+        unsigned l = (unsigned)h->len | (h->cb ? 0x8000u : 0u);
+        lens[2 * i] = (uint8_t)l;
+        lens[2 * i + 1] = (uint8_t)(l >> 8);
+        if (h->cb) {
+            memcpy(w, &h->csf, 4);
+            memcpy(w + 4, h->cb, (size_t)h->len);
+            w += 4 + (size_t)h->len;
+        } else {
+            memcpy(w, h->cells, (size_t)h->len * sizeof(VtCell));
+            w += (size_t)h->len * sizeof(VtCell);
+        }
+    }
+    for (int i = 0; i < n; i++) hist_release(t, &t->hist[(t->hhead + i) & t->hmask]);
+    t->hhead = (t->hhead + n) & t->hmask;
+    t->hcount -= n;
+    block_push(t, raw, raw_size, j, n, 1);
+}
+
+static void hist_add(Vt *t, const VtCell *src, int hw, VtLineMeta meta) {
+    int len = hw;
+    if (len > t->cols) len = t->cols;
+    while (len > 0 && src[len - 1].cp == 0 && src[len - 1].sf == 0) len--;
+    HSeg *g = t->hseg;
+    if (!g || g->lines >= BLOCK_LINES || g->used + (size_t)len > g->cap) {
+        if (g && g->live == 0) { free(g->buf); free(g->bbuf); free(g); }
+        g = seg_new(t);
+        if (!g) { if (meta.cache && t->cache_free) t->cache_free(meta.cache, t->user); return; }
+        t->hseg = g;
+    }
+    if (t->hcount == t->hcap) {
+        if (t->hcap >= HOT_KEEP + BLOCK_LINES) pack_oldest(t);
+        else { hist_release(t, &t->hist[t->hhead]); t->hhead = (t->hhead + 1) & t->hmask; t->hcount--; }
+    }
+    g = t->hseg;
+    HEnt *e = &t->hist[(t->hhead + t->hcount) & t->hmask];
+    e->cells = g->cells + g->used;
+    e->cb = NULL; e->promoted = 0;
+    e->len = len;
+    e->seg = g;
+    copy_cells(e->cells, src, (size_t)len);
+    g->used += (size_t)len; g->lines++; g->live++;
+    e->meta = meta;
+    t->hcount++;
+    t->hot_bytes += sizeof(HEnt) + (size_t)len * sizeof(VtCell);
+    if ((t->max_lines > 0 && total_lines(t) > t->max_lines) || t->packed_bytes + t->pending_bytes > t->ram_budget || t->disk_bytes > t->disk_budget)
+        enforce_limits(t);
+}
+
+static void hist_add_compact(Vt *t, const uint8_t *src, int hw, uint32_t sf, VtLineMeta meta, bool check) {
+    int len = hw > t->cols ? t->cols : hw;
+    HSeg *g = t->hseg;
+    if (!g || g->lines >= BLOCK_LINES || (g->bytes && g->bused + (size_t)len > g->bcap)) {
+        if (g && g->live == 0) { free(g->buf); free(g->bbuf); free(g); }
+        g = seg_new(t);
+        if (!g) return;
+        t->hseg = g;
+    }
+    if (!g->bytes) {
+        g->bcap = (size_t)BLOCK_LINES * (size_t)t->cols;
+        g->bbuf = static_cast<uint8_t*>(malloc(COMPACT_HDR + (g->bcap ? g->bcap : 1)));
+        if (!g->bbuf) { g->bcap = 0; return; }
+        g->bytes = g->bbuf + COMPACT_HDR;
+    }
+    if (t->hcount == t->hcap) {
+        if (t->hcap >= HOT_KEEP + BLOCK_LINES) pack_oldest(t);
+        else { hist_release(t, &t->hist[t->hhead]); t->hhead = (t->hhead + 1) & t->hmask; t->hcount--; }
+    }
+    g = t->hseg;
+    HEnt *e = &t->hist[(t->hhead + t->hcount) & t->hmask];
+    e->cells = NULL;
+    e->cb = g->bytes + g->bused;
+    e->csf = sf; e->promoted = 0;
+    e->len = len;
+    e->seg = g;
+    memcpy(g->bytes + g->bused, src, (size_t)len);
+    g->bused += (size_t)len; g->lines++; g->live++;
+    e->meta = meta;
+    t->hcount++;
+    t->hot_bytes += sizeof(HEnt) + (size_t)len;
+    if (check && ((t->max_lines > 0 && total_lines(t) > t->max_lines) || t->packed_bytes + t->pending_bytes > t->ram_budget || t->disk_bytes > t->disk_budget))
+        enforce_limits(t);
+}
+
+#define PUSH_BYTES_MIN 32
+#define PUSH_BYTES_MAX 512
+
+static void hist_push(Vt *t, int y) {
+    if (t->max_lines == 0) return;
+    VtLineMeta *m = rowm(t, y);
+    VtLineMeta meta = *m;
+    const bool shadow = m->dirty == 2 && m->hw >= PUSH_BYTES_MIN && m->hw <= PUSH_BYTES_MAX;
+    meta.dirty = 1;
+    m->cache = NULL;
+    m->dirty = 1;
+    if (shadow) { hist_add_compact(t, t->cur->sh + (size_t)t->cur->order[y] * (size_t)t->cols, m->hw, meta.sf, meta, true); return; }
+    const VtCell *src = rowp(t, y);
+    int len = m->hw < t->cols ? m->hw : t->cols;
+    while (len > 0 && src[len - 1].cp == 0 && src[len - 1].sf == 0) len--;
+    if (len >= PUSH_BYTES_MIN && len <= PUSH_BYTES_MAX) {
+        uint8_t bytes[PUSH_BYTES_MAX];
+        const uint32_t sf = src[0].sf;
+        uint32_t bad = 0;
+        int i = 0;
+#ifdef __SSE2__
+        {
+            const __m128i sfv = _mm_set1_epi32((int)sf), hi = _mm_set1_epi32((int)~0xFFu), zero = _mm_setzero_si128();
+            __m128i acc = zero;
+            for (; i + 8 <= len; i += 8) {
+                __m128 a = _mm_loadu_ps((const float *)(src + i)), b = _mm_loadu_ps((const float *)(src + i + 2));
+                __m128 c = _mm_loadu_ps((const float *)(src + i + 4)), d = _mm_loadu_ps((const float *)(src + i + 6));
+                __m128i cp0 = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0)));
+                __m128i sf0 = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)));
+                __m128i cp1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(2, 0, 2, 0)));
+                __m128i sf1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(3, 1, 3, 1)));
+                acc = _mm_or_si128(acc, _mm_or_si128(_mm_and_si128(_mm_or_si128(cp0, cp1), hi), _mm_or_si128(_mm_xor_si128(sf0, sfv), _mm_xor_si128(sf1, sfv))));
+                _mm_storel_epi64((__m128i *)(bytes + i), _mm_packus_epi16(_mm_packs_epi32(cp0, cp1), zero));
+                if (_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) != 0xFFFF) break;  /* a second style or a non-ASCII cell: stop packing */
+            }
+            bad = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) ^ 0xFFFFu;
+        }
+#endif
+        for (; !bad && i < len; i++) {
+            bad |= (src[i].cp & ~0xFFu) | (src[i].sf ^ sf);
+            bytes[i] = (uint8_t)src[i].cp;
+        }
+        if (!bad) { hist_add_compact(t, bytes, len, sf, meta, true); return; }
+    }
+    hist_add(t, src, m->hw, meta);
+}
+
+void vt_clear_history(Vt *t) {
+    for (int i = 0; i < t->hcount; i++) hist_release(t, &t->hist[(t->hhead + i) & t->hmask]);
+    t->hhead = t->hcount = 0;
+    while (t->bcount) evict_oldest_block(t);
+    for (int i = 0; i < CACHE_ENTRIES; i++) if (t->cache[i]) cache_drop_id(t, t->cache[i]->id);
+    t->spill_next_id = t->next_block_id;
+}
+
+static CacheEntry *decode_entry(Vt *t, Block *b) {
+    CacheEntry *e = static_cast<CacheEntry*>(calloc(1, sizeof *e));
+    if (!e) return NULL;
+    e->id = b->id;
+    e->nlines = b->nlines;
+    const uint8_t *raw = NULL;
+    uint8_t *tmp = NULL, *comp = NULL;
+    int shuffled = 0;
+    if (b->job) raw = b->job->raw;
+    else if (b->data || b->disk_off >= 0) {
+        const uint8_t *src = b->data;
+        if (!src) {
+            comp = static_cast<uint8_t*>(malloc(b->comp_size));
+            ssize_t got = 0;
+            if (comp && t->spill_fd >= 0) got = pread(t->spill_fd, comp, b->comp_size, b->disk_off);
+            if (got == (ssize_t)b->comp_size) src = comp;
+        }
+        if (src) {
+            if (b->stored) raw = src;
+            else {
+                tmp = static_cast<uint8_t*>(malloc(b->raw_size));
+                if (tmp && sd_lz_decompress(src, b->comp_size, tmp, b->raw_size)) { raw = tmp; shuffled = b->shuffled; }
+            }
+        }
+    }
+    int n = b->nlines;
+    const bool v3 = b->v2 == 2;
+    size_t ncells = 0, need = (v3 ? 6 : 2) * (size_t)n;
+    int ok = raw && b->raw_size >= 2 * (size_t)n;
+    int lens[BLOCK_LINES];
+    bool cmp[BLOCK_LINES];
+    for (int i = 0; ok && i < n; i++) {
+        unsigned l = (unsigned)(raw[2 * i] | (raw[2 * i + 1] << 8));
+        cmp[i] = b->v2 && (l & 0x8000u);
+        lens[i] = (int)(l & (b->v2 ? 0x7fffu : 0xffffu));
+        ncells += (size_t)lens[i];
+        need += v3 ? (size_t)lens[i] : cmp[i] ? 4 + (size_t)lens[i] : 8 * (size_t)lens[i];
+    }
+    if (ok && b->raw_size != need) ok = 0;
+    if (ok) {
+        e->cells = static_cast<VtCell*>(malloc((ncells ? ncells : 1) * sizeof(VtCell)));
+        ok = e->cells != NULL;
+    }
+    if (ok) {
+        const uint8_t *body = raw + 2 * (size_t)n;
+        if (v3) {
+            const uint8_t *bytes = raw + 6 * (size_t)n;
+            size_t c = 0;
+            for (int i = 0; i < n; i++) {
+                uint32_t sf;
+                memcpy(&sf, raw + 2 * (size_t)n + 4 * (size_t)i, 4);
+                for (int k = 0; k < lens[i]; k++, c++) { e->cells[c].cp = bytes[k]; e->cells[c].sf = sf; }
+                bytes += lens[i];
+            }
+        } else if (b->v2) {
+            size_t c = 0;
+            for (int i = 0; i < n; i++) {
+                if (cmp[i]) {
+                    uint32_t sf;
+                    memcpy(&sf, body, 4);
+                    body += 4;
+                    for (int k = 0; k < lens[i]; k++, c++) { e->cells[c].cp = body[k]; e->cells[c].sf = sf; }
+                    body += lens[i];
+                } else {
+                    memcpy(e->cells + c, body, (size_t)lens[i] * sizeof(VtCell));
+                    body += (size_t)lens[i] * sizeof(VtCell);
+                    c += (size_t)lens[i];
+                }
+            }
+        } else if (shuffled) {
+            for (size_t c = 0; c < ncells; c++) {
+                uint8_t *dst = (uint8_t *)&e->cells[c];
+                for (int pl = 0; pl < 8; pl++) dst[pl] = body[(size_t)pl * ncells + c];
+            }
+        } else {
+            memcpy(e->cells, body, ncells * sizeof(VtCell));
+        }
+        int off = 0;
+        for (int i = 0; i < n; i++) { e->off[i] = off; off += lens[i]; }
+        e->off[n] = off;
+    } else {
+        free(e->cells);
+        e->cells = NULL;
+        memset(e->off, 0, sizeof e->off);
+    }
+    for (int i = 0; i < n; i++) e->meta[i].dirty = 1;
+    free(tmp); free(comp);
+    return e;
+}
+
+static CacheEntry *cache_get(Vt *t, Block *b) {
+    block_apply(t, b);
+    CacheEntry *victim = NULL;
+    int vi = 0;
+    for (int i = 0; i < CACHE_ENTRIES; i++) {
+        CacheEntry *e = t->cache[i];
+        if (e && e->id == b->id) { e->stamp = ++t->cache_clock; return e; }
+        if (!e) { victim = NULL; vi = i; goto fill; }
+        if (!victim || e->stamp < victim->stamp) { victim = e; vi = i; }
+    }
+    cache_drop_id(t, victim->id);
+fill:;
+    CacheEntry *e = decode_entry(t, b);
+    if (e) { e->stamp = ++t->cache_clock; t->cache[vi] = e; }
+    return e;
+}
+
+static int hist_lookup(Vt *t, int idx, VtCell **cells, int *len, VtLineMeta **meta) {
+    long k = -(long)idx - 1;
+    if (k < 0 || k >= total_lines(t)) return 0;
+    if (k < t->hcount) {
+        HEnt *h = &t->hist[(t->hhead + t->hcount - 1 - k) & t->hmask];
+        if (h->cb && !h->cells) {
+            VtCell *pc = static_cast<VtCell*>(malloc(((size_t)h->len ? (size_t)h->len : 1) * sizeof(VtCell)));
+            if (pc) { fill_ascii(pc, h->cb, (size_t)h->len, h->csf); h->cells = pc; h->promoted = 1; t->hot_bytes += (size_t)h->len * sizeof(VtCell); }
+        }
+        if (cells) *cells = h->cells;
+        if (len) *len = h->len < t->cols ? h->len : t->cols;
+        if (meta) *meta = &h->meta;
+        return 1;
+    }
+    long k2 = k - t->hcount;
+    int bi = t->bcount - 1 - (int)(k2 / BLOCK_LINES), li = BLOCK_LINES - 1 - (int)(k2 % BLOCK_LINES);
+    if (bi < 0) return 0;
+    CacheEntry *e = cache_get(t, blk(t, bi));
+    if (!e) return 0;
+    int l = e->off[li + 1] - e->off[li];
+    if (cells) *cells = e->cells ? e->cells + e->off[li] : NULL;
+    if (len) *len = l < t->cols ? l : t->cols;
+    if (meta) *meta = &e->meta[li];
+    return 1;
+}
+
+void vt_set_history(Vt *t, int max_lines, size_t ram_budget, size_t disk_budget, bool spill) {
+    t->max_lines = max_lines;
+    if (ram_budget) t->ram_budget = ram_budget;
+    if (disk_budget) t->disk_budget = disk_budget;
+    t->spill = spill;
+    if (max_lines == 0) { vt_clear_history(t); return; }
+    int want = (max_lines > 0 && max_lines <= HOT_KEEP + BLOCK_LINES) ? max_lines : HOT_KEEP + BLOCK_LINES;
+    if (want != t->hcap) {
+        while (t->hcount > want) {
+            if (t->hcap >= HOT_KEEP + BLOCK_LINES && t->hcount >= BLOCK_LINES && max_lines != 0 && want >= HOT_KEEP + BLOCK_LINES) pack_oldest(t);
+            else { hist_release(t, &t->hist[t->hhead]); t->hhead = (t->hhead + 1) & t->hmask; t->hcount--; }
+        }
+        int sz = 1;
+        while (sz < want) sz <<= 1;
+        HEnt *nh = static_cast<HEnt*>(calloc((size_t)sz, sizeof(HEnt)));
+        if (nh) {
+            for (int i = 0; i < t->hcount; i++) nh[i] = t->hist[(t->hhead + i) & t->hmask];
+            free(t->hist);
+            t->hist = nh; t->hcap = want; t->hhead = 0; t->hmask = sz - 1;
+        }
+    }
+    enforce_limits(t);
+}
+
+void vt_history_stats(const Vt *t, VtHistoryStats *o) {
+    memset(o, 0, sizeof *o);
+    o->lines = total_lines(t);
+    o->hot_lines = t->hcount;
+    o->block_count = t->bcount;
+    o->hot_bytes = t->hot_bytes;
+    o->packed_bytes = t->packed_bytes + t->pending_bytes;
+    o->disk_bytes = t->disk_bytes;
+    o->raw_bytes = t->raw_total;
+    for (int i = 0; i < CACHE_ENTRIES; i++)
+        if (t->cache[i]) o->cache_bytes += sizeof(CacheEntry) + (size_t)t->cache[i]->off[t->cache[i]->nlines] * sizeof(VtCell);
+}
+
+size_t vt_compact(Vt *t) {
+    VtHistoryStats before, after;
+    vt_history_stats(t, &before);
+    size_t b4 = before.hot_bytes + before.packed_bytes + before.cache_bytes;
+    if (t->hcap >= HOT_KEEP + BLOCK_LINES)
+        while (t->hcount >= 2 * BLOCK_LINES) pack_oldest(t);
+    for (int i = 0; i < CACHE_ENTRIES; i++) if (t->cache[i]) cache_drop_id(t, t->cache[i]->id);
+    defer_flush(t, 0);
+    blocks_poll(t);
+    enforce_limits(t);
+    vt_history_stats(t, &after);
+    size_t af = after.hot_bytes + after.packed_bytes + after.cache_bytes;
+    return b4 > af ? b4 - af : 0;
+}
+
+static void region_up(Vt *t, int top, int bottom, int n) {
+    int span = bottom - top + 1;
+    if (n > span) n = span;
+    if (n <= 0) return;
+    int *ord = t->cur->order;
+    if (n == 1) {
+        int first = ord[top];
+        for (int i = top; i < bottom; i++) ord[i] = ord[i + 1];
+        ord[bottom] = first;
+        clear_row(t, bottom);
+        return;
+    }
+    int tmp[n];
+    memcpy(tmp, ord + top, (size_t)n * sizeof(int));
+    memmove(ord + top, ord + top + n, (size_t)(span - n) * sizeof(int));
+    memcpy(ord + bottom - n + 1, tmp, (size_t)n * sizeof(int));
+    for (int y = bottom - n + 1; y <= bottom; y++) clear_row(t, y);
+}
+
+static void region_down(Vt *t, int top, int bottom, int n) {
+    int span = bottom - top + 1;
+    if (n > span) n = span;
+    if (n <= 0) return;
+    int *ord = t->cur->order;
+    int tmp[n];
+    memcpy(tmp, ord + bottom - n + 1, (size_t)n * sizeof(int));
+    memmove(ord + top + n, ord + top, (size_t)(span - n) * sizeof(int));
+    memcpy(ord + top, tmp, (size_t)n * sizeof(int));
+    for (int y = top; y < top + n; y++) clear_row(t, y);
+}
+
+static void scroll_up(Vt *t, int n) {
+    if (t->cur == &t->main && t->top == 0 && t->bottom == t->rows - 1) {
+        if (n > t->rows) n = t->rows;
+        for (int k = 0; k < n; k++) hist_push(t, k);
+    }
+    region_up(t, t->top, t->bottom, n);
+}
+
+static void scroll_down(Vt *t, int n) { region_down(t, t->top, t->bottom, n); }
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static void vbounds(Vt *t) {
+    int lo = 0, hi = t->rows - 1;
+    if ((t->modes & VT_M_ORIGIN) && !(t->top == 0 && t->bottom == t->rows - 1)) { lo = t->top; hi = t->bottom; }
+    t->cy = clampi(t->cy, lo, hi);
+}
+
+static void hbounds(Vt *t) { t->cx = clampi(t->cx, 0, t->cols - 1); }
+
+static void do_index(Vt *t) {
+    if (t->cy == t->bottom) scroll_up(t, 1);
+    else t->cy = t->cy + 1 < t->rows ? t->cy + 1 : t->cy;
+}
+
+static void do_reverse_index(Vt *t) {
+    if (t->cy == t->top) scroll_down(t, 1);
+    else if (t->cy > 0) t->cy--;
+}
+
+static void do_linefeed(Vt *t) {
+    do_index(t);
+    if ((t->modes & VT_M_NEWLINE) || t->force_nl || t->stream_nl) t->cx = 0;
+}
+
+static void do_tab(Vt *t) {
+    int x = t->cx;
+    if (x >= t->cols) x = t->cols - 1;
+    for (int i = x + 1; i < t->cols; i++)
+        if (t->tabs[i]) { t->cx = i; return; }
+    t->cx = t->cols - 1;
+}
+
+static void cursor_home(Vt *t) {
+    t->cx = 0;
+    t->cy = (t->modes & VT_M_ORIGIN) ? t->top : 0;
+}
+
+static const uint16_t GRAPHICS[32] = {
+    0x00A0, 0x25C6, 0x2592, 0x2409, 0x240C, 0x240D, 0x240A, 0x00B0, 0x00B1, 0x2424, 0x240B, 0x2518, 0x2510, 0x250C,
+    0x2514, 0x253C, 0x23BA, 0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534, 0x252C, 0x2502, 0x2264, 0x2265,
+    0x03C0, 0x2260, 0x00A3, 0x00B7,
+};
+
+
+static void insert_cells(Vt *t, int n) {
+    VtCell *r = rowp(t, t->cy);
+    int x = t->cx >= t->cols ? t->cols - 1 : t->cx;
+    if (n > t->cols - x) n = t->cols - x;
+    memmove(r + x + n, r + x, (size_t)(t->cols - x - n) * sizeof(VtCell));
+    clear_cells(t, r + x, n);
+    touch_row(t, t->cy);
+}
+
+static void wrap_if_needed(Vt *t, int w) {
+    if (t->cx == t->cols) {
+        if (t->modes & VT_M_AUTOWRAP) {
+            dirty(t, t->cy);
+            t->cx = 0;
+            do_linefeed(t);
+        } else if (w > 0) {
+            t->cx -= w;
+        }
+    }
+}
+
+static void put_cp(Vt *t, uint32_t cp) {
+    if (t->g[t->gl] == CS_GRAPHICS && cp >= 0x5f && cp <= 0x7e) cp = GRAPHICS[cp - 0x5f];
+    int w = vt_wcwidth(cp);
+    if (w < 0) return;
+    if (w == 0) {
+        int x = (t->cx >= t->cols ? t->cols : t->cx) - 1;
+        if (x >= 0) {
+            VtCell *r = rowp(t, t->cy);
+            if (VT_CELL_COMB(r[x]) == 0) {
+                unsigned ci = comb_index(t, cp);
+                if (ci) r[x].cp |= ci << 21;
+            }
+            dirty(t, t->cy);
+        }
+        return;
+    }
+    if (w == 2 && t->cx == t->cols - 1) {
+        if (!(t->modes & VT_M_AUTOWRAP)) return;
+        VtCell *last = rowp(t, t->cy);
+        last[t->cx].cp = 0; last[t->cx].sf = 0;
+        dirty(t, t->cy);
+        t->cx = t->cols;
+    }
+    wrap_if_needed(t, w);
+    if ((t->modes & VT_M_INSERT)) insert_cells(t, w);
+    VtCell *r = rowp(t, t->cy);
+    uint32_t sf = t->pen_style << 8;
+    if (w == 2) {
+        r[t->cx].cp = cp;
+        r[t->cx].sf = sf | VT_F_WIDE;
+        if (t->cx + 1 < t->cols) { r[t->cx + 1].cp = 0; r[t->cx + 1].sf = sf | VT_F_TAIL; }
+    } else {
+        r[t->cx].cp = cp;
+        r[t->cx].sf = sf;
+    }
+    VtLineMeta *lm = rowm(t, t->cy);
+    lm->dirty = 1;
+    if (t->cx + w > lm->hw) lm->hw = (uint16_t)(t->cx + w);
+    t->cx = t->cx + w < t->cols ? t->cx + w : t->cols;
+    t->last_cp = cp;
+}
+
+static inline size_t ascii_run(const uint8_t *p, size_t n) {
+    size_t i = 0;
+#ifdef __SSE2__
+    const __m128i lo = _mm_set1_epi8(0x20), del = _mm_set1_epi8(0x7f);
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(p + i));
+        int m = _mm_movemask_epi8(_mm_or_si128(_mm_cmplt_epi8(v, lo), _mm_cmpeq_epi8(v, del)));
+        if (m) return i + (size_t)__builtin_ctz((unsigned)m);
+        i += 16;
+    }
+#endif
+#ifdef VT_NEON
+    {
+        const uint8x16_t base = vdupq_n_u8(0x20), span = vdupq_n_u8(0x5e);
+        while (i + 16 <= n) {
+            uint8x16_t bad = vcgtq_u8(vsubq_u8(vld1q_u8(p + i), base), span);
+            uint64x2_t b64 = vreinterpretq_u64_u8(bad);
+            if (vgetq_lane_u64(b64, 0) | vgetq_lane_u64(b64, 1)) break;
+            i += 16;
+        }
+    }
+#endif
+    const uint64_t ones = 0x0101010101010101ull, highs = 0x8080808080808080ull;
+    while (i + 8 <= n) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        uint64_t below = (w - ones * 0x20) & ~w & highs;
+        uint64_t del = ((w ^ (ones * 0x7f)) - ones) & ~(w ^ (ones * 0x7f)) & highs;
+        if ((w & highs) | below | del) break;
+        i += 8;
+    }
+    while (i < n && p[i] >= 0x20 && p[i] < 0x7f) i++;
+    return i;
+}
+
+static bool fast_paths = true;
+void vt_set_force_nl(Vt *t, bool on) { t->force_nl = on; }
+void vt_set_stream_nl(Vt *t, bool on) { t->stream_nl = on; }
+
+void vt_set_fast_paths(bool on) { fast_paths = on; }
+
+static uint8_t wtab[65536];
+static pthread_once_t wtab_once = PTHREAD_ONCE_INIT;
+static void wtab_build(void) {
+    for (uint32_t c = 0x20; c < 0x10000; c++) {
+        if (c >= 0xd800 && c <= 0xdfff) continue;
+        int w = vt_wcwidth(c);
+        wtab[c] = (uint8_t)(w == 1 || w == 2 ? w : 0);
+    }
+}
+
+static inline void fill_ascii(VtCell *dst, const uint8_t *p, size_t k, uint32_t sf) {
+    size_t i = 0;
+#ifdef __SSE2__
+    {
+        const __m128i zero = _mm_setzero_si128(), sfv = _mm_set1_epi32((int)sf);
+        for (; i + 4 <= k; i += 4) {
+            int w;
+            memcpy(&w, p + i, 4);
+            __m128i cp = _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(w), zero), zero);
+            _mm_storeu_si128((__m128i *)(dst + i), _mm_unpacklo_epi32(cp, sfv));
+            _mm_storeu_si128((__m128i *)(dst + i + 2), _mm_unpackhi_epi32(cp, sfv));
+        }
+    }
+#endif
+#ifdef VT_NEON
+    {
+        const uint32x4_t sfv = vdupq_n_u32(sf);
+        for (; i + 8 <= k; i += 8) {
+            uint16x8_t w16 = vmovl_u8(vld1_u8(p + i));
+            uint32x4x2_t a = vzipq_u32(vmovl_u16(vget_low_u16(w16)), sfv), b = vzipq_u32(vmovl_u16(vget_high_u16(w16)), sfv);
+            vst1q_u32((uint32_t *)(dst + i), a.val[0]);
+            vst1q_u32((uint32_t *)(dst + i + 2), a.val[1]);
+            vst1q_u32((uint32_t *)(dst + i + 4), b.val[0]);
+            vst1q_u32((uint32_t *)(dst + i + 6), b.val[1]);
+        }
+    }
+#endif
+    for (; i < k; i++) { dst[i].cp = p[i]; dst[i].sf = sf; }
+}
+
+#ifdef __SSE2__
+static inline void fill16(VtCell *dst, __m128i v, unsigned k, uint32_t sf) {
+    const __m128i z = _mm_setzero_si128(), sfv = _mm_set1_epi32((int)sf), kv = _mm_set1_epi32((int)k);
+    __m128i l8 = _mm_unpacklo_epi8(v, z), h8 = _mm_unpackhi_epi8(v, z);
+    __m128i c[4] = {_mm_unpacklo_epi16(l8, z), _mm_unpackhi_epi16(l8, z), _mm_unpacklo_epi16(h8, z), _mm_unpackhi_epi16(h8, z)};
+    for (int q = 0; q < 4; q++) {
+        __m128i a = _mm_unpacklo_epi32(c[q], sfv), b = _mm_unpackhi_epi32(c[q], sfv);
+        __m128i ma = _mm_cmpgt_epi32(kv, _mm_set_epi32(4 * q + 1, 4 * q + 1, 4 * q, 4 * q));
+        __m128i mb = _mm_cmpgt_epi32(kv, _mm_set_epi32(4 * q + 3, 4 * q + 3, 4 * q + 2, 4 * q + 2));
+        __m128i oa = _mm_loadu_si128((const __m128i *)(dst + 4 * q)), ob = _mm_loadu_si128((const __m128i *)(dst + 4 * q + 2));
+        _mm_storeu_si128((__m128i *)(dst + 4 * q), _mm_or_si128(_mm_and_si128(ma, a), _mm_andnot_si128(ma, oa)));
+        _mm_storeu_si128((__m128i *)(dst + 4 * q + 2), _mm_or_si128(_mm_and_si128(mb, b), _mm_andnot_si128(mb, ob)));
+    }
+}
+#endif
+
+static const uint8_t U8LEN[16] = {1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4};
+
+static size_t utf8_run(Vt *t, const uint8_t *p, size_t n) {
+    if (!fast_paths || t->g[t->gl] == CS_GRAPHICS || (t->modes & VT_M_INSERT) || !(t->modes & VT_M_AUTOWRAP)) return 0;
+    if (t->cx > t->cols) return 0;
+    pthread_once(&wtab_once, wtab_build);
+    VtCell *r = rowp(t, t->cy);
+    const uint32_t sf = t->pen_style << 8;
+    const int cols = t->cols;
+    int cx = t->cx;
+    size_t i = 0;
+    uint32_t last = 0;
+    int wend = 0;
+#define META() do { if (wend) { VtLineMeta *lm_ = rowm(t, t->cy); lm_->dirty = 1; if (wend > lm_->hw) lm_->hw = (uint16_t)wend; t->last_cp = last; wend = 0; } } while (0)
+#define FLUSH() do { META(); t->cx = cx; } while (0)
+    while (i < n) {
+#ifdef __SSE2__
+        if (n - i >= 16 && cols - cx >= 16) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(p + i));
+            int m = _mm_movemask_epi8(_mm_or_si128(_mm_cmplt_epi8(v, _mm_set1_epi8(0x20)), _mm_cmpeq_epi8(v, _mm_set1_epi8(0x7f))));
+            unsigned k = m ? (unsigned)__builtin_ctz((unsigned)m) : 16u;
+            if (k) { fill16(r + cx, v, k, sf); cx += (int)k; i += k; last = p[i - 1]; wend = cx; }
+            if (!m) continue;
+        } else
+#endif
+        {
+            size_t room = (size_t)(cols - cx), lim = n - i < room ? n - i : room;
+            if (lim) {
+                size_t k = ascii_run(p + i, lim);
+                if (k) { fill_ascii(r + cx, p + i, k, sf); cx += (int)k; i += k; last = p[i - 1]; wend = cx; if (i >= n) break; }
+            }
+            if (i >= n) break;
+        }
+        uint8_t c = p[i];
+        uint32_t cp;
+        size_t len;
+        int w;
+        if (c < 0x80) {
+            if (c == 0x0d) {
+                META();
+                cx = 0; i++; continue;
+            }
+            if (c == 0x0a) {
+                FLUSH();
+                do_linefeed(t);
+                r = rowp(t, t->cy); cx = t->cx; i++;
+                continue;
+            }
+            if (c == 0x09) {
+                int x = cx >= cols ? cols - 1 : cx, nx = cols - 1;
+                for (int k = x + 1; k < cols; k++) if (t->tabs[k]) { nx = k; break; }
+                cx = nx; i++;
+                continue;
+            }
+            break;
+        }
+        if (n - i >= 4) {
+            uint32_t u;
+            memcpy(&u, p + i, 4);
+            uint32_t b0 = u & 0xff, b1 = (u >> 8) & 0xff, b2 = (u >> 16) & 0xff, b3 = u >> 24;
+            uint32_t L = U8LEN[b0 >> 4];
+            uint32_t c1 = b1 & 0x3f, c2 = b2 & 0x3f, c3 = b3 & 0x3f;
+            uint32_t cp2 = ((b0 & 0x1f) << 6) | c1, cp3 = ((b0 & 0x0f) << 12) | (c1 << 6) | c2, cp4 = ((b0 & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
+            cp = L == 2 ? cp2 : L == 3 ? cp3 : cp4;
+            uint32_t mn = L == 2 ? 0x80 : L == 3 ? 0x800 : 0x10000;
+            uint32_t ok = (L >= 2) & ((b1 & 0xc0) == 0x80) & ((L < 3) | ((b2 & 0xc0) == 0x80)) & ((L < 4) | ((b3 & 0xc0) == 0x80))
+                        & (cp >= mn) & (cp <= 0x10ffff) & ((cp - 0xd800) > 0x7ff);
+            if (!ok) break;
+            len = L;
+            if (__builtin_expect(cp >= 0x10000, 0)) { int vw = vt_wcwidth(cp); w = vw == 1 || vw == 2 ? vw : 0; }
+            else w = wtab[cp];
+        } else if (c >= 0xc2 && c <= 0xdf) {
+            if (i + 2 > n || (p[i + 1] & 0xc0) != 0x80) break;
+            cp = ((uint32_t)(c & 0x1f) << 6) | (p[i + 1] & 0x3f);
+            len = 2; w = wtab[cp];
+        } else if (c >= 0xe0 && c <= 0xef) {
+            if (i + 3 > n || (p[i + 1] & 0xc0) != 0x80 || (p[i + 2] & 0xc0) != 0x80) break;
+            cp = ((uint32_t)(c & 0x0f) << 12) | ((uint32_t)(p[i + 1] & 0x3f) << 6) | (p[i + 2] & 0x3f);
+            if (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff)) break;
+            len = 3; w = wtab[cp];
+        } else break;
+        if (!w || cx + w > cols) break;
+        r[cx].cp = cp;
+        r[cx].sf = sf | (w == 2 ? VT_F_WIDE : 0);
+        if (cx + 1 < cols) {
+            VtCell old = r[cx + 1];
+            r[cx + 1].cp = w == 2 ? 0 : old.cp;
+            r[cx + 1].sf = w == 2 ? (sf | VT_F_TAIL) : old.sf;
+        }
+        cx += w;
+        last = cp; wend = cx;
+        i += len;
+    }
+    FLUSH();
+#undef FLUSH
+#undef META
+    return i;
+}
+
+
+static inline __attribute__((always_inline)) void put_ascii_impl(Vt *t, const uint8_t *p, size_t n, const bool track) {
+    if (t->g[t->gl] == CS_GRAPHICS || (t->modes & VT_M_INSERT) || !(t->modes & VT_M_AUTOWRAP)) {
+        for (size_t i = 0; i < n; i++) put_cp(t, p[i]);
+        return;
+    }
+    const uint32_t sf = t->pen_style << 8;
+    while (n) {
+        if (t->cx == t->cols) {
+            VtLineMeta *wm = rowm(t, t->cy);
+            if (!track || wm->dirty != 2) wm->dirty = 1;
+            t->cx = 0;
+            do_linefeed(t);
+        }
+        VtCell *r = rowp(t, t->cy);
+        VtLineMeta *lm = rowm(t, t->cy);
+        size_t room = (size_t)(t->cols - t->cx);
+        size_t k = n < room ? n : room;
+        VtCell *dst = r + t->cx;
+        /* dirty == 2 marks a row only this function has written, in one style, with no gaps; shadow bytes then hold its text for the scrollback */
+        if (track) {
+            if (lm->dirty == 2) { if (t->cx > lm->hw || lm->sf != sf) lm->dirty = 1; }
+            else if (lm->hw == 0 && t->cx == 0) { lm->sf = sf; lm->dirty = 2; }
+            if (lm->dirty == 2) memcpy(t->cur->sh + (size_t)t->cur->order[t->cy] * (size_t)t->cols + t->cx, p, k);
+        }
+        fill_ascii(dst, p, k, sf);
+        t->cx += (int)k;
+        t->last_cp = p[k - 1];
+        p += k;
+        n -= k;
+        if (!track || lm->dirty != 2) lm->dirty = 1;
+        if (t->cx > lm->hw) lm->hw = (uint16_t)t->cx;
+    }
+}
+
+static void put_ascii(Vt *t, const uint8_t *p, size_t n) {
+#ifndef VT_NO_SHADOW
+    if (t->max_lines != 0 && t->cur == &t->main) put_ascii_impl(t, p, n, true);
+    else
+#endif
+    put_ascii_impl(t, p, n, false);
+}
+
+static void sgr(Vt *t) {
+    if (t->np == 0) { t->pen_fg = t->pen_bg = 0; t->pen_attrs = 0; pen_commit(t); return; }
+    for (int i = 0; i < t->np; i++) {
+        int a = t->par[i];
+        switch (a) {
+        case 0: t->pen_fg = t->pen_bg = 0; t->pen_attrs = 0; break;
+        case 1: t->pen_attrs |= VT_BOLD; break;
+        case 2: t->pen_attrs |= VT_DIM; break;
+        case 3: t->pen_attrs |= VT_ITALIC; break;
+        case 4: t->pen_attrs |= VT_UNDERLINE; break;
+        case 5: case 6: t->pen_attrs |= VT_BLINK; break;
+        case 7: t->pen_attrs |= VT_REVERSE; break;
+        case 8: t->pen_attrs |= VT_INVIS; break;
+        case 9: t->pen_attrs |= VT_STRIKE; break;
+        case 22: t->pen_attrs &= (uint16_t)~(VT_BOLD | VT_DIM); break;
+        case 23: t->pen_attrs &= (uint16_t)~VT_ITALIC; break;
+        case 24: t->pen_attrs &= (uint16_t)~VT_UNDERLINE; break;
+        case 25: t->pen_attrs &= (uint16_t)~VT_BLINK; break;
+        case 27: t->pen_attrs &= (uint16_t)~VT_REVERSE; break;
+        case 28: t->pen_attrs &= (uint16_t)~VT_INVIS; break;
+        case 29: t->pen_attrs &= (uint16_t)~VT_STRIKE; break;
+        case 39: t->pen_fg = 0; break;
+        case 49: t->pen_bg = 0; break;
+        case 38: case 48: {
+            uint32_t *dst = a == 38 ? &t->pen_fg : &t->pen_bg;
+            if (i + 1 >= t->np) goto done;
+            int kind = t->par[i + 1];
+            if (kind == 5 && i + 2 < t->np) {
+                *dst = VT_COLOR_IDX(clampi(t->par[i + 2], 0, 255));
+                i += 2;
+            } else if (kind == 2) {
+                int j = i + 2, avail = t->np - j;
+                int sub_count = 0;
+                while (j + sub_count < t->np && t->sub[j + sub_count]) sub_count++;
+                if (t->sub[i + 1] && sub_count >= 4) j++;
+                if (avail >= 3 || (t->sub[i + 1] && sub_count >= 3)) {
+                    *dst = VT_COLOR_RGB(clampi(t->par[j], 0, 255), clampi(t->par[j + 1], 0, 255), clampi(t->par[j + 2], 0, 255));
+                    i = j + 2;
+                } else {
+                    goto done;
+                }
+            } else {
+                goto done;
+            }
+            break;
+        }
+        default:
+            if (a >= 30 && a <= 37) t->pen_fg = VT_COLOR_IDX(a - 30);
+            else if (a >= 40 && a <= 47) t->pen_bg = VT_COLOR_IDX(a - 40);
+            else if (a >= 90 && a <= 97) t->pen_fg = VT_COLOR_IDX(a - 90 + 8);
+            else if (a >= 100 && a <= 107) t->pen_bg = VT_COLOR_IDX(a - 100 + 8);
+            break;
+        }
+    }
+done:
+    pen_commit(t);
+}
+
+static void save_cursor(Vt *t, Saved *s) {
+    s->x = t->cx; s->y = t->cy; s->fg = t->pen_fg; s->bg = t->pen_bg; s->attrs = t->pen_attrs;
+    s->g[0] = t->g[0]; s->g[1] = t->g[1]; s->gl = t->gl;
+}
+
+static void restore_cursor(Vt *t, const Saved *s) {
+    t->cx = clampi(s->x, 0, t->cols);
+    t->cy = clampi(s->y, 0, t->rows - 1);
+    t->pen_fg = s->fg; t->pen_bg = s->bg; t->pen_attrs = s->attrs;
+    t->g[0] = s->g[0]; t->g[1] = s->g[1]; t->gl = s->gl;
+    pen_commit(t);
+}
+
+static void switch_screen(Vt *t, bool alt, bool save) {
+    if (alt == (t->cur == &t->alt)) return;
+    if (alt) {
+        if (save) save_cursor(t, &t->saved_1049);
+        t->cur = &t->alt;
+        memset(t->alt.cells, 0, (size_t)t->cols * (size_t)t->rows * sizeof(VtCell));
+        for (int i = 0; i < t->rows; i++) { t->alt.order[i] = i; t->alt.meta[i].dirty = 1; t->alt.meta[i].hw = 0; }
+        t->modes |= VT_M_ALT_SCREEN;
+    } else {
+        t->cur = &t->main;
+        t->modes &= ~VT_M_ALT_SCREEN;
+        for (int i = 0; i < t->rows; i++) t->main.meta[i].dirty = 1;
+        if (save) restore_cursor(t, &t->saved_1049);
+    }
+}
+
+static void set_mode(Vt *t, int mode, bool on, bool priv) {
+    if (!priv) {
+        if (mode == 4) t->modes = on ? t->modes | VT_M_INSERT : t->modes & ~VT_M_INSERT;
+        else if (mode == 20) t->modes = on ? t->modes | VT_M_NEWLINE : t->modes & ~VT_M_NEWLINE;
+        return;
+    }
+#define FLAG(bit) (t->modes = on ? (t->modes | (bit)) : (t->modes & ~(bit)))
+    switch (mode) {
+    case 1: FLAG(VT_M_APP_CURSOR); break;
+    case 5: FLAG(VT_M_REVERSE_VIDEO); vt_mark_all_dirty(t); break;
+    case 6: FLAG(VT_M_ORIGIN); cursor_home(t); break;
+    case 7: FLAG(VT_M_AUTOWRAP); break;
+    case 25: FLAG(VT_M_CURSOR_VISIBLE); break;
+    case 47: case 1047: switch_screen(t, on, false); break;
+    case 1048: if (on) save_cursor(t, &t->saved_1049); else restore_cursor(t, &t->saved_1049); break;
+    case 1049: switch_screen(t, on, true); break;
+    case 1000: t->modes &= ~(VT_M_MOUSE_BTN | VT_M_MOUSE_DRAG | VT_M_MOUSE_ANY); if (on) t->modes |= VT_M_MOUSE_BTN; break;
+    case 1002: t->modes &= ~(VT_M_MOUSE_BTN | VT_M_MOUSE_DRAG | VT_M_MOUSE_ANY); if (on) t->modes |= VT_M_MOUSE_DRAG; break;
+    case 1003: t->modes &= ~(VT_M_MOUSE_BTN | VT_M_MOUSE_DRAG | VT_M_MOUSE_ANY); if (on) t->modes |= VT_M_MOUSE_ANY; break;
+    case 1004: FLAG(VT_M_FOCUS_EVENTS); break;
+    case 1006: FLAG(VT_M_MOUSE_SGR); break;
+    case 2004: FLAG(VT_M_BRACKETED_PASTE); break;
+    default: break;
+    }
+#undef FLAG
+}
+
+static void reply(Vt *t, const char *s) {
+    if (t->write_fn) t->write_fn((const uint8_t *)s, strlen(s), t->user);
+}
+
+static inline int arg(const Vt *t, int i, int def) { return (i < t->np && t->par[i] > 0) ? t->par[i] : def; }
+
+static void erase_line(Vt *t, int how) {
+    VtCell *r = rowp(t, t->cy);
+    int x = t->cx >= t->cols ? t->cols - 1 : t->cx;
+    if (how == 0) clear_cells(t, r + x, t->cols - x);
+    else if (how == 1) clear_cells(t, r, x + 1);
+    else clear_cells(t, r, t->cols);
+    touch_row(t, t->cy);
+}
+
+static void erase_display(Vt *t, int how) {
+    if (how == 0) {
+        erase_line(t, 0);
+        for (int y = t->cy + 1; y < t->rows; y++) clear_row(t, y);
+    } else if (how == 1) {
+        for (int y = 0; y < t->cy; y++) clear_row(t, y);
+        erase_line(t, 1);
+    } else {
+        for (int y = 0; y < t->rows; y++) clear_row(t, y);
+        if (how == 3) vt_clear_history(t);
+    }
+}
+
+static void csi_dispatch(Vt *t, uint8_t f) {
+    int n;
+    bool priv = t->priv == '?';
+    if (t->inter == ' ' && f == 'q') { t->cursor_style = t->np ? t->par[0] : 0; return; }
+    if (t->inter) return;
+    if (t->priv && !priv) {
+        if (f == 'c' && t->priv == '>') reply(t, "\x1b[>1;10;0c");
+        return;
+    }
+    switch (f) {
+    case '@': insert_cells(t, arg(t, 0, 1)); break;
+    case 'A': t->cy = t->cy - arg(t, 0, 1) < t->top ? t->top : t->cy - arg(t, 0, 1); break;
+    case 'B': case 'e': t->cy = t->cy + arg(t, 0, 1) > t->bottom ? t->bottom : t->cy + arg(t, 0, 1); break;
+    case 'C': case 'a': t->cx += arg(t, 0, 1); hbounds(t); break;
+    case 'D':
+        if (t->cx == t->cols) t->cx--;
+        t->cx -= arg(t, 0, 1);
+        hbounds(t);
+        break;
+    case 'E': t->cy = t->cy + arg(t, 0, 1) > t->bottom ? t->bottom : t->cy + arg(t, 0, 1); t->cx = 0; break;
+    case 'F': t->cy = t->cy - arg(t, 0, 1) < t->top ? t->top : t->cy - arg(t, 0, 1); t->cx = 0; break;
+    case 'G': case '`': t->cx = arg(t, 0, 1) - 1; hbounds(t); break;
+    case 'H': case 'f': {
+        int row = arg(t, 0, 1) - 1, col = arg(t, 1, 1) - 1;
+        if (t->modes & VT_M_ORIGIN) row += t->top;
+        t->cy = row; t->cx = col;
+        vbounds(t); hbounds(t);
+        break;
+    }
+    case 'I': for (n = arg(t, 0, 1); n > 0; n--) do_tab(t); break;
+    case 'J': erase_display(t, t->np ? t->par[0] : 0); break;
+    case 'K': erase_line(t, t->np ? t->par[0] : 0); break;
+    case 'L': if (t->cy >= t->top && t->cy <= t->bottom) { region_down(t, t->cy, t->bottom, arg(t, 0, 1)); t->cx = 0; } break;
+    case 'M': if (t->cy >= t->top && t->cy <= t->bottom) { region_up(t, t->cy, t->bottom, arg(t, 0, 1)); t->cx = 0; } break;
+    case 'P': {
+        VtCell *r = rowp(t, t->cy);
+        int x = t->cx >= t->cols ? t->cols - 1 : t->cx;
+        n = arg(t, 0, 1);
+        if (n > t->cols - x) n = t->cols - x;
+        memmove(r + x, r + x + n, (size_t)(t->cols - x - n) * sizeof(VtCell));
+        clear_cells(t, r + t->cols - n, n);
+        touch_row(t, t->cy);
+        break;
+    }
+    case 'S': scroll_up(t, arg(t, 0, 1)); break;
+    case 'T': scroll_down(t, arg(t, 0, 1)); break;
+    case 'X': {
+        int x = t->cx >= t->cols ? t->cols - 1 : t->cx;
+        n = arg(t, 0, 1);
+        if (n > t->cols - x) n = t->cols - x;
+        clear_cells(t, rowp(t, t->cy) + x, n);
+        touch_row(t, t->cy);
+        break;
+    }
+    case 'Z': {
+        for (n = arg(t, 0, 1); n > 0; n--) {
+            int x = t->cx >= t->cols ? t->cols - 1 : t->cx, found = 0;
+            for (int i = x - 1; i >= 0; i--) if (t->tabs[i]) { t->cx = i; found = 1; break; }
+            if (!found) t->cx = 0;
+        }
+        break;
+    }
+    case 'b': for (n = arg(t, 0, 1); n > 0 && t->last_cp; n--) put_cp(t, t->last_cp); break;
+    case 'c':
+        if (!priv && (t->np == 0 || t->par[0] == 0)) reply(t, "\x1b[?62;22c");
+        break;
+    case 'd': {
+        int row = arg(t, 0, 1) - 1;
+        if (t->modes & VT_M_ORIGIN) row += t->top;
+        t->cy = row; vbounds(t);
+        break;
+    }
+    case 'g':
+        if (!t->np || t->par[0] == 0) { if (t->cx < t->cols) t->tabs[t->cx] = 0; }
+        else if (t->par[0] == 3) memset(t->tabs, 0, (size_t)t->cols);
+        break;
+    case 'h': case 'l':
+        for (int i = 0; i < (t->np ? t->np : 1); i++) set_mode(t, t->np ? t->par[i] : 0, f == 'h', priv);
+        break;
+    case 'm': if (!priv) sgr(t); break;
+    case 'n': {
+        int what = t->np ? t->par[0] : 0;
+        if (what == 5) reply(t, "\x1b[0n");
+        else if (what == 6) {
+            char buf[32];
+            int row = t->cy + 1 - ((t->modes & VT_M_ORIGIN) ? t->top : 0);
+            snprintf(buf, sizeof buf, "\x1b[%d;%dR", row, (t->cx >= t->cols ? t->cols : t->cx + 1));
+            reply(t, buf);
+        }
+        break;
+    }
+    case 'r':
+        if (priv) break;
+        if (t->np == 0) { t->top = 0; t->bottom = t->rows - 1; }
+        else {
+            int top = clampi(arg(t, 0, 1) - 1, 0, t->rows - 1);
+            int bot = clampi(arg(t, 1, t->rows) - 1, 0, t->rows - 1);
+            if (bot - top >= 1) { t->top = top; t->bottom = bot; }
+            else break;
+        }
+        cursor_home(t);
+        break;
+    case 's': if (!priv) save_cursor(t, t->cur == &t->alt ? &t->saved_alt : &t->saved_main); break;
+    case 'u': if (!priv) restore_cursor(t, t->cur == &t->alt ? &t->saved_alt : &t->saved_main); break;
+    default: break;
+    }
+}
+
+static void esc_dispatch(Vt *t, uint8_t c) {
+    Saved *s = t->cur == &t->alt ? &t->saved_alt : &t->saved_main;
+    switch (c) {
+    case '7': save_cursor(t, s); break;
+    case '8': restore_cursor(t, s); break;
+    case 'D': do_index(t); break;
+    case 'E': do_index(t); t->cx = 0; break;
+    case 'M': do_reverse_index(t); break;
+    case 'H': if (t->cx < t->cols) t->tabs[t->cx] = 1; break;
+    case 'c': vt_reset(t); break;
+    case '=': t->modes |= VT_M_APP_KEYPAD; break;
+    case '>': t->modes &= ~VT_M_APP_KEYPAD; break;
+    default: break;
+    }
+}
+
+static int hexv(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+
+static void osc_dispatch(Vt *t) {
+    t->osc[t->osc_len] = 0;
+    char *semi = strchr(t->osc, ';');
+    if (!semi) return;
+    int code = atoi(t->osc);
+    const char *text = semi + 1;
+    if (code == 7777) {
+        size_t tl = strlen(t->stream_token);
+        if (!tl || strncmp(text, "cat;", 4) != 0 || strncmp(text + 4, t->stream_token, tl) != 0 || text[4 + tl] != ';') return;
+        char tmp[OSC_MAX + 1];
+        snprintf(tmp, sizeof tmp, "%s", text + 5 + tl);
+        char *f[3] = {NULL, NULL, NULL};
+        for (int k = 0; k < 3; k++) { char *sc = strrchr(tmp, ';'); if (!sc) return; *sc = 0; f[2 - k] = sc + 1; }
+        size_t on = 0;
+        for (const unsigned char *q = (const unsigned char *)tmp; *q && on < OSC_MAX; q++) {
+            if (*q == '%' && hexv((char)q[1]) >= 0 && hexv((char)q[2]) >= 0) { t->stream_path[on++] = (char)(hexv((char)q[1]) * 16 + hexv((char)q[2])); q += 2; }
+            else t->stream_path[on++] = (char)*q;
+        }
+        t->stream_path[on] = 0;
+        t->stream_off = strtoull(f[0], NULL, 10);
+        t->stream_len = strtoull(f[1], NULL, 10);
+        t->stream_flags = (unsigned)strtoul(f[2], NULL, 10);
+        t->stream_pending = t->stream_path[0] == '/';
+        return;
+    }
+    if ((code == 0 || code == 2) && t->event_fn) t->event_fn(VT_EV_TITLE, text, t->user);
+    else if (code == 7 && t->event_fn) {
+        const char *p = strstr(text, "://");
+        p = p ? strchr(p + 3, '/') : NULL;
+        if (!p) return;
+        char out[OSC_MAX + 1];
+        int o = 0;
+        for (; *p && o < OSC_MAX; p++) {
+            if (*p == '%' && hexv(p[1]) >= 0 && hexv(p[2]) >= 0) { out[o++] = (char)(hexv(p[1]) * 16 + hexv(p[2])); p += 2; }
+            else out[o++] = *p;
+        }
+        out[o] = 0;
+        t->event_fn(VT_EV_CWD, out, t->user);
+    }
+}
+
+
+static void control(Vt *t, uint8_t c) {
+    switch (c) {
+    case 0x07: if (t->event_fn) t->event_fn(VT_EV_BELL, NULL, t->user); break;
+    case 0x08: if (t->cx == t->cols) t->cx--; t->cx -= 1; hbounds(t); break;
+    case 0x09: do_tab(t); break;
+    case 0x0a: case 0x0b: case 0x0c: do_linefeed(t); break;
+    case 0x0d: t->cx = 0; break;
+    case 0x0e: t->gl = 1; break;
+    case 0x0f: t->gl = 0; break;
+    default: break;
+    }
+}
+
+static inline void csi_start(Vt *t) {
+    t->st = ST_CSI;
+    t->np = 0;
+    t->have_digit = false;
+    t->priv = 0;
+    t->inter = 0;
+}
+
+/* The SGR sequences programs print most (reset, bold, one plain colour): applied straight to the pen, without the parameter
+ * array, the CSI dispatch switch or the general SGR loop. Anything else returns 0 and takes the general path. */
+static inline size_t sgr_quick(Vt *t, const uint8_t *p, size_t n) {
+    uint8_t a = p[2];
+    if (a == 'm' || (a == '0' && p[3] == 'm')) {
+        t->pen_fg = t->pen_bg = 0; t->pen_attrs = 0;
+        pen_commit(t);
+        return a == 'm' ? 3 : 4;
+    }
+    if (a == '1' && p[3] == 'm') { t->pen_attrs |= VT_BOLD; pen_commit(t); return 4; }
+    if (n >= 5 && p[4] == 'm' && p[3] >= '0' && p[3] <= '7') {
+        unsigned d = (unsigned)(p[3] - '0');
+        if (a == '3') t->pen_fg = VT_COLOR_IDX(d);
+        else if (a == '4') t->pen_bg = VT_COLOR_IDX(d);
+        else if (a == '9') t->pen_fg = VT_COLOR_IDX(d + 8);
+        else return 0;
+        pen_commit(t);
+        return 5;
+    }
+    return 0;
+}
+
+static inline size_t csi_fast(Vt *t, const uint8_t *p, size_t n) {
+    if (n >= 4) { size_t q = sgr_quick(t, p, n); if (q) return q; }
+    size_t i = 2;
+    int np = 0;
+    int cur = 0;
+    bool any = false, sub = false;
+    int *vals = t->par;
+    uint8_t *subs = t->sub;
+    for (; i < n; i++) {
+        uint8_t c = p[i];
+        if (c >= '0' && c <= '9') { cur = cur * 10 + (c - '0'); if (cur > 65535) cur = 65535; any = true; }
+        else if (c == ';' || c == ':') {
+            if (np >= MAX_PARAMS - 1) return 0;
+            vals[np] = cur; subs[np] = sub; np++;
+            cur = 0; any = true; sub = (c == ':');
+        } else if (c >= 0x40 && c <= 0x7e) {
+            if (any) { vals[np] = cur; subs[np] = sub; np++; }
+            t->np = np;
+            t->priv = 0;
+            t->inter = 0;
+            t->have_digit = any;
+            if (c == 'H' && np <= 2 && !subs[0]) {  /* cursor position: the redraw loop of full-screen programs */
+                int row = np > 0 && vals[0] > 0 ? vals[0] : 1, col = np > 1 && vals[1] > 0 ? vals[1] : 1;
+                row--;
+                if (t->modes & VT_M_ORIGIN) row += t->top;
+                t->cy = row; t->cx = col - 1;
+                vbounds(t); hbounds(t);
+                return i + 1;
+            }
+            csi_dispatch(t, c);
+            return i + 1;
+        } else {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
+    size_t i = 0;
+    while (i < n && !t->stream_pending) {
+        uint8_t c = p[i];
+        switch (t->st) {
+        case ST_GROUND:
+            if (c == 0x1b && t->utf_need == 0 && i + 2 < n && p[i + 1] == '[') {
+                size_t used = csi_fast(t, p + i, n - i);
+                if (used) { i += used; continue; }
+            }
+            if (t->utf_need == 0 && c >= 0x20 && c < 0x7f) {
+                size_t run = ascii_run(p + i, n - i);
+                put_ascii(t, p + i, run);
+                i += run;
+                if (i < n && p[i] == '\r') { t->cx = 0; i++; }
+                if (i < n && p[i] == '\n') { do_linefeed(t); i++; }
+                continue;
+            }
+            if (t->utf_need == 0 && c >= 0xc2 && c <= 0xef) {
+                size_t used = utf8_run(t, p + i, n - i);
+                if (used) { i += used; continue; }
+            }
+            i++;
+            if (t->utf_need) {
+                if ((c & 0xC0) == 0x80) {
+                    t->utf_cp = (t->utf_cp << 6) | (c & 0x3f);
+                    if (--t->utf_need == 0) put_cp(t, t->utf_cp);
+                    continue;
+                }
+                t->utf_need = 0;
+                put_cp(t, 0xFFFD);
+                i--;
+                continue;
+            }
+            if (c < 0x20 || c == 0x7f) {
+                if (c == 0x1b) t->st = ST_ESC;
+                else control(t, c);
+            } else if (c >= 0xC2 && c <= 0xDF) { t->utf_need = 1; t->utf_cp = c & 0x1f; }
+            else if (c >= 0xE0 && c <= 0xEF) { t->utf_need = 2; t->utf_cp = c & 0x0f; }
+            else if (c >= 0xF0 && c <= 0xF4) { t->utf_need = 3; t->utf_cp = c & 0x07; }
+            else put_cp(t, 0xFFFD);
+            continue;
+
+        case ST_ESC:
+            i++;
+            if (c == 0x1b) continue;
+            if (c < 0x20) { if (c != 0x18 && c != 0x1a) control(t, c); else t->st = ST_GROUND; continue; }
+            switch (c) {
+            case '[': csi_start(t); break;
+            case ']': t->st = ST_OSC; t->osc_len = 0; break;
+            case 'P': case 'X': case '^': case '_': t->st = ST_STR; break;
+            case '(': case ')': case '*': case '+': t->st = ST_CHARSET; t->charset_slot = c == '(' ? 0 : c == ')' ? 1 : 2; break;
+            case '#': case '%': case ' ': t->st = ST_SKIP1; if (c == '#') t->inter = '#'; else t->inter = 0; break;
+            default: esc_dispatch(t, c); t->st = ST_GROUND; break;
+            }
+            continue;
+
+        case ST_SKIP1:
+            i++;
+            if (t->inter == '#' && c == '8') {
+                VtCell e = {'E', 0};
+                for (int y = 0; y < t->rows; y++) { VtCell *r = rowp(t, y); for (int x = 0; x < t->cols; x++) r[x] = e; touch_row(t, y); }
+            }
+            t->inter = 0;
+            t->st = ST_GROUND;
+            continue;
+
+        case ST_CHARSET:
+            i++;
+            if (t->charset_slot < 2) t->g[t->charset_slot] = c == '0' ? CS_GRAPHICS : CS_US;
+            t->st = ST_GROUND;
+            continue;
+
+        case ST_CSI:
+            i++;
+            if (c == 0x1b) { t->st = ST_ESC; continue; }
+            if (c == 0x18 || c == 0x1a) { t->st = ST_GROUND; continue; }
+            if (c < 0x20) { control(t, c); continue; }
+            if (c >= '0' && c <= '9') {
+                if (t->np == 0) { t->np = 1; t->par[0] = 0; t->sub[0] = 0; }
+                if (t->np <= MAX_PARAMS) {
+                    int *v = &t->par[t->np - 1];
+                    *v = *v * 10 + (c - '0');
+                    if (*v > 65535) *v = 65535;
+                }
+                t->have_digit = true;
+            } else if (c == ';' || c == ':') {
+                if (t->np == 0) { t->np = 1; t->par[0] = 0; t->sub[0] = 0; }
+                if (t->np < MAX_PARAMS) { t->np++; t->par[t->np - 1] = 0; t->sub[t->np - 1] = (c == ':'); }
+            } else if (c >= 0x3c && c <= 0x3f) {
+                if (t->np == 0 && !t->have_digit) t->priv = (char)c;
+            } else if (c >= 0x20 && c <= 0x2f) {
+                t->inter = (char)c;
+            } else if (c >= 0x40 && c <= 0x7e) {
+                csi_dispatch(t, c);
+                t->st = ST_GROUND;
+            }
+            continue;
+
+        case ST_OSC:
+            i++;
+            if (c == 0x07) { osc_dispatch(t); t->st = ST_GROUND; }
+            else if (c == 0x1b) t->st = ST_OSC_ESC;
+            else if (c == 0x18 || c == 0x1a) t->st = ST_GROUND;
+            else if (t->osc_len < OSC_MAX) t->osc[t->osc_len++] = (char)c;
+            continue;
+        case ST_OSC_ESC:
+            i++;
+            if (c == '\\') { osc_dispatch(t); t->st = ST_GROUND; }
+            else { t->st = ST_ESC; i--; }
+            continue;
+
+        case ST_STR:
+            i++;
+            if (c == 0x1b) t->st = ST_STR_ESC;
+            else if (c == 0x07 || c == 0x18 || c == 0x1a) t->st = ST_GROUND;
+            continue;
+        case ST_STR_ESC:
+            i++;
+            if (c == '\\') t->st = ST_GROUND;
+            else { t->st = ST_ESC; i--; }
+            continue;
+        }
+    }
+    return i;
+}
+
+
+void vt_set_threads(int parse_workers, int compress_workers) { cfg_parse_workers = parse_workers; cfg_compress_workers = compress_workers; }
+
+static int parse_workers_count(void) {
+    if (cfg_parse_workers >= 0) return cfg_parse_workers > 16 ? 16 : cfg_parse_workers;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    int w = (int)(n / 2);
+    return w > 8 ? 8 : w;
+}
+
+#define BULK_MIN (128 * 1024)
+#define BULK_TASK_MIN (24 * 1024)
+
+typedef struct BTask {
+    struct BTask *next;
+    const uint8_t *p; size_t n;
+    int cols; uint32_t sf; bool allow0, nl;
+    VtCell *cells; size_t ncells, ccap;
+    struct { uint32_t off; uint16_t hw; uint8_t compact; } *rows; int nrows, rcap;
+    uint8_t *bytes; size_t nbytes, bcap;
+    size_t used;
+    bool stopped;
+    int done;
+} BTask;
+
+static void btask_emit(BTask *tk, const VtCell *row, int hw) {
+    if (tk->ncells + (size_t)hw > tk->ccap) {
+        size_t nc = tk->ccap ? tk->ccap * 2 : 65536;
+        while (nc < tk->ncells + (size_t)hw) nc *= 2;
+        VtCell *p = static_cast<VtCell*>(realloc(tk->cells, nc * sizeof(VtCell)));
+        if (!p) { tk->stopped = true; return; }
+        tk->cells = p; tk->ccap = nc;
+    }
+    if (tk->nrows == tk->rcap) {
+        int nr = tk->rcap ? tk->rcap * 2 : 4096;
+        void *p = realloc(tk->rows, (size_t)nr * sizeof *tk->rows);
+        if (!p) { tk->stopped = true; return; }
+        tk->rows = static_cast<decltype(tk->rows)>(p); tk->rcap = nr;
+    }
+    tk->rows[tk->nrows].off = (uint32_t)tk->ncells; tk->rows[tk->nrows].hw = (uint16_t)hw; tk->rows[tk->nrows].compact = 0; tk->nrows++;
+    copy_cells(tk->cells + tk->ncells, row, (size_t)hw);
+    tk->ncells += (size_t)hw;
+}
+
+static bool btask_breserve(BTask *tk, size_t extra) {
+    if (tk->nbytes + extra <= tk->bcap) return true;
+    size_t nc = tk->bcap ? tk->bcap * 2 : 65536;
+    while (nc < tk->nbytes + extra) nc *= 2;
+    uint8_t *p = static_cast<uint8_t*>(realloc(tk->bytes, nc));
+    if (!p) { tk->stopped = true; return false; }
+    tk->bytes = p; tk->bcap = nc;
+    return true;
+}
+
+static void btask_emit_bytes(BTask *tk, int hw) {
+    if (tk->nrows == tk->rcap) {
+        int nr = tk->rcap ? tk->rcap * 2 : 4096;
+        void *p = realloc(tk->rows, (size_t)nr * sizeof *tk->rows);
+        if (!p) { tk->stopped = true; return; }
+        tk->rows = static_cast<decltype(tk->rows)>(p); tk->rcap = nr;
+    }
+    tk->rows[tk->nrows].off = (uint32_t)tk->nbytes; tk->rows[tk->nrows].hw = (uint16_t)hw; tk->rows[tk->nrows].compact = 1; tk->nrows++;
+    tk->nbytes += (size_t)hw;
+}
+
+static void btask_build(BTask *tk) {
+    const uint8_t *p = tk->p;
+    const size_t n = tk->n;
+    const int cols = tk->cols;
+    const uint32_t sf = tk->sf;
+    VtCell *row = static_cast<VtCell*>(calloc((size_t)cols + 4, sizeof(VtCell)));
+    if (!row) { tk->stopped = true; return; }
+    if (!btask_breserve(tk, (size_t)cols + 4)) { free(row); return; }
+    uint8_t *rb = tk->bytes + tk->nbytes;
+    bool allow = tk->allow0, pure = allow;
+    int rows_seen = 0, rows_imp = 0;
+    int cx = 0, hw = 0;
+    size_t pos = 0, line_start = 0;
+    int line_rows = 0; size_t line_cells = 0, line_bytes = 0;
+    while (pos < n && !tk->stopped) {
+        size_t room = (size_t)(cols - cx), lim = n - pos < room ? n - pos : room;
+        if (lim) {
+            size_t k = ascii_run(p + pos, lim);
+            if (k) { if (pure) memcpy(rb + cx, p + pos, k); else fill_ascii(row + cx, p + pos, k, sf); cx += (int)k; pos += k; hw = cx; if (pos >= n) break; }
+        }
+        uint8_t c = p[pos];
+        if (c >= 0x20 && c < 0x7f) {
+            { bool wp = pure; if (wp) { btask_emit_bytes(tk, hw); if (!btask_breserve(tk, (size_t)cols + 4)) break; rb = tk->bytes + tk->nbytes; } else { btask_emit(tk, row, hw); memset(row, 0, (size_t)hw * sizeof(VtCell)); } rows_seen++; if (!wp) rows_imp++; if (rows_seen == 32) { allow = rows_imp * 4 <= rows_seen; rows_seen = rows_imp = 0; } pure = allow; } cx = 0; hw = 0;
+            continue;
+        }
+        if (c == '\r') {
+            if (pos + 1 >= n || p[pos + 1] != '\n') goto unsafe;
+            { bool wp = pure; if (wp) { btask_emit_bytes(tk, hw); if (!btask_breserve(tk, (size_t)cols + 4)) break; rb = tk->bytes + tk->nbytes; } else { btask_emit(tk, row, hw); memset(row, 0, (size_t)hw * sizeof(VtCell)); } rows_seen++; if (!wp) rows_imp++; if (rows_seen == 32) { allow = rows_imp * 4 <= rows_seen; rows_seen = rows_imp = 0; } pure = allow; } cx = 0; hw = 0;
+            pos += 2;
+            line_start = pos; line_rows = tk->nrows; line_cells = tk->ncells; line_bytes = tk->nbytes;
+            continue;
+        }
+        if (c == '\n' && tk->nl) {
+            { bool wp = pure; if (wp) { btask_emit_bytes(tk, hw); if (!btask_breserve(tk, (size_t)cols + 4)) break; rb = tk->bytes + tk->nbytes; } else { btask_emit(tk, row, hw); memset(row, 0, (size_t)hw * sizeof(VtCell)); } rows_seen++; if (!wp) rows_imp++; if (rows_seen == 32) { allow = rows_imp * 4 <= rows_seen; rows_seen = rows_imp = 0; } pure = allow; } cx = 0; hw = 0;
+            pos += 1;
+            line_start = pos; line_rows = tk->nrows; line_cells = tk->ncells; line_bytes = tk->nbytes;
+            continue;
+        }
+        if (c == '\t') {
+            if (pure) { fill_ascii(row, rb, (size_t)cx, sf); pure = false; }
+            int x = cx >= cols ? cols - 1 : cx, nx = (x / 8 + 1) * 8;
+            cx = nx < cols ? nx : cols - 1;
+            pos++;
+            continue;
+        }
+        if (c < 0x80) goto unsafe;
+        {
+            if (pure) { fill_ascii(row, rb, (size_t)cx, sf); pure = false; }
+            uint32_t cp, L;
+            int w;
+            if (n - pos >= 4) {
+                uint32_t u;
+                memcpy(&u, p + pos, 4);
+                uint32_t b0 = u & 0xff, b1 = (u >> 8) & 0xff, b2 = (u >> 16) & 0xff, b3 = u >> 24;
+                L = U8LEN[b0 >> 4];
+                uint32_t c1 = b1 & 0x3f, c2 = b2 & 0x3f, c3 = b3 & 0x3f;
+                uint32_t cp2 = ((b0 & 0x1f) << 6) | c1, cp3 = ((b0 & 0x0f) << 12) | (c1 << 6) | c2, cp4 = ((b0 & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
+                cp = L == 2 ? cp2 : L == 3 ? cp3 : cp4;
+                uint32_t mn = L == 2 ? 0x80 : L == 3 ? 0x800 : 0x10000;
+                uint32_t ok = (L >= 2) & ((b1 & 0xc0) == 0x80) & ((L < 3) | ((b2 & 0xc0) == 0x80)) & ((L < 4) | ((b3 & 0xc0) == 0x80))
+                            & (cp >= mn) & (cp <= 0x10ffff) & ((cp - 0xd800) > 0x7ff);
+                if (!ok) goto unsafe;
+                if (__builtin_expect(cp >= 0x10000, 0)) { int vw = vt_wcwidth(cp); w = vw == 1 || vw == 2 ? vw : 0; }
+                else w = wtab[cp];
+            } else goto unsafe;
+            if (!w) goto unsafe;
+            if (cx + w > cols) {
+                if (w == 2 && cx == cols - 1) { row[cx].cp = 0; row[cx].sf = 0; }
+                { bool wp = pure; if (wp) { btask_emit_bytes(tk, hw); if (!btask_breserve(tk, (size_t)cols + 4)) break; rb = tk->bytes + tk->nbytes; } else { btask_emit(tk, row, hw); memset(row, 0, (size_t)hw * sizeof(VtCell)); } rows_seen++; if (!wp) rows_imp++; if (rows_seen == 32) { allow = rows_imp * 4 <= rows_seen; rows_seen = rows_imp = 0; } pure = false; } cx = 0; hw = 0;
+            }
+            row[cx].cp = cp;
+            row[cx].sf = sf | (w == 2 ? VT_F_WIDE : 0);
+            if (w == 2) { row[cx + 1].cp = 0; row[cx + 1].sf = sf | VT_F_TAIL; }
+            cx += w; hw = cx;
+            pos += L;
+            continue;
+        }
+    unsafe:
+        tk->stopped = true;
+    }
+    if (tk->stopped) { tk->nrows = line_rows; tk->ncells = line_cells; tk->nbytes = line_bytes; tk->used = line_start; }
+    else tk->used = pos;
+    free(row);
+}
+
+static struct { pthread_mutex_t m; pthread_cond_t work, fin; BTask *q; int started; } bpool = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0};
+
+static void *bpool_worker(void *arg) {
+    prctl(PR_SET_NAME, "lx-parse", 0, 0, 0);
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&bpool.m);
+        while (!bpool.q) pthread_cond_wait(&bpool.work, &bpool.m);
+        BTask *tk = bpool.q;
+        bpool.q = tk->next;
+        pthread_mutex_unlock(&bpool.m);
+        btask_build(tk);
+        pthread_mutex_lock(&bpool.m);
+        tk->done = 1;
+        pthread_cond_broadcast(&bpool.fin);
+        pthread_mutex_unlock(&bpool.m);
+    }
+    return NULL;
+}
+
+static bool btasks_run(BTask *tk, int n) {
+    pthread_mutex_lock(&bpool.m);
+    if (!bpool.started) {
+        int w = parse_workers_count();
+        for (int i = 0; i < w; i++) {
+            pthread_t th;
+            pthread_attr_t at;
+            pthread_attr_init(&at);
+            pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            pthread_attr_setstacksize(&at, 256 * 1024);
+            if (pthread_create(&th, NULL, bpool_worker, NULL) == 0) bpool.started++;
+            pthread_attr_destroy(&at);
+        }
+        if (!bpool.started) bpool.started = -1;
+    }
+    bool usable = bpool.started > 0;
+    if (usable && n > 1) {
+        for (int i = n - 1; i >= 1; i--) { tk[i].next = bpool.q; bpool.q = &tk[i]; }
+        pthread_cond_broadcast(&bpool.work);
+    }
+    pthread_mutex_unlock(&bpool.m);
+    if (!usable) return false;
+    btask_build(&tk[0]);
+    tk[0].done = 1;
+    pthread_mutex_lock(&bpool.m);
+    for (int i = 1; i < n; i++) while (!tk[i].done) pthread_cond_wait(&bpool.fin, &bpool.m);
+    pthread_mutex_unlock(&bpool.m);
+    return true;
+}
+
+static bool bulk_state_ok(Vt *t) {
+    if (t->st != ST_GROUND || t->utf_need || t->cur != &t->main || t->top != 0 || t->bottom != t->rows - 1) return false;
+    if (!(t->modes & VT_M_AUTOWRAP) || (t->modes & VT_M_INSERT) || t->g[t->gl] == CS_GRAPHICS) return false;
+    if (t->cx != 0 || t->cy != t->rows - 1 || rowm(t, t->cy)->hw != 0 || erase_style(t) != 0 || t->stream_pending) return false;
+    for (int i = 0; i < t->cols; i++) if (t->tabs[i] != (i > 0 && i % 8 == 0)) return false;
+    return true;
+}
+
+static void bulk_commit(Vt *t, BTask *tk, int ntasks) {
+    int rows = t->rows, cols = t->cols;
+    {
+        long total = 0, comp = 0;
+        for (int k = 0; k < ntasks; k++) for (int r = 0; r < tk[k].nrows; r++) { total++; comp += tk[k].rows[r].compact; }
+        t->compact_ok = total == 0 || comp * 4 >= total * 3;
+        t->compact_probe++;
+    }
+    long M = 0;
+    for (int k = 0; k < ntasks; k++) M += tk[k].nrows;
+    if (M == 0) return;
+    long keep = rows - 1;
+    long old_stay = M < keep ? keep - M : 0;
+    VtCell *saved = NULL; uint16_t *saved_hw = NULL;
+    if (old_stay) {
+        saved = static_cast<VtCell*>(malloc((size_t)old_stay * (size_t)cols * sizeof(VtCell))); saved_hw = static_cast<uint16_t*>(malloc((size_t)old_stay * sizeof *saved_hw));
+        if (saved && saved_hw) for (long j = 0; j < old_stay; j++) {
+            int y = (int)(M + j);
+            memcpy(saved + j * cols, rowp(t, y), (size_t)cols * sizeof(VtCell));
+            saved_hw[j] = rowm(t, y)->hw;
+        }
+    }
+    long j = 0;
+    for (; j < M && j < keep; j++) hist_push(t, (int)j);
+    VtLineMeta fresh = {.dirty = 1, .hw = 0, .cache = NULL};
+    long hist_new = M > keep ? M - keep : 0;
+    long idx = 0;
+    for (int k = 0; k < ntasks && idx < hist_new; k++)
+        for (int r = 0; r < tk[k].nrows && idx < hist_new; r++, idx++) {
+            VtLineMeta m = fresh; m.hw = tk[k].rows[r].hw;
+            if (tk[k].rows[r].compact) hist_add_compact(t, tk[k].bytes + tk[k].rows[r].off, tk[k].rows[r].hw, tk[k].sf, m, idx + 1 >= hist_new || (idx & 127) == 127);
+            else hist_add(t, tk[k].cells + tk[k].rows[r].off, tk[k].rows[r].hw, m);
+        }
+    int y = 0;
+    for (long q = 0; q < old_stay && saved && saved_hw; q++, y++) {
+        VtCell *dst = rowp(t, y); VtLineMeta *m = rowm(t, y);
+        if (m->cache && t->cache_free) t->cache_free(m->cache, t->user);
+        m->cache = NULL;
+        memset(dst, 0, (size_t)cols * sizeof(VtCell));
+        memcpy(dst, saved + q * cols, (size_t)saved_hw[q] * sizeof(VtCell));
+        m->hw = saved_hw[q]; m->dirty = 1;
+    }
+    for (int k = 0; k < ntasks && y < rows - 1; k++)
+        for (int r = 0; r < tk[k].nrows && y < rows - 1; r++) {
+            long gidx = 0; for (int kk = 0; kk < k; kk++) gidx += tk[kk].nrows; gidx += r;
+            if (gidx < hist_new) continue;
+            VtCell *dst = rowp(t, y); VtLineMeta *m = rowm(t, y);
+            if (m->cache && t->cache_free) t->cache_free(m->cache, t->user);
+            m->cache = NULL;
+            memset(dst, 0, (size_t)cols * sizeof(VtCell));
+            if (tk[k].rows[r].compact) fill_ascii(dst, tk[k].bytes + tk[k].rows[r].off, tk[k].rows[r].hw, tk[k].sf);
+            else copy_cells(dst, tk[k].cells + tk[k].rows[r].off, tk[k].rows[r].hw);
+            m->hw = tk[k].rows[r].hw; m->dirty = 1;
+            y++;
+        }
+    {
+        VtCell *dst = rowp(t, rows - 1); VtLineMeta *m = rowm(t, rows - 1);
+        if (m->cache && t->cache_free) t->cache_free(m->cache, t->user);
+        m->cache = NULL;
+        memset(dst, 0, (size_t)cols * sizeof(VtCell));
+        m->hw = 0; m->dirty = 1;
+    }
+    t->cx = 0; t->cy = rows - 1;
+    free(saved); free(saved_hw);
+}
+
+static void btasks_start(BTask *tk, int n) {
+    pthread_mutex_lock(&bpool.m);
+    for (int i = n - 1; i >= 0; i--) { tk[i].next = bpool.q; bpool.q = &tk[i]; }
+    pthread_cond_broadcast(&bpool.work);
+    pthread_mutex_unlock(&bpool.m);
+}
+
+static void btasks_wait(BTask *tk, int n) {
+    pthread_mutex_lock(&bpool.m);
+    for (int i = 0; i < n; i++) while (!tk[i].done) pthread_cond_wait(&bpool.fin, &bpool.m);
+    pthread_mutex_unlock(&bpool.m);
+}
+
+static int split_tasks(Vt *t, BTask *tk, const uint8_t *p, size_t base, size_t end_all, int want) {
+    size_t start = base, len = end_all - base;
+    int built = 0;
+    for (int k = 0; k < want; k++) {
+        size_t end = end_all;
+        if (k < want - 1) {
+            size_t target = base + len * (size_t)(k + 1) / (size_t)want;
+            const uint8_t *nl = target > start ? static_cast<const uint8_t*>(memchr(p + target, '\n', end_all - target)) : NULL;
+            end = nl ? (size_t)(nl - p) + 1 : end_all;
+        }
+        if (end <= start) continue;
+        tk[built].p = p + start; tk[built].n = end - start; tk[built].cols = t->cols; tk[built].sf = t->pen_style << 8;
+        tk[built].allow0 = t->compact_ok || (t->compact_probe & 7) == 0; tk[built].nl = t->force_nl || t->stream_nl;
+        built++;
+        start = end;
+        if (start >= end_all) break;
+    }
+    return built;
+}
+
+#define BULK_BATCH (192 * 1024)
+#define BULK_MAX_BATCHES 4
+
+static size_t bulk_region(Vt *t, const uint8_t *p, size_t n) {
+    int workers = parse_workers_count();
+    if (workers <= 0 || n < BULK_MIN) return 0;
+    pthread_once(&wtab_once, wtab_build);
+    int nbatch = (int)(n / BULK_BATCH);
+    if (nbatch < 1) nbatch = 1;
+    if (nbatch > BULK_MAX_BATCHES) nbatch = BULK_MAX_BATCHES;
+    size_t bstart[BULK_MAX_BATCHES + 1];
+    bstart[0] = 0;
+    int nb = 1;
+    for (int b = 1; b < nbatch; b++) {
+        size_t target = n * (size_t)b / (size_t)nbatch;
+        const uint8_t *nl = static_cast<const uint8_t*>(memchr(p + target, '\n', n - target));
+        size_t e = nl ? (size_t)(nl - p) + 1 : n;
+        if (e <= bstart[nb - 1] || e >= n) continue;
+        bstart[nb++] = e;
+    }
+    bstart[nb] = n;
+    int per = workers + 1;
+    BTask *tk = static_cast<BTask*>(calloc((size_t)nb * (size_t)per, sizeof *tk));
+    if (!tk) return 0;
+    int off[BULK_MAX_BATCHES], cnt[BULK_MAX_BATCHES];
+    for (int b = 0; b < nb; b++) {
+        off[b] = b * per;
+        int want = b == 0 ? per : workers;
+        size_t span = bstart[b + 1] - bstart[b];
+        int cap = (int)(span / BULK_TASK_MIN);
+        if (want > cap) want = cap;
+        cnt[b] = want < 1 ? 0 : split_tasks(t, tk + off[b], p, bstart[b], bstart[b + 1], want);
+    }
+    size_t consumed = 0;
+    if (cnt[0] >= 2 && btasks_run(tk + off[0], cnt[0])) {
+        bool stopped = false;
+        for (int b = 0; b < nb; b++) {
+            bool next = b + 1 < nb && cnt[b + 1] > 0;
+            if (next) btasks_start(tk + off[b + 1], cnt[b + 1]);
+            int use = 0;
+            for (int k = 0; k < cnt[b]; k++) {
+                consumed += tk[off[b] + k].used;
+                use++;
+                if (tk[off[b] + k].stopped) { stopped = true; break; }
+            }
+            bulk_commit(t, tk + off[b], use);
+            if (next) btasks_wait(tk + off[b + 1], cnt[b + 1]);
+            if (stopped) break;
+            if (b + 1 < nb && cnt[b + 1] == 0) break;
+        }
+    }
+    for (int k = 0; k < nb * per; k++) { free(tk[k].cells); free(tk[k].rows); free(tk[k].bytes); }
+    free(tk);
+    return consumed;
+}
+
+static size_t feed_bulk(Vt *t, const uint8_t *p, size_t n) {
+    size_t i = 0;
+    bool bulk_off = false;
+    while (i < n) {
+        if (!bulk_off && n - i >= BULK_MIN) {
+            for (int guard = 0; i < n && !bulk_state_ok(t) && guard < t->rows + 4; guard++) {
+                const uint8_t *nl = static_cast<const uint8_t*>(memchr(p + i, '\n', n - i));
+                size_t upto = nl ? (size_t)(nl - p) + 1 : n;
+                size_t used = feed_serial(t, p + i, upto - i);
+                i += used;
+                if (used < upto - (i - used)) return i;
+                if (!nl) break;
+            }
+            if (i < n && n - i >= BULK_MIN && bulk_state_ok(t)) {
+                size_t end = n;
+                if (t->esc_scan > 0) {
+                    t->esc_scan--;
+                    const uint8_t *esc = static_cast<const uint8_t*>(memchr(p + i, 0x1b, n - i));
+                    if (esc) { const uint8_t *ls = esc; while (ls > p + i && ls[-1] != '\n') ls--; end = (size_t)(ls - p); t->esc_scan = 16; }
+                }
+                const uint8_t *last = end > i ? static_cast<const uint8_t*>(memrchr(p + i, '\n', end - i)) : NULL;
+                if (last && last > p + i && (last[-1] == '\r' || t->force_nl || t->stream_nl) && (size_t)(last - p) + 1 - i >= BULK_MIN / 2) {
+                    size_t rlen = (size_t)(last - p) + 1 - i;
+                    size_t used = bulk_region(t, p + i, rlen);
+                    if (used < rlen) t->esc_scan = 16;
+                    if (used) { i += used; if (used < (size_t)(last - p) + 1 - i + used) bulk_off = true; continue; }
+                }
+            }
+            bulk_off = true;
+        }
+        size_t used = feed_serial(t, p + i, n - i);
+        i += used;
+        break;
+    }
+    return i;
+}
+
+static double mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec; }
+
+size_t vt_feed_stream(Vt *t, const uint8_t *p, size_t n) {
+    if (n < BULK_MIN || !fast_paths || parse_workers_count() <= 0) return feed_serial(t, p, n);
+    bool use_bulk;
+    if (t->rate_bulk == 0) use_bulk = true;
+    else if (t->rate_serial == 0) use_bulk = false;
+    else { use_bulk = t->rate_bulk >= t->rate_serial; if (++t->batch_no % 16 == 0) use_bulk = !use_bulk; }
+    double t0 = mono_ns();
+    size_t used = use_bulk ? feed_bulk(t, p, n) : feed_serial(t, p, n);
+    double dt = mono_ns() - t0;
+    if (use_bulk && !t->bulk_warm) { t->bulk_warm = true; return used; }
+    if (dt > 0 && used >= BULK_MIN / 2) {
+        double r = (double)used / dt;
+        double *rate = use_bulk ? &t->rate_bulk : &t->rate_serial;
+        *rate = *rate == 0 ? r : *rate * 0.7 + r * 0.3;
+    }
+    return used;
+}
+
+void vt_feed(Vt *t, const uint8_t *p, size_t n) { vt_feed_stream(t, p, n); }
+
+void vt_set_stream_token(Vt *t, const char *token) { snprintf(t->stream_token, sizeof t->stream_token, "%s", token ? token : ""); }
+
+bool vt_take_stream(Vt *t, char *path, size_t cap, uint64_t *off, uint64_t *len, unsigned *flags) {
+    if (!t->stream_pending) return false;
+    t->stream_pending = false;
+    snprintf(path, cap, "%s", t->stream_path);
+    *off = t->stream_off; *len = t->stream_len; *flags = t->stream_flags;
+    return true;
+}
+
+static void reset_tabs(Vt *t) {
+    free(t->tabs);
+    t->tabs = static_cast<uint8_t*>(calloc((size_t)t->cols + 1, 1));
+    for (int i = 8; i < t->cols; i += 8) t->tabs[i] = 1;
+}
+
+void vt_reset(Vt *t) {
+    t->pen_fg = t->pen_bg = 0;
+    t->pen_attrs = 0;
+    pen_commit(t);
+    t->modes = VT_M_AUTOWRAP | VT_M_CURSOR_VISIBLE;
+    t->cur = &t->main;
+    t->top = 0;
+    t->bottom = t->rows - 1;
+    t->g[0] = t->g[1] = CS_US;
+    t->gl = 0;
+    t->cursor_style = 0;
+    t->st = ST_GROUND;
+    t->utf_need = 0;
+    memset(&t->saved_main, 0, sizeof t->saved_main);
+    memset(&t->saved_alt, 0, sizeof t->saved_alt);
+    memset(&t->saved_1049, 0, sizeof t->saved_1049);
+    for (int y = 0; y < t->rows; y++) clear_row(t, y);
+    t->cx = t->cy = 0;
+    reset_tabs(t);
+}
+
+#ifdef __GLIBC__
+static void malloc_once(void) {
+    mallopt(M_TRIM_THRESHOLD, 8 << 20);
+    mallopt(M_TOP_PAD, 3 << 20);
+    mallopt(M_MMAP_THRESHOLD, 4 << 20);
+}
+static pthread_once_t malloc_tuned = PTHREAD_ONCE_INIT;
+#endif
+
+Vt *vt_new(int cols, int rows, int scrollback) {
+#ifdef __GLIBC__
+    pthread_once(&malloc_tuned, malloc_once);
+#endif
+    Vt *t = static_cast<Vt*>(calloc(1, sizeof *t));
+    if (cols < 2) cols = 2;
+    if (rows < 2) rows = 2;
+    t->cols = cols; t->rows = rows;
+    t->spill_fd = -1;
+    t->ram_budget = DEFAULT_RAM_BUDGET;
+    t->disk_budget = DEFAULT_DISK_BUDGET;
+    t->spill = true;
+    t->max_lines = scrollback < 0 ? -1 : scrollback;
+    t->hcap = (scrollback < 0 || scrollback > HOT_KEEP + BLOCK_LINES) ? HOT_KEEP + BLOCK_LINES : (scrollback > 0 ? scrollback : 1);
+    { int sz = 1; while (sz < t->hcap) sz <<= 1; t->hmask = sz - 1; t->hist = static_cast<HEnt*>(calloc((size_t)sz, sizeof(HEnt))); }
+    style_table_init(t);
+    scr_alloc(&t->main, cols, rows);
+    scr_alloc(&t->alt, cols, rows);
+    t->cur = &t->main;
+    vt_reset(t);
+    return t;
+}
+
+void vt_free(Vt *t) {
+    if (!t) return;
+    vt_clear_history(t);
+    if (t->hseg) { free(t->hseg->buf); free(t->hseg->bbuf); free(t->hseg); }
+    free(t->hist);
+    free(t->blocks);
+    spill_close(t);
+    scr_free(t, &t->main, t->rows);
+    scr_free(t, &t->alt, t->rows);
+    free(t->tabs); free(t->styles); free(t->style_hash);
+    free(t);
+}
+
+void vt_set_callbacks(Vt *t, VtWriteFn w, VtEventFn e, VtCacheFree cf, void *user) {
+    t->write_fn = w; t->event_fn = e; t->cache_free = cf; t->user = user;
+}
+
+void vt_resize(Vt *t, int cols, int rows) {
+    if (cols < 2) cols = 2;
+    if (rows < 2) rows = 2;
+    if (cols == t->cols && rows == t->rows) return;
+    bool was_alt = t->cur == &t->alt;
+    int old_cols = t->cols, old_rows = t->rows;
+
+    Scr *m = &t->main;
+    int shift = (!was_alt && t->cy >= rows) ? t->cy - rows + 1 : 0;
+    Scr *saved_cur = t->cur;
+    t->cur = m;
+    for (int k = 0; k < shift; k++) hist_push(t, k);
+    t->cur = saved_cur;
+
+    Scr nm, na;
+    scr_alloc(&nm, cols, rows);
+    scr_alloc(&na, cols, rows);
+    int w = cols < old_cols ? cols : old_cols;
+    for (int y = 0; y < rows; y++) {
+        int sy = y + shift;
+        if (sy < old_rows) {
+            int slot = m->order[sy];
+            memcpy(nm.cells + (size_t)y * (size_t)cols, m->cells + (size_t)slot * (size_t)old_cols, (size_t)w * sizeof(VtCell));
+            nm.meta[y].hw = (uint16_t)w;
+            VtCell *last = nm.cells + (size_t)y * (size_t)cols + w - 1;
+            if (w < old_cols && (last->sf & VT_F_WIDE)) { last->cp = 0; last->sf &= ~(uint32_t)VT_F_WIDE; }
+        }
+        if (y < old_rows) {
+            int aslot = t->alt.order[y];
+            memcpy(na.cells + (size_t)y * (size_t)cols, t->alt.cells + (size_t)aslot * (size_t)old_cols, (size_t)w * sizeof(VtCell));
+            na.meta[y].hw = (uint16_t)w;
+        }
+    }
+    scr_free(t, &t->main, old_rows);
+    scr_free(t, &t->alt, old_rows);
+    t->main = nm;
+    t->alt = na;
+    t->cur = was_alt ? &t->alt : &t->main;
+    t->cols = cols;
+    t->rows = rows;
+    t->cy = clampi(t->cy - shift, 0, rows - 1);
+    t->cx = clampi(t->cx, 0, cols - 1);
+    t->top = 0;
+    t->bottom = rows - 1;
+    reset_tabs(t);
+    vt_mark_all_dirty(t);
+}
+
+void vt_mark_all_dirty(Vt *t) {
+    for (int i = 0; i < t->rows; i++) { t->main.meta[i].dirty = 1; t->alt.meta[i].dirty = 1; }
+    for (int i = 0; i < t->hcount; i++) t->hist[(t->hhead + i) & t->hmask].meta.dirty = 1;
+    for (int i = 0; i < CACHE_ENTRIES; i++)
+        if (t->cache[i]) for (int k = 0; k < t->cache[i]->nlines; k++) t->cache[i]->meta[k].dirty = 1;
+}
+
+int vt_cols(const Vt *t) { return t->cols; }
+int vt_rows(const Vt *t) { return t->rows; }
+uint32_t vt_modes(const Vt *t) { return t->modes; }
+int vt_cursor_x(const Vt *t) { return t->cx; }
+int vt_cursor_y(const Vt *t) { return t->cy; }
+int vt_cursor_style(const Vt *t) { return t->cursor_style; }
+int vt_history_count(const Vt *t) { long n = total_lines(t); return t->cur == &t->alt ? 0 : (n > INT_MAX ? INT_MAX : (int)n); }
+
+VtCell *vt_line(Vt *t, int idx, int *len) {
+    if (idx >= 0) {
+        if (idx >= t->rows) return NULL;
+        if (len) *len = t->cols;
+        return rowp(t, idx);
+    }
+    if (t->cur == &t->alt) return NULL;
+    VtCell *cells = NULL;
+    int l = 0;
+    if (!hist_lookup(t, idx, &cells, &l, NULL)) return NULL;
+    if (len) *len = l;
+    static VtCell empty[1];
+    return cells ? cells : empty;
+}
+
+VtLineMeta *vt_line_meta(Vt *t, int idx) {
+    if (idx >= 0) return idx < t->rows ? rowm(t, idx) : NULL;
+    if (t->cur == &t->alt) return NULL;
+    VtLineMeta *m = NULL;
+    return hist_lookup(t, idx, NULL, NULL, &m) ? m : NULL;
+}
+
+size_t vt_memory_used(const Vt *t) {
+    size_t n = sizeof *t + (size_t)t->cstyles * sizeof(VtStyle) + (size_t)(t->hash_mask + 1) * sizeof(uint32_t);
+    n += 2 * ((size_t)t->cols * (size_t)t->rows * sizeof(VtCell) + (size_t)t->rows * (sizeof(VtLineMeta) + sizeof(int)));
+    VtHistoryStats h;
+    vt_history_stats(t, &h);
+    return n + (size_t)(t->hmask + 1) * sizeof(HEnt) + h.hot_bytes + h.packed_bytes + h.cache_bytes + (size_t)t->bcap * sizeof(Block);
+}

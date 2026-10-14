@@ -41,10 +41,10 @@ for cand in apt-get dnf yum pacman zypper apk; do have "$cand" && { PM="$cand"; 
 
 pkgs() {
   case "$PM" in
-    apt-get) echo build-essential pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libglib2.0-dev libcurl4-openssl-dev openssh-client libgl1 libegl1 libgles2 libgl1-mesa-dri ;;
-    dnf|yum) echo gcc make pkgconf-pkg-config SDL2-devel freetype-devel fontconfig-devel glib2-devel libcurl-devel openssh-clients mesa-libGL mesa-libEGL mesa-libGLES mesa-dri-drivers ;;
-    pacman)  echo base-devel pkgconf sdl2 freetype2 fontconfig glib2 curl openssh mesa ;;
-    zypper)  echo gcc make pkg-config SDL2-devel freetype2-devel fontconfig-devel glib2-devel libcurl-devel openssh-clients Mesa-libGL1 Mesa-libEGL1 Mesa-libGLESv2-2 Mesa-dri ;;
+    apt-get) echo build-essential pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libcurl4-openssl-dev openssh-client libgl1 libegl1 libgles2 libgl1-mesa-dri ;;
+    dnf|yum) echo gcc-c++ make pkgconf-pkg-config SDL2-devel freetype-devel fontconfig-devel libcurl-devel openssh-clients mesa-libGL mesa-libEGL mesa-libGLES mesa-dri-drivers ;;
+    pacman)  echo base-devel pkgconf sdl2 freetype2 fontconfig curl openssh mesa ;;
+    zypper)  echo gcc-c++ make pkg-config SDL2-devel freetype2-devel fontconfig-devel libcurl-devel openssh-clients Mesa-libGL1 Mesa-libEGL1 Mesa-libGLESv2-2 Mesa-dri ;;
   esac
 }
 
@@ -59,7 +59,7 @@ profiling_pkgs() {
 }
 
 install_deps() {
-  [ -n "$PM" ] && [ "$PM" != apk ] && [ "$SUDO" != none ] || { warn "cannot install packages here; install gcc, make, pkg-config and the SDL2, FreeType, fontconfig, GLib and libcurl development files, and Mesa's OpenGL libraries, yourself"; return 1; }
+  [ -n "$PM" ] && [ "$PM" != apk ] && [ "$SUDO" != none ] || { warn "cannot install packages here; install g++, make, pkg-config and the SDL2, FreeType, fontconfig and libcurl development files, and Mesa's OpenGL libraries, yourself"; return 1; }
   say "Installing build dependencies with $PM"
   case "$PM" in
     apt-get) $SUDO apt-get update -y >/dev/null; $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $(pkgs)
@@ -73,7 +73,7 @@ install_deps() {
   esac
 }
 
-need_deps() { pkg-config --exists sdl2 freetype2 fontconfig glib-2.0 gio-2.0 libcurl 2>/dev/null && have gcc && have make; }
+need_deps() { pkg-config --exists sdl2 freetype2 fontconfig libcurl 2>/dev/null && have g++ && have make; }
 
 if ! need_deps; then
   if [ "$DEPS" = no ]; then :
@@ -83,7 +83,7 @@ if ! need_deps; then
   fi
 fi
 if ! need_deps; then
-  echo "Missing build requirements: gcc, make, pkg-config and the development files of SDL2, FreeType, fontconfig, GLib and libcurl." >&2
+  echo "Missing build requirements: g++, make, pkg-config and the development files of SDL2, FreeType, fontconfig and libcurl." >&2
   echo "  SDL2 found: $(pkg-config --modversion sdl2 2>/dev/null || echo none)   (any current distribution ships it; at run time OpenGL 3.3, OpenGL ES 3.0 or ES 2.0 is needed)" >&2
   exit 1
 fi

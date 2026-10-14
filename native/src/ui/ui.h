@@ -11,7 +11,7 @@
 #include "render.h"
 
 typedef struct { float x, y, w, h; } Rect;
-static inline Rect R(float x, float y, float w, float h) { return (Rect){x, y, w, h}; }
+static inline Rect R(float x, float y, float w, float h) { return Rect{x, y, w, h}; }
 #define UI_MAX_HITS 1024
 extern float ui_ptr_x, ui_ptr_y;
 extern Rect ui_hits[UI_MAX_HITS];
@@ -22,7 +22,7 @@ static inline bool rect_has(Rect r, float px, float py) {
     if (ui_hits_on && px == ui_ptr_x && py == ui_ptr_y) { if (ui_nhits < UI_MAX_HITS) ui_hits[ui_nhits++] = r; else ui_hits_full = true; }
     return in;
 }
-static inline Rect rect_inset(Rect r, float d) { return (Rect){r.x + d, r.y + d, r.w - 2 * d, r.h - 2 * d}; }
+static inline Rect rect_inset(Rect r, float d) { return Rect{r.x + d, r.y + d, r.w - 2 * d, r.h - 2 * d}; }
 
 typedef struct {
     uint32_t bg0, bg1, bg2, ink, ink2, muted, border, border2, accent, on_accent, hover, up, down, blue, red, term_bg;
