@@ -289,7 +289,7 @@ static inline uint32_t intern_cached(Vt *t, uint32_t fg, uint32_t bg, uint16_t a
 }
 
 static inline void pen_commit(Vt *t) {
-    t->pen_style = intern_cached(t, t->pen_fg, t->pen_bg, t->pen_attrs);
+    t->pen_style = (t->pen_fg | t->pen_bg | t->pen_attrs) ? intern_cached(t, t->pen_fg, t->pen_bg, t->pen_attrs) : 0;
     t->erase_valid = false;
 }
 
@@ -933,11 +933,12 @@ static void hist_push(Vt *t, int y) {
                 __m128i sf1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(3, 1, 3, 1)));
                 acc = _mm_or_si128(acc, _mm_or_si128(_mm_and_si128(_mm_or_si128(cp0, cp1), hi), _mm_or_si128(_mm_xor_si128(sf0, sfv), _mm_xor_si128(sf1, sfv))));
                 _mm_storel_epi64((__m128i *)(bytes + i), _mm_packus_epi16(_mm_packs_epi32(cp0, cp1), zero));
+                if (_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) != 0xFFFF) break;  /* a second style or a non-ASCII cell: stop packing */
             }
             bad = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) ^ 0xFFFFu;
         }
 #endif
-        for (; i < len; i++) {
+        for (; !bad && i < len; i++) {
             bad |= (src[i].cp & ~0xFFu) | (src[i].sf ^ sf);
             bytes[i] = (uint8_t)src[i].cp;
         }
@@ -1146,7 +1147,7 @@ static void region_up(Vt *t, int top, int bottom, int n) {
     int *ord = t->cur->order;
     if (n == 1) {
         int first = ord[top];
-        for (int i = top; i < bottom; i++) ord[i] = ord[i + 1];
+        memmove(ord + top, ord + top + 1, (size_t)(bottom - top) * sizeof(int));
         ord[bottom] = first;
         clear_row(t, bottom);
         return;
@@ -1901,6 +1902,14 @@ static inline size_t csi_fast(Vt *t, const uint8_t *p, size_t n) {
             t->priv = 0;
             t->inter = 0;
             t->have_digit = any;
+            if (c == 'H' && np <= 2 && !subs[0]) {  /* cursor position: the redraw loop of full-screen programs */
+                int row = np > 0 && vals[0] > 0 ? vals[0] : 1, col = np > 1 && vals[1] > 0 ? vals[1] : 1;
+                row--;
+                if (t->modes & VT_M_ORIGIN) row += t->top;
+                t->cy = row; t->cx = col - 1;
+                vbounds(t); hbounds(t);
+                return i + 1;
+            }
             csi_dispatch(t, c);
             return i + 1;
         } else {
