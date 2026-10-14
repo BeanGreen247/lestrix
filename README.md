@@ -91,6 +91,15 @@ Measured on the same machine (Intel i5-8265U, Debian 13, g++ 14.2 against gcc 14
 
 So the rewrite is a maintenance change, not a speed change: throughput is unchanged, start-up is slightly slower and the binary is larger. No speed-up was expected or found.
 
+First tuning step on the C++ base (colour output was the slowest engine test, so it went first): the common SGR sequences (`ESC[m`, `ESC[0m`, `ESC[1m`, and one plain colour such as `ESC[31m`, `ESC[44m`, `ESC[92m`) are applied straight to the pen from the CSI fast parser, without filling the parameter array, going through the CSI dispatch switch and the general SGR loop. A new test feeds every `ESC[Nm` form for N = -2..111, under three starting pens, once whole and once byte by byte and requires the same style; changing one constant makes it fail 24 checks. The original C engine and the new one also give byte-identical screens on 600 random streams (`tests/dump_vt`).
+
+| Measure | before (0.3.0 C / 0.4.0 first cut) | after the SGR shortcut | Change |
+|---|---|---|---|
+| Colour-heavy engine run, instructions executed (callgrind, 4 MB; includes about 95 M for generating the test text) | 224 M | 200 M | 18% fewer for the engine alone (about 130 M to 106 M) |
+| `csi_dispatch` instructions in that run | 25.6 M | 5.1 M | 5x fewer |
+| Colour-heavy engine speed (`make bench`, 16 MB, 5 interleaved runs, median) | 270 MB/s | 372 MB/s | faster, but this machine has two cores and the runs vary from 212 to 375 MB/s, so treat the size as indicative; the instruction counts above are the exact figure |
+| Plain log, no scrollback / 10,000 lines (`perf_gate`) | 1478 / 928 MB/s | 1532 / 897 MB/s | none (no escape sequences in that test) |
+
 ### Speed is a feature
 
 A terminal sits between you and everything you run. When it is slow, `tail -f` on a busy log lags, a build scrolls in jerks, and pasting a large file freezes the window. When it is wasteful, it takes memory and battery from the editor, the compiler and the browser next to it. So speed is treated as a requirement, not a nice extra:

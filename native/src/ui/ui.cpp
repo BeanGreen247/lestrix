@@ -400,7 +400,7 @@ struct IconDef { const Prim *p; int n; };
 /* Indexed by UiIcon; the order must match the enum in ui.h. */
 static const IconDef ICONS[IC_COUNT] = {
     {nullptr, 0}, /* IC_NONE */
-    {nullptr, 0}, /* IC_PIN */
+    {P_PIN, 3}, /* IC_PIN */
     {P_CLOSE, 2}, /* IC_CLOSE */
     {P_PLUS, 2}, /* IC_PLUS */
     {P_COPY, 2}, /* IC_COPY */

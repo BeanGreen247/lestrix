@@ -10,10 +10,9 @@
 #include <unistd.h>
 #include <string.h>
 
+#include <string>
+
 static int failures, checks;
-#define FALSE 0
-#define TRUE 1
-typedef int gboolean;
 #define CHECK(cond) do { checks++; if (!(cond)) { failures++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
 
 static void feed(Vt *t, const char *s) { vt_feed(t, (const uint8_t *)s, strlen(s)); }
@@ -238,10 +237,10 @@ static void test_compact_history_and_styles(void) {
     CHECK(VT_CELL_STYLE(l[2]) == 0);
     feed(t, "\r\n\x1b[44m \x1b[0m");
     for (int i = 0; i < 15; i++) feed(t, "\r\n");
-    gboolean found = FALSE;
+    bool found = false;
     for (int k = 1; k <= 20; k++) {
         h = vt_line(t, -k, &len);
-        if (h && len == 1 && vt_style(t, VT_CELL_STYLE(h[0]))->bg == VT_COLOR_IDX(4)) found = TRUE;
+        if (h && len == 1 && vt_style(t, VT_CELL_STYLE(h[0]))->bg == VT_COLOR_IDX(4)) found = true;
     }
     CHECK(found);
     vt_free(t);
@@ -446,7 +445,34 @@ static void test_history_segments(void) {
     vt_free(t);
 }
 
+/* The one-call SGR shortcut must give exactly what the general parser gives, so feed every "ESC [ N m" form whole and byte by byte. */
+static void test_sgr_quick_path_matches_general_path() {
+    char seq[32];
+    for (int pre = 0; pre < 3; pre++) {
+        const char *setup = pre == 0 ? "" : pre == 1 ? "\x1b[1;33;44m" : "\x1b[7;4;96;102m";
+        for (int n = -2; n < 112; n++) {
+            if (n == -2) snprintf(seq, sizeof seq, "\x1b[m");
+            else if (n == -1) snprintf(seq, sizeof seq, "\x1b[00m");
+            else snprintf(seq, sizeof seq, "\x1b[%dm", n);
+            std::string text = std::string(setup) + "p" + seq + "Q";
+            Vt *a = vt_new(20, 3, 100), *b = vt_new(20, 3, 100);
+            vt_feed(a, (const uint8_t *)text.data(), text.size());
+            for (char c : text) vt_feed(b, (const uint8_t *)&c, 1);
+            int la = 0, lb = 0;
+            VtCell *ra = vt_line(a, vt_history_count(a), &la), *rb = vt_line(b, vt_history_count(b), &lb);
+            bool same = ra && rb && la >= 2 && lb >= 2;
+            if (same) {
+                const VtStyle *sa = vt_style(a, VT_CELL_STYLE(ra[1])), *sb = vt_style(b, VT_CELL_STYLE(rb[1]));
+                same = sa->fg == sb->fg && sa->bg == sb->bg && sa->attrs == sb->attrs;
+            }
+            CHECK(same);
+            vt_free(a); vt_free(b);
+        }
+    }
+}
+
 int main(void) {
+    test_sgr_quick_path_matches_general_path();
     test_history_segments();
     test_stream_requests();
     test_basic_and_wrap(); test_scrollback_ring(); test_insert_delete_lines(); test_edit_chars_at_pending_wrap();

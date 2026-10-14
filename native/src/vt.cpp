@@ -294,7 +294,7 @@ static inline void pen_commit(Vt *t) {
 }
 
 static inline uint32_t erase_style(Vt *t) {
-    if (!t->erase_valid) { t->erase_style = intern_style(t, 0, t->pen_bg, 0); t->erase_valid = true; }
+    if (!t->erase_valid) { t->erase_style = t->pen_bg ? intern_cached(t, 0, t->pen_bg, 0) : 0; t->erase_valid = true; }
     return t->erase_style;
 }
 
@@ -1858,7 +1858,30 @@ static inline void csi_start(Vt *t) {
     t->inter = 0;
 }
 
+/* The SGR sequences programs print most (reset, bold, one plain colour): applied straight to the pen, without the parameter
+ * array, the CSI dispatch switch or the general SGR loop. Anything else returns 0 and takes the general path. */
+static inline size_t sgr_quick(Vt *t, const uint8_t *p, size_t n) {
+    uint8_t a = p[2];
+    if (a == 'm' || (a == '0' && p[3] == 'm')) {
+        t->pen_fg = t->pen_bg = 0; t->pen_attrs = 0;
+        pen_commit(t);
+        return a == 'm' ? 3 : 4;
+    }
+    if (a == '1' && p[3] == 'm') { t->pen_attrs |= VT_BOLD; pen_commit(t); return 4; }
+    if (n >= 5 && p[4] == 'm' && p[3] >= '0' && p[3] <= '7') {
+        unsigned d = (unsigned)(p[3] - '0');
+        if (a == '3') t->pen_fg = VT_COLOR_IDX(d);
+        else if (a == '4') t->pen_bg = VT_COLOR_IDX(d);
+        else if (a == '9') t->pen_fg = VT_COLOR_IDX(d + 8);
+        else return 0;
+        pen_commit(t);
+        return 5;
+    }
+    return 0;
+}
+
 static inline size_t csi_fast(Vt *t, const uint8_t *p, size_t n) {
+    if (n >= 4) { size_t q = sgr_quick(t, p, n); if (q) return q; }
     size_t i = 2;
     int np = 0;
     int cur = 0;
