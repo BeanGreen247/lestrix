@@ -929,21 +929,33 @@ static void draw_strip(App *a) {
         if (r.x + r.w < view.x || r.x > view.x + view.w) continue;
         bool active = (int)i == a->cur;
         bool hov = ui_hover(u, r) && rect_has(view, ui_mx(u), ui_my(u));
-        if (active) { ui_rect(u, r, a->pal.bg); ui_rect(u, R(r.x, r.y + r.h - P(2), r.w, P(2)), c->accent); }
-        else if (hov) ui_rect(u, r, c->hover);
-        uint32_t tint = !t->color.empty() ? ui_rgba(t->color.c_str(), 255) : (active ? c->ink : c->ink2);
-        ui_icon(u, kind_icon(t->kind), R(r.x + P(10), r.y + (r.h - P(16)) / 2, P(16), P(16)), t->color[0] ? tint : c->muted);
+        /* A coloured tab gets the colour as its background, with dark or light text picked for contrast, so it reads on any colour. */
+        bool coloured = !t->color.empty();
+        uint32_t tint = active ? c->ink : c->ink2, icon_col = c->muted, close_col = active || hov ? c->ink2 : c->muted;
+        if (coloured) {
+            uint32_t base = ui_rgba(t->color.c_str(), 255);
+            uint32_t fill = active ? base : ui_mix(c->bg0, base, hov ? 0.85 : 0.65);
+            double lum = (0.299 * (fill & 255) + 0.587 * ((fill >> 8) & 255) + 0.114 * ((fill >> 16) & 255)) / 255.0;
+            uint32_t fg = lum > 0.55 ? RGBA(16, 18, 20, 255) : RGBA(255, 255, 255, 255);
+            ui_rrect(u, R(r.x + P(1), r.y + P(3), r.w - P(2), r.h - P(3)), fill, P(6));
+            if (active) ui_rect(u, R(r.x + P(1), r.y + r.h - P(2), r.w - P(2), P(2)), fg);
+            tint = icon_col = close_col = fg;
+        } else {
+            if (active) { ui_rect(u, r, a->pal.bg); ui_rect(u, R(r.x, r.y + r.h - P(2), r.w, P(2)), c->accent); }
+            else if (hov) ui_rect(u, r, c->hover);
+        }
+        ui_icon(u, kind_icon(t->kind), R(r.x + P(10), r.y + (r.h - P(16)) / 2, P(16), P(16)), coloured ? icon_col : c->muted);
         float lx = r.x + P(10 + 16 + 8);
         float dotw = t->state == ST_IDLE ? 0 : P(14);
         ui_text_fit(u, R(lx, r.y, r.w - P(10 + 16 + 8) - P(30) - dotw, r.h), t->title.c_str(), tint, 0);
         if (t->state != ST_IDLE) {
-            uint32_t dc = t->state == ST_ACTIVITY ? c->blue : t->state == ST_BELL ? c->red : c->muted;
+            uint32_t dc = coloured ? tint : t->state == ST_ACTIVITY ? c->blue : t->state == ST_BELL ? c->red : c->muted;
             ui_rrect(u, R(r.x + r.w - P(30) - P(10), r.y + (r.h - P(8)) / 2, P(8), P(8)), dc, P(4));
         }
         Rect cx = R(r.x + r.w - P(26), r.y + (r.h - P(20)) / 2, P(20), P(20));
         bool chov = ui_hover(u, cx);
-        if (chov) ui_rrect(u, cx, c->hover, P(4));
-        ui_icon(u, IC_CLOSE, rect_inset(cx, P(3)), chov ? c->red : (active || hov ? c->ink2 : c->muted));
+        if (chov) ui_rrect(u, cx, coloured ? 0x40000000u : c->hover, P(4));
+        ui_icon(u, IC_CLOSE, rect_inset(cx, P(3)), chov && !coloured ? c->red : close_col);
         if (hov) ui_set_cursor(u, 2);
         if (chov && ui_mouse_pressed(u, 1, cx)) close_idx = (int)i;
         else if (hov && ui_mouse_pressed(u, 1, r)) {
