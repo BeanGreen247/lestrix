@@ -24,7 +24,7 @@ static double run(const char *data, size_t len, int scrollback) {
 
 int main(void) {
     size_t want = 8u << 20, n = 0;
-    char *buf = malloc(want + 256);
+    char *buf = static_cast<char*>(malloc(want + 256));
     for (int i = 0; n < want; i++)
         n += (size_t)snprintf(buf + n, 200, "2026-10-03 12:00:%02d INFO worker-%d processed request id=%d in %d ms\r\n", i % 60, i % 8, i, i % 97);
     double best_plain = 0, best_hist = 0;

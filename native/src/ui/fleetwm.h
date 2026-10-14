@@ -5,20 +5,21 @@
 
 #ifndef SD_FLEETWM_H
 #define SD_FLEETWM_H
-#include <stdbool.h>
 
-typedef struct {
-    bool found;
-    char theme[64];
-    bool rounded;
-    bool accent_auto;
-    char accent[16];
-    double stamp;
-} FleetCfg;
+#include <string>
+
+struct FleetCfg {
+    bool found = false;
+    std::string theme = "dark";
+    bool rounded = true;
+    bool accent_auto = true;
+    std::string accent;
+    double stamp = 0;
+};
 
 void fleetwm_read(FleetCfg *out);
-double fleetwm_stamp(void);
-bool fleetwm_watch_start(void);  /* inotify thread; false: keep polling */
-bool fleetwm_watch_take(void);   /* true once after the config directories changed */
-const char *fleetwm_theme_name(const char *key);
+double fleetwm_stamp();
+bool fleetwm_watch_start();  /* inotify thread; false: keep polling */
+bool fleetwm_watch_take();   /* true once after the config directories changed */
+const char *fleetwm_theme_name(const std::string &key);
 #endif

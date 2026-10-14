@@ -6,50 +6,59 @@
 #ifndef SD_STORE_H
 #define SD_STORE_H
 
-#include <glib.h>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
-typedef struct {
-    char *id, *name, *group, *host, *user, *key;
-    char *x11;
-    char *options;
-    char *remote_command;
-    char *alias;
-    char *color;
-    char *protocol;
-    int port;
-    double last_used;
-} SdConn;
+struct SdConn {
+    std::string id, name, group = "Ungrouped", host, user, key;
+    std::string x11 = "off";
+    std::string options;
+    std::string remote_command;
+    std::string alias;
+    std::string color;
+    std::string protocol = "ssh";
+    int port = 22;
+    double last_used = 0;
 
-typedef struct {
-    char *path;
-    GPtrArray *conns;
-    GPtrArray *live;
-    GHashTable *meta;
-} SdStore;
+    SdConn();
+    bool is_live() const { return !alias.empty(); }
+    std::string dest() const;
+    std::vector<std::string> argv(const char *control_path) const;
+};
 
-SdConn *sd_conn_new(void);
-SdConn *sd_conn_copy(const SdConn *c);
-void sd_conn_free(SdConn *c);
-void sd_conn_set(char **field, const char *value);
-gboolean sd_conn_is_live(const SdConn *c);
-char *sd_conn_dest(const SdConn *c);
-char **sd_conn_argv(const SdConn *c, const char *control_path);
+using ConnList = std::vector<std::unique_ptr<SdConn>>;
 
-char *sd_config_dir(void);
-SdStore *sd_store_new(const char *path);
-void sd_store_free(SdStore *s);
-gboolean sd_store_save(SdStore *s);
-GPtrArray *sd_store_all(SdStore *s);
-SdConn *sd_store_get(SdStore *s, const char *id);
-void sd_store_upsert(SdStore *s, const SdConn *c);
-void sd_store_remove(SdStore *s, const char *id);
-void sd_store_touch(SdStore *s, const char *id);
-void sd_store_set_color(SdStore *s, const char *id, const char *color);
-GPtrArray *sd_store_recent(SdStore *s, int limit);
-void sd_store_reload_ssh_config(SdStore *s, gboolean enabled, const char *path);
-int sd_store_add_imported(SdStore *s, GPtrArray *items);
+class SdStore {
+public:
+    explicit SdStore(const std::string &path = {});
 
-GPtrArray *sd_parse_ansible_inventory(const char *path, GError **err);
-GPtrArray *sd_parse_ssh_config(const char *path, gboolean live);
+    std::string path;
+    ConnList conns;
+    ConnList live;
+    std::map<std::string, SdConn> meta;
+
+    bool save();
+    std::vector<SdConn *> all();
+    SdConn *get(const std::string &id);
+    void upsert(const SdConn &c);
+    void remove(const std::string &id);
+    void touch(const std::string &id);
+    void set_color(const std::string &id, const std::string &color);
+    std::vector<SdConn *> recent(int limit);
+    void reload_ssh_config(bool enabled, const char *path = nullptr);
+    int add_imported(ConnList items);
+
+private:
+    void load();
+    SdConn &meta_for(const SdConn &c);
+};
+
+std::string sd_config_dir();
+
+std::optional<ConnList> sd_parse_ansible_inventory(const std::string &path, std::string *err = nullptr);
+ConnList sd_parse_ssh_config(const std::string &path, bool live);
 
 #endif

@@ -85,9 +85,9 @@ static int prev_boundary(const char *s, int i) {
 }
 
 Ui *ui_new(Renderer *r, void *font, void *mono, float scale) {
-    Ui *u = calloc(1, sizeof *u);
+    Ui *u = static_cast<Ui*>(calloc(1, sizeof *u));
     if (!u) return NULL;
-    u->r = r; u->font = font; u->mono = mono; u->scale = scale;
+    u->r = r; u->font = static_cast<Font*>(font); u->mono = static_cast<Font*>(mono); u->scale = scale;
     u->cursors[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
     u->cursors[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_IBEAM);
     u->cursors[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_HAND);
@@ -276,7 +276,7 @@ void ui_text_fit(Ui *u, Rect r, const char *s, uint32_t color, int align) {
 }
 
 void ui_text_font(Ui *u, void *font, int style, float x, float y, const char *s, uint32_t color) {
-    Font *f = font;
+    Font *f = static_cast<Font*>(font);
     Atlas *a = r_atlas(u->r);
     float base = y + (float)font_ascent(f), pen = x;
     for (const char *p = s; *p;) {
@@ -291,7 +291,7 @@ void ui_text_font(Ui *u, void *font, int style, float x, float y, const char *s,
 float ui_text_font_w(Ui *u, void *font, int style, const char *s) {
     float w = 0;
     Atlas *a = r_atlas(u->r);
-    for (const char *p = s; *p;) { uint32_t cp = next_cp(&p); const AtlasGlyph *g = atlas_glyph(a, font, cp, style); w += g ? g->adv : 8; }
+    for (const char *p = s; *p;) { uint32_t cp = next_cp(&p); const AtlasGlyph *g = atlas_glyph(a, static_cast<Font*>(font), cp, style); w += g ? g->adv : 8; }
     return w;
 }
 
@@ -308,7 +308,7 @@ void ui_text_vertical(Ui *u, Rect r, const char *s, uint32_t color) {
         float adv_total = 0;
         for (const char *p = s; *p;) { uint32_t cp = next_cp(&p); const AtlasGlyph *gg = atlas_glyph(a, u->font, cp, FS_BOLD); adv_total += (gg ? gg->adv : 8) + S(u, 1.2f); }
         int W = (int)adv_total + 2, H = lh;
-        uint8_t *src = calloc((size_t)W * H, 1);
+        uint8_t *src = static_cast<uint8_t*>(calloc((size_t)W * H, 1));
         float pen = 0;
         for (const char *p = s; *p;) {
             uint32_t cp = next_cp(&p);
@@ -321,7 +321,7 @@ void ui_text_vertical(Ui *u, Rect r, const char *s, uint32_t color) {
                 pen += b.adv + S(u, 1.2f);
             }
         }
-        uint8_t *dst = calloc((size_t)W * H, 1);
+        uint8_t *dst = static_cast<uint8_t*>(calloc((size_t)W * H, 1));
         for (int yy = 0; yy < H; yy++) for (int xx = 0; xx < W; xx++) dst[(size_t)(W - 1 - xx) * H + yy] = src[(size_t)yy * W + xx];
         g = atlas_custom(a, fid, key, dst, H, W);
         free(src); free(dst);
@@ -396,12 +396,35 @@ static const Prim P_LINK[] = {RO(1.5f, 6, 8.5f, 10), RO(7.5f, 6, 14.5f, 10)};
 static const Prim P_HOME[] = {LN(2, 8, 8, 2.5f), LN(8, 2.5f, 14, 8), LN(4, 7, 4, 13.5f), LN(4, 13.5f, 12, 13.5f), LN(12, 13.5f, 12, 7)};
 static const Prim P_NEWFOLDER[] = {LN(1.5f, 4, 5.5f, 4), LN(5.5f, 4, 7, 6), LN(7, 6, 13, 6), LN(13, 6, 13, 13), LN(13, 13, 1.5f, 13), LN(1.5f, 13, 1.5f, 4), LN(7.5f, 7.5f, 7.5f, 11.5f), LN(5.5f, 9.5f, 9.5f, 9.5f)};
 
-static const struct { const Prim *p; int n; } ICONS[IC_COUNT] = {
-    [IC_PIN] = {P_PIN, 3}, [IC_CLOSE] = {P_CLOSE, 2}, [IC_PLUS] = {P_PLUS, 2}, [IC_COPY] = {P_COPY, 2}, [IC_COPYALL] = {P_COPYALL, 4}, [IC_PASTE] = {P_PASTE, 4},
-    [IC_DUPLICATE] = {P_DUP, 2}, [IC_TERMINAL] = {P_TERM, 4}, [IC_SERVER] = {P_SERVER, 4}, [IC_FOLDER] = {P_FOLDER, 6}, [IC_FILE] = {P_FILE, 7},
-    [IC_CHEV_R] = {P_CHEV_R, 2}, [IC_CHEV_D] = {P_CHEV_D, 2}, [IC_CHEV_L] = {P_CHEV_L, 2}, [IC_UP] = {P_UP, 3}, [IC_REFRESH] = {P_REFRESH, 2},
-    [IC_UPLOAD] = {P_UPLOAD, 4}, [IC_DOWNLOAD] = {P_DOWNLOAD, 4}, [IC_SEARCH] = {P_SEARCH, 2}, [IC_TRASH] = {P_TRASH, 5}, [IC_EDIT] = {P_EDIT, 5},
-    [IC_CHECK] = {P_CHECK, 2}, [IC_LINK] = {P_LINK, 2}, [IC_HOME] = {P_HOME, 5}, [IC_NEWFOLDER] = {P_NEWFOLDER, 8},
+struct IconDef { const Prim *p; int n; };
+/* Indexed by UiIcon; the order must match the enum in ui.h. */
+static const IconDef ICONS[IC_COUNT] = {
+    {nullptr, 0}, /* IC_NONE */
+    {nullptr, 0}, /* IC_PIN */
+    {P_CLOSE, 2}, /* IC_CLOSE */
+    {P_PLUS, 2}, /* IC_PLUS */
+    {P_COPY, 2}, /* IC_COPY */
+    {P_COPYALL, 4}, /* IC_COPYALL */
+    {P_PASTE, 4}, /* IC_PASTE */
+    {P_DUP, 2}, /* IC_DUPLICATE */
+    {P_TERM, 4}, /* IC_TERMINAL */
+    {P_SERVER, 4}, /* IC_SERVER */
+    {P_FOLDER, 6}, /* IC_FOLDER */
+    {P_FILE, 7}, /* IC_FILE */
+    {P_CHEV_R, 2}, /* IC_CHEV_R */
+    {P_CHEV_D, 2}, /* IC_CHEV_D */
+    {P_CHEV_L, 2}, /* IC_CHEV_L */
+    {P_UP, 3}, /* IC_UP */
+    {P_REFRESH, 2}, /* IC_REFRESH */
+    {P_UPLOAD, 4}, /* IC_UPLOAD */
+    {P_DOWNLOAD, 4}, /* IC_DOWNLOAD */
+    {P_SEARCH, 2}, /* IC_SEARCH */
+    {P_TRASH, 5}, /* IC_TRASH */
+    {P_EDIT, 5}, /* IC_EDIT */
+    {P_CHECK, 2}, /* IC_CHECK */
+    {P_LINK, 2}, /* IC_LINK */
+    {P_HOME, 5}, /* IC_HOME */
+    {P_NEWFOLDER, 8}, /* IC_NEWFOLDER */
 };
 
 static const AtlasGlyph *icon_glyph(Ui *u, UiIcon ic, int px) {
@@ -410,7 +433,7 @@ static const AtlasGlyph *icon_glyph(Ui *u, UiIcon ic, int px) {
     uint32_t key = (uint32_t)ic * 1024u + (uint32_t)px;
     const AtlasGlyph *g = atlas_find_custom(a, fid, key);
     if (g) return g;
-    uint8_t *bits = calloc((size_t)px * px, 1);
+    uint8_t *bits = static_cast<uint8_t*>(calloc((size_t)px * px, 1));
     float k = (float)px / 16.f, sw = fmaxf(1.f, 1.35f * k);
     for (int y = 0; y < px; y++) for (int x = 0; x < px; x++) {
         float fx = (x + 0.5f), fy = (y + 0.5f), best = 0;
@@ -686,7 +709,7 @@ void ui_scroll_end(Ui *u) {
 
 void ui_menu_open(Ui *u, float x, float y, const UiMenuItem *items, int n, int tag) {
     free(u->menu_items);
-    u->menu_items = malloc((size_t)n * sizeof *items);
+    u->menu_items = static_cast<UiMenuItem*>(malloc((size_t)n * sizeof *items));
     memcpy(u->menu_items, items, (size_t)n * sizeof *items);
     u->menu_n = n; u->menu_tag = tag; u->menu_x = x; u->menu_y = y;
     u->menu_open = true;

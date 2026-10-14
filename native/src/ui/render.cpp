@@ -121,7 +121,7 @@ static GLuint compile_src(GLenum kind, const char *head, const char *body) {
 }
 
 Renderer *r_new(Atlas *a) {
-    Renderer *r = calloc(1, sizeof *r);
+    Renderer *r = static_cast<Renderer*>(calloc(1, sizeof *r));
     if (!r) return NULL;
     r->atlas = a;
     GLuint vs, fs;
@@ -145,8 +145,8 @@ Renderer *r_new(Atlas *a) {
     r->u_atlas = gl.GetUniformLocation(r->prog, "u_atlas");
     gl.GenBuffers(1, &r->vbo);
     if (sd_gl_kind == GLK_ES2) {
-        uint16_t *idx = malloc((size_t)MAXQ * 6 * sizeof *idx);
-        r->v2 = malloc((size_t)MAXQ * 4 * sizeof *r->v2);
+        uint16_t *idx = static_cast<uint16_t*>(malloc((size_t)MAXQ * 6 * sizeof *idx));
+        r->v2 = static_cast<V2*>(malloc((size_t)MAXQ * 4 * sizeof *r->v2));
         if (!idx || !r->v2) { free(idx); free(r->v2); free(r); return NULL; }
         for (int q = 0; q < MAXQ; q++) {
             uint16_t base = (uint16_t)(q * 4);
@@ -261,7 +261,7 @@ static void grow(Renderer *r, size_t extra) {
     if (r->n + extra <= r->cap) return;
     size_t nc = r->cap ? r->cap * 2 : 4096;
     while (nc < r->n + extra) nc *= 2;
-    RInst *nb = realloc(r->buf, nc * sizeof *nb);
+    RInst *nb = static_cast<RInst*>(realloc(r->buf, nc * sizeof *nb));
     if (!nb) return;
     r->buf = nb; r->cap = nc;
 }

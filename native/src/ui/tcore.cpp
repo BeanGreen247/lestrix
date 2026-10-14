@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define _GNU_SOURCE
 #include "tcore.h"
 
 #include <errno.h>
@@ -12,7 +11,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
-#include <stdatomic.h>
+#include <atomic>
+#include <new>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/random.h>
@@ -48,13 +48,13 @@ struct TermCore {
     int io_head, io_count;
     bool io_eof;
     int wake[2];
-    atomic_int stop, act_flag, eof_flag, running_flag, wake_pending;
-    atomic_int ui_waiting;
-    atomic_ullong bytes_fed;
+    std::atomic<int> stop, act_flag, eof_flag, running_flag, wake_pending;
+    std::atomic<int> ui_waiting;
+    std::atomic<unsigned long long> bytes_fed;
     struct { bool on, saw_child, alt; double t0, t_last, t_back; uint64_t fed0, fed_last; } cmd;
-    struct { bool active, suspect, th_started; struct termios saved; pid_t fg, last_checked; double release_at; pthread_t th; atomic_int restored, cancel; int pidfd; } fo;
+    struct { bool active, suspect, th_started; struct termios saved; pid_t fg, last_checked; double release_at; pthread_t th; std::atomic<int> restored, cancel; int pidfd; } fo;
     char fastcat_token[33];
-    atomic_ullong reads;
+    std::atomic<unsigned long long> reads;
     bool running, eof, child_done;
     int exit_status;
     pthread_mutex_t outlock, evlock;
@@ -74,9 +74,9 @@ struct TermCore {
 };
 
 static inline void lock_counted(TermCore *t) {
-    atomic_fetch_add_explicit(&t->ui_waiting, 1, memory_order_relaxed);
+    t->ui_waiting.fetch_add(1, std::memory_order_relaxed);
     pthread_mutex_lock(&t->lock);
-    atomic_fetch_sub_explicit(&t->ui_waiting, 1, memory_order_relaxed);
+    t->ui_waiting.fetch_sub(1, std::memory_order_relaxed);
 }
 #define LOCK(t) lock_counted(t)
 #define UNLOCK(t) pthread_mutex_unlock(&(t)->lock)
@@ -98,7 +98,7 @@ int tcore_read_delay_us = 200;
 int tcore_io_threads = -1;
 const char *tcore_cat_dir = NULL;
 
-uint64_t tcore_reads(const TermCore *t) { return atomic_load((atomic_ullong *)&t->reads); }
+uint64_t tcore_reads(const TermCore *t) { return t->reads.load(); }
 static bool g_fast_output = true;
 
 void tcore_set_fast_output(bool on) { g_fast_output = on; }
@@ -133,12 +133,12 @@ static void fo_restore_kernel(TermCore *t) {
 }
 
 static void *fo_watch_main(void *data) {
-    TermCore *t = data;
+    TermCore *t = static_cast<TermCore*>(data);
     struct pollfd p = {t->fo.pidfd, POLLIN, 0};
-    while (!atomic_load(&t->stop) && !atomic_load(&t->fo.cancel))
+    while (!t->stop.load() && !t->fo.cancel.load())
         if (poll(&p, 1, 100) > 0) break;
     fo_restore_kernel(t);
-    atomic_store(&t->fo.restored, 1);
+    t->fo.restored.store(1);
     return NULL;
 }
 
@@ -150,7 +150,7 @@ static void fo_join(TermCore *t) {
 }
 
 static void fo_shutdown(TermCore *t) {
-    atomic_store(&t->fo.cancel, 1);
+    t->fo.cancel.store(1);
     fo_join(t);
     t->fo.active = false;
 }
@@ -163,8 +163,8 @@ static bool fo_activate(TermCore *t, pid_t fg, const struct termios *cur, bool a
     t->fo.fg = fg;
     t->fo.release_at = 0;
     t->fo.pidfd = pfd;
-    atomic_store(&t->fo.cancel, 0);
-    atomic_store(&t->fo.restored, 0);
+    t->fo.cancel.store(0);
+    t->fo.restored.store(0);
     LOCK(t);
     vt_set_force_nl(t->vt, true);
     UNLOCK(t);
@@ -183,11 +183,11 @@ static bool fo_activate(TermCore *t, pid_t fg, const struct termios *cur, bool a
 static void fo_step(TermCore *t, double now) {
     if (!g_fast_output || t->pty.fd < 0) return;
     if (t->fo.active) {
-        if (atomic_load(&t->fo.restored)) {
+        if (t->fo.restored.load()) {
             fo_join(t);
             t->fo.active = false;
             t->fo.release_at = now + 0.25;
-            atomic_store(&t->fo.restored, 0);
+            t->fo.restored.store(0);
         }
         return;
     }
@@ -220,7 +220,7 @@ static void fo_step(TermCore *t, double now) {
 
 void tcore_cmd_begin(TermCore *t, double now) {
     if (t->cmd.on || t->pty.fd < 0 || (tcore_modes(t) & VT_M_ALT_SCREEN) || tcgetpgrp(t->pty.fd) != t->pty.pid) return;
-    uint64_t fed = atomic_load(&t->bytes_fed);
+    uint64_t fed = t->bytes_fed.load();
     t->cmd.on = true; t->cmd.saw_child = false; t->cmd.alt = false; t->cmd.t_back = 0;
     t->cmd.t0 = t->cmd.t_last = now; t->cmd.fed0 = t->cmd.fed_last = fed;
 }
@@ -230,7 +230,7 @@ bool tcore_cmd_active(const TermCore *t) { return t->cmd.on || t->fo.active || t
 bool tcore_cmd_poll(TermCore *t, double now, double *secs, uint64_t *bytes) {
     fo_step(t, now);
     if (!t->cmd.on) return false;
-    uint64_t fed = atomic_load(&t->bytes_fed);
+    uint64_t fed = t->bytes_fed.load();
     if (fed != t->cmd.fed_last) { t->cmd.fed_last = fed; t->cmd.t_last = now; }
     if (tcore_modes(t) & VT_M_ALT_SCREEN) t->cmd.alt = true;
     pid_t fg = t->pty.fd >= 0 ? tcgetpgrp(t->pty.fd) : -1;
@@ -253,7 +253,7 @@ bool tcore_cmd_poll(TermCore *t, double now, double *secs, uint64_t *bytes) {
     return true;
 }
 
-uint64_t tcore_bytes_fed(const TermCore *t) { return atomic_load((atomic_ullong *)&t->bytes_fed); }
+uint64_t tcore_bytes_fed(const TermCore *t) { return t->bytes_fed.load(); }
 const char *tcore_title(const TermCore *t) { return t->title; }
 bool tcore_focused(const TermCore *t) { return t->focused; }
 int tcore_offset(const TermCore *t) { return t->offset; }
@@ -279,14 +279,14 @@ static void wake_worker(TermCore *t) {
 }
 
 void tcore_send(TermCore *t, const char *data, size_t len) {
-    if (!len || !atomic_load(&t->running_flag)) return;
+    if (!len || !t->running_flag.load()) return;
     pthread_mutex_lock(&t->outlock);
     if (t->outhead + t->outlen + len > t->outcap) {
         if (t->outhead) { memmove(t->outq, t->outq + t->outhead, t->outlen); t->outhead = 0; }
         if (t->outlen + len > t->outcap) {
             size_t nc = t->outcap ? t->outcap * 2 : 1024;
             while (nc < t->outlen + len) nc *= 2;
-            uint8_t *nb = realloc(t->outq, nc);
+            uint8_t *nb = static_cast<uint8_t*>(realloc(t->outq, nc));
             if (nb) { t->outq = nb; t->outcap = nc; }
         }
     }
@@ -297,11 +297,11 @@ void tcore_send(TermCore *t, const char *data, size_t len) {
 
 void tcore_send_str(TermCore *t, const char *s) { tcore_send(t, s, strlen(s)); }
 
-static void vt_write_cb(const uint8_t *d, size_t n, void *user) { tcore_send(user, (const char *)d, n); }
+static void vt_write_cb(const uint8_t *d, size_t n, void *user) { tcore_send(static_cast<TermCore*>(user), (const char *)d, n); }
 
 static void vt_event_cb(VtEvent ev, const char *text, void *user) {
-    TermCore *t = user;
-    PendingEv *pe = calloc(1, sizeof *pe);
+    TermCore *t = static_cast<TermCore*>(user);
+    PendingEv *pe = static_cast<PendingEv*>(calloc(1, sizeof *pe));
     if (!pe) return;
     pe->ev = ev;
     pe->text = text ? strdup(text) : NULL;
@@ -341,8 +341,8 @@ static void feed_sliced(TermCore *t, const uint8_t *p, size_t n, bool notify) {
         vt_feed(t->vt, p, k);
         UNLOCK(t);
         p += k; n -= k;
-        if (notify) { atomic_fetch_add(&t->bytes_fed, k); atomic_store(&t->act_flag, 1); wake_ui(t); }
-        for (int spin = 0; atomic_load_explicit(&t->ui_waiting, memory_order_relaxed) > 0 && spin < 2000; spin++) sched_yield();
+        if (notify) { t->bytes_fed.fetch_add(k); t->act_flag.store(1); wake_ui(t); }
+        for (int spin = 0; t->ui_waiting.load(std::memory_order_relaxed) > 0 && spin < 2000; spin++) sched_yield();
     }
 }
 
@@ -352,11 +352,11 @@ static void stream_file(TermCore *t, const char *path, uint64_t off, uint64_t le
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return; }
     enum { CH = 1 << 20 };
-    uint8_t *in = malloc(CH);
+    uint8_t *in = static_cast<uint8_t*>(malloc(CH));
     if (in) {
         uint64_t done = 0;
         if (flags & 2) { LOCK(t); vt_set_stream_nl(t->vt, true); UNLOCK(t); }
-        while (!atomic_load(&t->stop) && (len == 0 || done < len)) {
+        while (!t->stop.load() && (len == 0 || done < len)) {
             size_t want = len ? (len - done < CH ? (size_t)(len - done) : (size_t)CH) : (size_t)CH;
             ssize_t n = pread(fd, in, want, (off_t)(off + done));
             if (n <= 0) break;
@@ -385,19 +385,19 @@ static void feed_output(TermCore *t, const uint8_t *p, size_t n) {
 
 static void *reader_main(void *data) {
     prctl(PR_SET_NAME, "lx-reader", 0, 0, 0);
-    TermCore *t = data;
+    TermCore *t = static_cast<TermCore*>(data);
     prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
-    while (!atomic_load(&t->stop)) {
+    while (!t->stop.load()) {
         struct pollfd fds[2] = {{t->pty.fd, POLLIN, 0}, {t->wake[0], POLLIN, 0}};
         if (poll(fds, 2, -1) < 0 && errno != EINTR) break;
-        if (atomic_load(&t->stop)) break;
+        if (t->stop.load()) break;
         if (fds[1].revents & POLLIN) { char junk[64]; ssize_t r = read(t->wake[0], junk, sizeof junk); (void)r; }
         if (!(fds[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
         for (;;) {
             pthread_mutex_lock(&t->iom);
-            while (t->io_count == 8 && !atomic_load(&t->stop)) pthread_cond_wait(&t->io_space, &t->iom);
+            while (t->io_count == 8 && !t->stop.load()) pthread_cond_wait(&t->io_space, &t->iom);
             int slot = (t->io_head + t->io_count) % 8;
-            bool stop = atomic_load(&t->stop);
+            bool stop = t->stop.load();
             pthread_mutex_unlock(&t->iom);
             if (stop) return NULL;
             ssize_t n = read(t->pty.fd, t->iob[slot].data, 65536);
@@ -406,7 +406,7 @@ static void *reader_main(void *data) {
                 t->iob[slot].n = (size_t)n; t->io_count++;
                 pthread_cond_signal(&t->io_data);
                 pthread_mutex_unlock(&t->iom);
-                atomic_fetch_add_explicit(&t->reads, 1, memory_order_relaxed);
+                t->reads.fetch_add(1, std::memory_order_relaxed);
                 if (tcore_read_delay_us > 0 && n < 1024) { struct timespec ts = {0, (long)tcore_read_delay_us * 1000}; nanosleep(&ts, NULL); }
                 continue;
             }
@@ -423,18 +423,18 @@ static void *reader_main(void *data) {
 
 static void *writer_main(void *data) {
     prctl(PR_SET_NAME, "lx-writer", 0, 0, 0);
-    TermCore *t = data;
-    while (!atomic_load(&t->stop)) {
+    TermCore *t = static_cast<TermCore*>(data);
+    while (!t->stop.load()) {
         pthread_mutex_lock(&t->iom);
         pthread_mutex_lock(&t->outlock);
         bool empty = t->outlen == 0;
         pthread_mutex_unlock(&t->outlock);
-        if (empty && !atomic_load(&t->stop)) {
+        if (empty && !t->stop.load()) {
             struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 200 * 1000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&t->out_cv, &t->iom, &ts);
         }
         pthread_mutex_unlock(&t->iom);
-        if (atomic_load(&t->stop)) break;
+        if (t->stop.load()) break;
         bool pending = false;
         flush_out(t, &pending);
         if (pending) { struct pollfd pf = {t->pty.fd, POLLOUT, 0}; poll(&pf, 1, 20); }
@@ -448,8 +448,8 @@ static void parser_main(TermCore *t) {
     size_t unsaid = 0;
     for (;;) {
         pthread_mutex_lock(&t->iom);
-        while (t->io_count == 0 && !t->io_eof && !atomic_load(&t->stop)) pthread_cond_wait(&t->io_data, &t->iom);
-        if (atomic_load(&t->stop)) { pthread_mutex_unlock(&t->iom); return; }
+        while (t->io_count == 0 && !t->io_eof && !t->stop.load()) pthread_cond_wait(&t->io_data, &t->iom);
+        if (t->stop.load()) { pthread_mutex_unlock(&t->iom); return; }
         if (t->io_count == 0) { pthread_mutex_unlock(&t->iom); break; }
         int slot = t->io_head;
         pthread_mutex_unlock(&t->iom);
@@ -464,21 +464,21 @@ static void parser_main(TermCore *t) {
         struct timespec wt1;
         clock_gettime(CLOCK_MONOTONIC, &wt1);
         if (idle || (wt1.tv_sec - wt0.tv_sec) * 1000000000L + (wt1.tv_nsec - wt0.tv_nsec) > 200000L) {
-            atomic_fetch_add(&t->bytes_fed, unsaid);
-            atomic_store(&t->act_flag, 1);
+            t->bytes_fed.fetch_add(unsaid);
+            t->act_flag.store(1);
             wake_ui(t);
             unsaid = 0; wt0 = wt1;
         }
     }
-    if (unsaid) { atomic_fetch_add(&t->bytes_fed, unsaid); atomic_store(&t->act_flag, 1); wake_ui(t); }
-    atomic_store(&t->eof_flag, 1);
+    if (unsaid) { t->bytes_fed.fetch_add(unsaid); t->act_flag.store(1); wake_ui(t); }
+    t->eof_flag.store(1);
     wake_ui(t);
-    while (!atomic_load(&t->stop)) {
+    while (!t->stop.load()) {
         int st = 0;
         pid_t r = waitpid(t->pty.pid, &st, WNOHANG);
         if (r == t->pty.pid || (r < 0 && errno != EINTR)) {
             t->exit_status = r == t->pty.pid ? (WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st)) : 0;
-            atomic_store(&t->act_flag, 1);
+            t->act_flag.store(1);
             t->child_done = true;
             wake_ui(t);
             break;
@@ -490,16 +490,16 @@ static void parser_main(TermCore *t) {
 
 static void *worker_main(void *data) {
     prctl(PR_SET_NAME, "lx-io", 0, 0, 0);
-    TermCore *t = data;
+    TermCore *t = static_cast<TermCore*>(data);
     prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
     if (t->io_split) { parser_main(t); return NULL; }
 
-    uint8_t *buf = malloc(65536);
+    uint8_t *buf = static_cast<uint8_t*>(malloc(65536));
     bool out_pending = false;
-    while (!atomic_load(&t->stop)) {
-        struct pollfd fds[2] = {{t->pty.fd, POLLIN | (out_pending ? POLLOUT : 0), 0}, {t->wake[0], POLLIN, 0}};
+    while (!t->stop.load()) {
+        struct pollfd fds[2] = {{t->pty.fd, (short)(POLLIN | (out_pending ? POLLOUT : 0)), 0}, {t->wake[0], POLLIN, 0}};
         if (poll(fds, 2, -1) < 0 && errno != EINTR) break;
-        if (atomic_load(&t->stop)) break;
+        if (t->stop.load()) break;
         if (fds[1].revents & POLLIN) { char junk[64]; ssize_t r = read(t->wake[0], junk, sizeof junk); (void)r; }
         flush_out(t, &out_pending);
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
@@ -518,13 +518,13 @@ static void *worker_main(void *data) {
                         struct timespec wt1;
                         clock_gettime(CLOCK_MONOTONIC, &wt1);
                         if ((wt1.tv_sec - wt0.tv_sec) * 1000000000L + (wt1.tv_nsec - wt0.tv_nsec) > 200000L) {
-                            atomic_fetch_add(&t->bytes_fed, unsaid);
-                            atomic_store(&t->act_flag, 1);
+                            t->bytes_fed.fetch_add(unsaid);
+                            t->act_flag.store(1);
                             wake_ui(t);
                             unsaid = 0; wt0 = wt1;
                         }
                     }
-                    atomic_fetch_add_explicit(&t->reads, 1, memory_order_relaxed);
+                    t->reads.fetch_add(1, std::memory_order_relaxed);
                     if (total >= (1u << 20)) break;
                     if (tcore_read_delay_us > 0 && n < 1024) { struct timespec ts = {0, (long)tcore_read_delay_us * 1000}; nanosleep(&ts, NULL); }
                     continue;
@@ -534,20 +534,20 @@ static void *worker_main(void *data) {
                 break;
             }
             if (unsaid || total) {
-                atomic_fetch_add(&t->bytes_fed, unsaid);
-                atomic_store(&t->act_flag, 1);
+                t->bytes_fed.fetch_add(unsaid);
+                t->act_flag.store(1);
                 wake_ui(t);
             }
             flush_out(t, &out_pending);
             if (eof) {
-                atomic_store(&t->eof_flag, 1);
+                t->eof_flag.store(1);
                 wake_ui(t);
-                while (!atomic_load(&t->stop)) {
+                while (!t->stop.load()) {
                     int st = 0;
                     pid_t r = waitpid(t->pty.pid, &st, WNOHANG);
                     if (r == t->pty.pid || (r < 0 && errno != EINTR)) {
                         t->exit_status = r == t->pty.pid ? (WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st)) : 0;
-                        atomic_store(&t->act_flag, 1);
+                        t->act_flag.store(1);
                         t->child_done = true;
                         wake_ui(t);
                         break;
@@ -581,10 +581,10 @@ static bool spawn(TermCore *t) {
     }
     if (sd_pty_spawn(&t->pty, t->argv, t->cwd, extra, cols, rows) != 0) return false;
     t->running = true;
-    atomic_store(&t->running_flag, 1);
+    t->running_flag.store(1);
     t->eof = t->child_done = false;
-    atomic_store(&t->stop, 0);
-    atomic_store(&t->eof_flag, 0);
+    t->stop.store(0);
+    t->eof_flag.store(0);
     if (pipe(t->wake) != 0) { t->wake[0] = t->wake[1] = -1; }
     else for (int i = 0; i < 2; i++) { fcntl(t->wake[i], F_SETFL, O_NONBLOCK); fcntl(t->wake[i], F_SETFD, FD_CLOEXEC); }
     int want_split = tcore_io_threads;
@@ -592,7 +592,7 @@ static bool spawn(TermCore *t) {
     t->io_split = false;
     if (want_split >= 2) {
         bool ok = true;
-        for (int k = 0; k < 8; k++) if (!t->iob[k].data) { t->iob[k].data = malloc(65536); if (!t->iob[k].data) ok = false; }
+        for (int k = 0; k < 8; k++) if (!t->iob[k].data) { t->iob[k].data = static_cast<uint8_t*>(malloc(65536)); if (!t->iob[k].data) ok = false; }
         if (ok) {
             t->io_head = t->io_count = 0; t->io_eof = false;
             t->io_split = true;
@@ -607,7 +607,7 @@ static bool spawn(TermCore *t) {
 
 static void join_worker(TermCore *t) {
     if (!t->worker_started) return;
-    atomic_store(&t->stop, 1);
+    t->stop.store(1);
     wake_worker(t);
     pthread_join(t->worker, NULL);
     t->worker_started = false;
@@ -618,7 +618,7 @@ static void join_worker(TermCore *t) {
 }
 
 TermCore *tcore_new(char *const argv[], const char *cwd, int cols, int rows, const TermHooks *hooks, void *user, bool fastcat) {
-    TermCore *t = calloc(1, sizeof *t);
+    TermCore *t = new (std::nothrow) TermCore();
     if (!t) return NULL;
     pthread_mutexattr_t at;
     pthread_mutexattr_init(&at);
@@ -638,7 +638,7 @@ TermCore *tcore_new(char *const argv[], const char *cwd, int cols, int rows, con
     t->fo.pidfd = -1;
     int n = 0;
     while (argv && argv[n]) n++;
-    t->argv = calloc((size_t)n + 1, sizeof *t->argv);
+    t->argv = static_cast<char**>(calloc((size_t)n + 1, sizeof *t->argv));
     for (int i = 0; i < n; i++) t->argv[i] = strdup(argv[i]);
     t->cwd = cwd ? strdup(cwd) : NULL;
     t->vt = vt_new(t->cols, t->rows, default_scrollback);
@@ -660,7 +660,7 @@ TermCore *tcore_new(char *const argv[], const char *cwd, int cols, int rows, con
 void tcore_close(TermCore *t) {
     fo_shutdown(t);
     if (t->running || t->worker_started) {
-        atomic_store(&t->running_flag, 0);
+        t->running_flag.store(0);
         sd_pty_hangup(&t->pty);
         join_worker(t);
         t->running = false;
@@ -677,14 +677,14 @@ void tcore_free(TermCore *t) {
     free(t->argv); free(t->cwd); free(t->title); free(t->outq);
     for (int k = 0; k < 8; k++) free(t->iob[k].data);
     pthread_mutex_destroy(&t->lock); pthread_mutex_destroy(&t->outlock); pthread_mutex_destroy(&t->evlock);
-    free(t);
+    delete t;
 }
 
 static void finish(TermCore *t) {
     if (!t->eof || !t->child_done || !t->running) return;
     join_worker(t);
     t->running = false;
-    atomic_store(&t->running_flag, 0);
+    t->running_flag.store(0);
     sd_pty_close(&t->pty);
     char msg[160];
     snprintf(msg, sizeof msg, "\r\n\x1b[2m[session ended, exit code %d - press Enter to reconnect]\x1b[0m\r\n", t->exit_status);
@@ -708,13 +708,13 @@ bool tcore_pump(TermCore *t) {
         free(e);
     }
     int exp = 1;
-    if (atomic_compare_exchange_strong(&t->act_flag, &exp, 0)) {
+    if (t->act_flag.compare_exchange_strong(exp, 0)) {
         if (t->offset == 0) t->sel_on = false;
         changed = true;
         if (t->hooks.activity) t->hooks.activity(t->user);
     }
     exp = 1;
-    if (atomic_compare_exchange_strong(&t->eof_flag, &exp, 0)) { t->eof = true; changed = true; }
+    if (t->eof_flag.compare_exchange_strong(exp, 0)) { t->eof = true; changed = true; }
     if (t->eof && t->child_done) { finish(t); changed = true; }
     return changed;
 }
@@ -788,7 +788,7 @@ static void put_cell(char **out, size_t *len, size_t *cap, uint32_t cp) {
     int n = cp < 0x80 ? (u[0] = (char)cp, 1) : cp < 0x800 ? (u[0] = (char)(0xC0 | cp >> 6), u[1] = (char)(0x80 | (cp & 63)), 2)
           : cp < 0x10000 ? (u[0] = (char)(0xE0 | cp >> 12), u[1] = (char)(0x80 | ((cp >> 6) & 63)), u[2] = (char)(0x80 | (cp & 63)), 3)
           : (u[0] = (char)(0xF0 | cp >> 18), u[1] = (char)(0x80 | ((cp >> 12) & 63)), u[2] = (char)(0x80 | ((cp >> 6) & 63)), u[3] = (char)(0x80 | (cp & 63)), 4);
-    if (*len + 5 > *cap) { *cap = *cap ? *cap * 2 : 256; *out = realloc(*out, *cap); }
+    if (*len + 5 > *cap) { *cap = *cap ? *cap * 2 : 256; *out = static_cast<char*>(realloc(*out, *cap)); }
     memcpy(*out + *len, u, (size_t)n);
     *len += (size_t)n;
 }
@@ -850,7 +850,7 @@ void tcore_paste_request(TermCore *t) { if (t->hooks.clip_request) t->hooks.clip
 void tcore_paste(TermCore *t, const char *text) {
     if (!text || !*text) return;
     size_t n = strlen(text);
-    char *g = malloc(n + 1);
+    char *g = static_cast<char*>(malloc(n + 1));
     size_t m = 0;
     for (const char *p = text; *p; p++) {
         if (*p == '\r' && p[1] == '\n') continue;

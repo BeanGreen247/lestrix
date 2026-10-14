@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define _GNU_SOURCE
 #include <pty.h>
 #include <termios.h>
 #include <unistd.h>
@@ -21,9 +20,9 @@ int main(int argc,char**argv){
     openpty(&m,&s,NULL,NULL,&ws);
     struct termios t; tcgetattr(s,&t); if(!opost){t.c_oflag&=~(OPOST|ONLCR);} t.c_lflag&=~ECHO; tcsetattr(s,TCSANOW,&t);
     pid_t pid=fork();
-    if(!pid){ close(m); char*b=malloc(wbuf); size_t n=0; while(n<wbuf){ for(int i=0;i<linelen&&n<wbuf;i++) b[n++]='a'+(i%26); if(n<wbuf) b[n++]='\n'; } size_t sent=0; while(sent<total){ ssize_t w=write(s,b,wbuf); if(w<=0)break; sent+=w;} close(s); _exit(0);}    
+    if(!pid){ close(m); char*b=static_cast<char*>(malloc(wbuf)); size_t n=0; while(n<wbuf){ for(int i=0;i<linelen&&n<wbuf;i++) b[n++]='a'+(i%26); if(n<wbuf) b[n++]='\n'; } size_t sent=0; while(sent<total){ ssize_t w=write(s,b,wbuf); if(w<=0)break; sent+=w;} close(s); _exit(0);}    
     close(s);
-    char*rb=malloc(rbuf); size_t got=0; double t0=now(); ssize_t r; unsigned long reads=0;
+    char*rb=static_cast<char*>(malloc(rbuf)); size_t got=0; double t0=now(); ssize_t r; unsigned long reads=0;
     while((r=read(m,rb,rbuf))>0){ got+=r; reads++; if(got>=total) break; }
     double dt=now()-t0; kill(pid,9); waitpid(pid,0,0);
     printf("opost=%d rbuf=%zuK wbuf=%zuK line=%d: %.2f GB/s (%.2fs, avg read %.0f B)\n",opost,rbuf>>10,wbuf>>10,linelen,got/dt/1e9,dt,(double)got/reads);

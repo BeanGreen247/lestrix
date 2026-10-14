@@ -178,7 +178,7 @@ if [ "$summary_only" = 1 ]; then summarise; show_results; exit 0; fi
 
 mkdir -p "$dir" "$results"
 genr=$here/build/gen_random
-if [ ! -x "$genr" ]; then genr=$dir/gen_random; [ -x "$genr" ] || cc -O2 -o "$genr" "$here/bench/gen_random.c" || { echo "need a C compiler to build the test-file generator"; exit 1; }; fi
+if [ ! -x "$genr" ]; then genr=$dir/gen_random; [ -x "$genr" ] || c++ -O2 -o "$genr" "$here/bench/gen_random.cpp" || { echo "need a C++ compiler to build the test-file generator"; exit 1; }; fi
 [ -x "$lx" ] || { echo "cannot find the lestrix binary (set LESTRIX_BIN)"; exit 1; }
 specs=()
 [ "$workloads" = 1 ] && for w in log colour unicode seq redraw; do specs+=("w:$w"); done

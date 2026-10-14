@@ -55,7 +55,6 @@ for p in "${PREFIXES[@]}"; do
   for sz in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do rm_path "$p/share/icons/hicolor/$sz/apps/lestrix.png"; done
   rm_path "$p/share/icons/hicolor/scalable/apps/lestrix.svg"
   have update-desktop-database && [ -d "$p/share/applications" ] && update-desktop-database "$p/share/applications" 2>/dev/null
-  have gtk-update-icon-cache && [ -d "$p/share/icons/hicolor" ] && gtk-update-icon-cache -q -t "$p/share/icons/hicolor" 2>/dev/null
 done
 rm_path build
 

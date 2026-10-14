@@ -3,40 +3,42 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define _GNU_SOURCE
-#include <malloc.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <poll.h>
 #include <fcntl.h>
 #include <math.h>
-#include <errno.h>
+#include <malloc.h>
+#include <netdb.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+
 #include "../bench.h"
-#include "fleetwm.h"
-#include <signal.h>
 #include "app.h"
 #include "appicon.h"
-#include "workpool.h"
+#include "fleetwm.h"
 #include "gl.h"
 #include "jobs.h"
+#include "workpool.h"
 
 #define P(v) S(a->ui, (v))
 
+
 App *g_app;
 static Uint32 EV_WAKE;
-static atomic_int wake_pending;
+static std::atomic<int> wake_pending;
 
 void app_wake(void) {
     int exp = 0;
-    if (atomic_compare_exchange_strong(&wake_pending, &exp, 1)) {
+    if (wake_pending.compare_exchange_strong(exp, 1)) {
         SDL_Event e;
         SDL_zero(e);
         e.type = EV_WAKE;
@@ -58,13 +60,14 @@ static void tmark(const char *what) {
 
 static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9; }
 
-static char *relative_age(double ts) {
-    double secs = (double)g_get_real_time() / 1e6 - ts;
-    if (secs < 90) return g_strdup("just now");
-    if (secs < 5400) return g_strdup_printf("%dm ago", (int)(secs / 60));
-    if (secs < 129600) return g_strdup_printf("%dh ago", (int)(secs / 3600));
-    return g_strdup_printf("%dd ago", (int)(secs / 86400));
+static std::string relative_age(double ts) {
+    double secs = lx::real_time() - ts;
+    if (secs < 90) return "just now";
+    if (secs < 5400) return lx::strprintf("%dm ago", (int)(secs / 60));
+    if (secs < 129600) return lx::strprintf("%dh ago", (int)(secs / 3600));
+    return lx::strprintf("%dd ago", (int)(secs / 86400));
 }
+
 
 static const char *TAB_COLORS[][2] = {
     {"Red", "#e06c75"}, {"Orange", "#e59a5a"}, {"Yellow", "#e5c07b"}, {"Green", "#98c379"},
@@ -117,73 +120,72 @@ static void fmt_count(double v, char *out, size_t cap) {
     else snprintf(out, cap, "%.0f", v);
 }
 
-static char *fmt_mb(double bytes) { return bytes >= 1048576 ? g_strdup_printf("%.1f MB", bytes / 1048576) : g_strdup_printf("%.0f KB", bytes / 1024); }
+static std::string fmt_mb(double bytes) { return bytes >= 1048576 ? lx::strprintf("%.1f MB", bytes / 1048576) : lx::strprintf("%.0f KB", bytes / 1024); }
 
 static bool g_lite;
 
 static void settings_load(App *a) {
-    a->settings = g_key_file_new();
-    char *dir = sd_config_dir();
-    a->settings_path = g_build_filename(dir, "settings.ini", NULL);
-    g_free(dir);
-    g_key_file_load_from_file(a->settings, a->settings_path, G_KEY_FILE_NONE, NULL);
-    char *theme = g_key_file_get_string(a->settings, "ui", "theme", NULL);
-    a->theme = ui_theme_find(theme);
-    g_free(theme);
-    a->accent = g_key_file_get_string(a->settings, "ui", "accent", NULL);
-    a->font_size = g_key_file_has_key(a->settings, "ui", "font_size", NULL) ? g_key_file_get_integer(a->settings, "ui", "font_size", NULL) : 11;
+    a->settings_path = lx::path_join(sd_config_dir(), "settings.ini");
+    a->settings.load(a->settings_path);
+    const lx::IniFile &s = a->settings;
+    a->theme = ui_theme_find(s.get_string("ui", "theme").c_str());
+    a->accent = s.get_string("ui", "accent");
+    a->font_size = s.get_int("ui", "font_size", 11);
     if (a->font_size < 7 || a->font_size > 32) a->font_size = 11;
-    a->font_family = g_key_file_get_string(a->settings, "ui", "font_family", NULL);
-    a->show_ssh_config = !g_key_file_has_key(a->settings, "ui", "show_ssh_config", NULL) || g_key_file_get_boolean(a->settings, "ui", "show_ssh_config", NULL);
-    a->startup_shell = g_key_file_get_boolean(a->settings, "ui", "startup_shell", NULL);
-    a->follow_default = !g_key_file_has_key(a->settings, "ui", "follow_path", NULL) || g_key_file_get_boolean(a->settings, "ui", "follow_path", NULL);
-    a->scrollback = g_key_file_has_key(a->settings, "ui", "scrollback", NULL) ? g_key_file_get_integer(a->settings, "ui", "scrollback", NULL) : 10000;
-    a->sb_ram_mb = g_key_file_has_key(a->settings, "ui", "scrollback_ram_mb", NULL) ? (size_t)g_key_file_get_integer(a->settings, "ui", "scrollback_ram_mb", NULL) : 32;
-    a->sb_disk_mb = g_key_file_has_key(a->settings, "ui", "scrollback_disk_mb", NULL) ? (size_t)g_key_file_get_integer(a->settings, "ui", "scrollback_disk_mb", NULL) : 4096;
-    a->sb_spill = !g_key_file_has_key(a->settings, "ui", "scrollback_spill", NULL) || g_key_file_get_boolean(a->settings, "ui", "scrollback_spill", NULL);
-    a->fast_cat = !g_key_file_has_key(a->settings, "ui", "fast_cat", NULL) || g_key_file_get_boolean(a->settings, "ui", "fast_cat", NULL);
-    a->hud = !g_key_file_has_key(a->settings, "ui", "performance_overlay", NULL) || g_key_file_get_boolean(a->settings, "ui", "performance_overlay", NULL);
-    a->follow_fleet = !g_key_file_has_key(a->settings, "ui", "follow_fleetwm", NULL) || g_key_file_get_boolean(a->settings, "ui", "follow_fleetwm", NULL);
-    a->rounded = !g_key_file_has_key(a->settings, "ui", "rounded_corners", NULL) || g_key_file_get_boolean(a->settings, "ui", "rounded_corners", NULL);
-    a->pinned = !g_key_file_has_key(a->settings, "ui", "sidebar_pinned", NULL) || g_key_file_get_boolean(a->settings, "ui", "sidebar_pinned", NULL);
-    if (g_key_file_has_key(a->settings, "ui", "sidebar_shown", NULL)) a->dock_shown = g_key_file_get_boolean(a->settings, "ui", "sidebar_shown", NULL);
-    if (g_key_file_has_key(a->settings, "ui", "sidebar_page", NULL)) a->side_page = g_key_file_get_integer(a->settings, "ui", "sidebar_page", NULL);
-    a->panel_w = g_key_file_has_key(a->settings, "ui", "panel_width", NULL) ? g_key_file_get_integer(a->settings, "ui", "panel_width", NULL) : 300;
+    a->font_family = s.get_string("ui", "font_family");
+    a->show_ssh_config = s.get_bool("ui", "show_ssh_config", true);
+    a->startup_shell = s.get_bool("ui", "startup_shell", false);
+    a->follow_default = s.get_bool("ui", "follow_path", true);
+    a->scrollback = s.get_int("ui", "scrollback", 10000);
+    a->sb_ram_mb = (size_t)s.get_int("ui", "scrollback_ram_mb", 32);
+    a->sb_disk_mb = (size_t)s.get_int("ui", "scrollback_disk_mb", 4096);
+    a->sb_spill = s.get_bool("ui", "scrollback_spill", true);
+    a->fast_cat = s.get_bool("ui", "fast_cat", true);
+    a->hud = s.get_bool("ui", "performance_overlay", true);
+    a->follow_fleet = s.get_bool("ui", "follow_fleetwm", true);
+    a->rounded = s.get_bool("ui", "rounded_corners", true);
+    a->pinned = s.get_bool("ui", "sidebar_pinned", true);
+    if (s.has("ui", "sidebar_shown")) a->dock_shown = s.get_bool("ui", "sidebar_shown", true);
+    if (s.has("ui", "sidebar_page")) a->side_page = s.get_int("ui", "sidebar_page", 0);
+    a->panel_w = s.get_int("ui", "panel_width", 300);
     if (a->panel_w < 200 || a->panel_w > 700) a->panel_w = 300;
     if (g_lite) { a->lite = true; a->hud = true; a->pinned = false; a->dock_shown = false; a->side_open = false; }
 }
 
 void app_settings_save(App *a) {
-    g_key_file_set_string(a->settings, "ui", "theme", a->theme->name);
-    g_key_file_set_string(a->settings, "ui", "accent", a->accent ? a->accent : "");
-    g_key_file_set_integer(a->settings, "ui", "font_size", a->font_size);
-    g_key_file_set_boolean(a->settings, "ui", "show_ssh_config", a->show_ssh_config);
-    g_key_file_set_boolean(a->settings, "ui", "startup_shell", a->startup_shell);
+    lx::IniFile &s = a->settings;
+    s.set_string("ui", "theme", a->theme->name);
+    s.set_string("ui", "accent", a->accent);
+    s.set_int("ui", "font_size", a->font_size);
+    s.set_bool("ui", "show_ssh_config", a->show_ssh_config);
+    s.set_bool("ui", "startup_shell", a->startup_shell);
     bool follow = a->follow_default;
-    for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->kind == TAB_SSH && t->files) follow = files_follow(t->files); }
+    for (auto &t : a->tabs) if (t->kind == TAB_SSH && t->files) follow = t->files->follow();
     a->follow_default = follow;
-    g_key_file_set_boolean(a->settings, "ui", "follow_path", a->follow_default);
-    g_key_file_set_integer(a->settings, "ui", "scrollback", a->scrollback);
-    g_key_file_set_integer(a->settings, "ui", "scrollback_ram_mb", (int)a->sb_ram_mb);
-    g_key_file_set_integer(a->settings, "ui", "scrollback_disk_mb", (int)a->sb_disk_mb);
-    g_key_file_set_boolean(a->settings, "ui", "scrollback_spill", a->sb_spill);
-    if (!a->lite) g_key_file_set_boolean(a->settings, "ui", "performance_overlay", a->hud);
-    if (!a->lite) g_key_file_set_boolean(a->settings, "ui", "sidebar_pinned", a->pinned);
-    g_key_file_set_boolean(a->settings, "ui", "fast_cat", a->fast_cat);
-    if (!a->lite) g_key_file_set_boolean(a->settings, "ui", "sidebar_shown", a->dock_shown);
-    if (!a->lite) g_key_file_set_integer(a->settings, "ui", "sidebar_page", (int)a->side_page);
-    g_key_file_set_boolean(a->settings, "ui", "follow_fleetwm", a->follow_fleet);
-    g_key_file_set_boolean(a->settings, "ui", "rounded_corners", a->rounded);
-    g_key_file_set_integer(a->settings, "ui", "panel_width", a->panel_w);
-    char *dir = g_path_get_dirname(a->settings_path);
-    g_mkdir_with_parents(dir, 0700);
-    g_free(dir);
-    g_key_file_save_to_file(a->settings, a->settings_path, NULL);
+    s.set_bool("ui", "follow_path", a->follow_default);
+    s.set_int("ui", "scrollback", a->scrollback);
+    s.set_int("ui", "scrollback_ram_mb", (int)a->sb_ram_mb);
+    s.set_int("ui", "scrollback_disk_mb", (int)a->sb_disk_mb);
+    s.set_bool("ui", "scrollback_spill", a->sb_spill);
+    if (!a->lite) s.set_bool("ui", "performance_overlay", a->hud);
+    if (!a->lite) s.set_bool("ui", "sidebar_pinned", a->pinned);
+    s.set_bool("ui", "fast_cat", a->fast_cat);
+    if (!a->lite) s.set_bool("ui", "sidebar_shown", a->dock_shown);
+    if (!a->lite) s.set_int("ui", "sidebar_page", a->side_page);
+    s.set_bool("ui", "follow_fleetwm", a->follow_fleet);
+    s.set_bool("ui", "rounded_corners", a->rounded);
+    s.set_int("ui", "panel_width", a->panel_w);
+    s.save(a->settings_path);
+}
+
+static void mark_terms_dirty(App *a) {
+    for (auto &tb : a->tabs)
+        if (tb->term) { tcore_lock(tb->term); vt_mark_all_dirty(tcore_vt(tb->term)); tcore_unlock(tb->term); }
 }
 
 void app_apply_theme(App *a, const UiTheme *t) {
     a->theme = t;
-    const char *acc = a->follow_fleet && a->fleet.found && a->fleet.accent[0] ? a->fleet.accent : (a->accent && *a->accent ? a->accent : t->accent);
+    const char *acc = a->follow_fleet && a->fleet.found && !a->fleet.accent.empty() ? a->fleet.accent.c_str() : (!a->accent.empty() ? a->accent.c_str() : t->accent);
     ui_set_rounded(a->ui, a->rounded);
     uint32_t bg0 = ui_rgba(t->bg0, 255), bg1 = ui_rgba(t->bg1, 255), bg2 = ui_rgba(t->bg2, 255), ink = ui_rgba(t->ink, 255);
     uint32_t accent = ui_rgba(acc, 255);
@@ -197,16 +199,12 @@ void app_apply_theme(App *a, const UiTheme *t) {
     c->term_bg = ui_rgba(t->term_bg, 255);
     ui_set_colors(a->ui, c);
     ui_palette(&a->pal, t, acc);
-    for (guint i = 0; i < a->tabs->len; i++) {
-        Tab *tb = a->tabs->pdata[i];
-        if (tb->term) { tcore_lock(tb->term); vt_mark_all_dirty(tcore_vt(tb->term)); tcore_unlock(tb->term); }
-    }
+    mark_terms_dirty(a);
     app_redraw(a);
 }
 
-void app_set_accent(App *a, const char *hex) {
-    g_free(a->accent);
-    a->accent = g_strdup(hex ? hex : "");
+void app_set_accent(App *a, const std::string &hex) {
+    a->accent = hex;
     app_apply_theme(a, a->theme);
     app_settings_save(a);
 }
@@ -219,345 +217,283 @@ void app_follow_fleetwm(App *a) {
     app_apply_theme(a, ui_theme_find(name ? name : "fleetwm Dark"));
 }
 
-static char *pick_font_family(void) {
-    const char *want[] = {"JetBrains Mono", "DejaVu Sans Mono", "Cascadia Mono", "Menlo", "Consolas", NULL};
+static std::string pick_font_family() {
+    const char *want[] = {"JetBrains Mono", "DejaVu Sans Mono", "Cascadia Mono", "Menlo", "Consolas", nullptr};
     char *f = font_pick_family(want);
-    return f ? f : g_strdup("monospace");
+    std::string out = f ? f : "monospace";
+    free(f);
+    return out;
 }
 
 void app_apply_font(App *a) {
-    Font *nf = font_open(a->font_family && *a->font_family ? a->font_family : "monospace", a->font_size * 96.0 / 72.0 * a->scale, true);
+    Font *nf = font_open(a->font_family.empty() ? "monospace" : a->font_family.c_str(), a->font_size * 96.0 / 72.0 * a->scale, true);
     if (!nf) return;
     if (a->term_font) font_close(a->term_font);
     a->term_font = nf;
-    for (guint i = 0; i < a->tabs->len; i++) {
-        Tab *tb = a->tabs->pdata[i];
-        if (tb->term) { tcore_lock(tb->term); vt_mark_all_dirty(tcore_vt(tb->term)); tcore_unlock(tb->term); }
-    }
+    mark_terms_dirty(a);
     app_redraw(a);
 }
 
-Tab *app_cur_tab(App *a) { return a->cur >= 0 && a->cur < (int)a->tabs->len ? a->tabs->pdata[a->cur] : NULL; }
+Tab *app_cur_tab(App *a) { return a->cur >= 0 && a->cur < (int)a->tabs.size() ? a->tabs[(size_t)a->cur].get() : nullptr; }
 
-static int tab_index(App *a, Tab *t) { for (guint i = 0; i < a->tabs->len; i++) if (a->tabs->pdata[i] == t) return (int)i; return -1; }
+static int tab_index(App *a, const Tab *t) {
+    for (size_t i = 0; i < a->tabs.size(); i++) if (a->tabs[i].get() == t) return (int)i;
+    return -1;
+}
 
 static void ended_prompt(App *a, Tab *t);
 
 static void select_tab(App *a, int i) {
-    if (i < 0 || i >= (int)a->tabs->len) return;
+    if (i < 0 || i >= (int)a->tabs.size()) return;
     a->cur = i;
-    Tab *t = a->tabs->pdata[i];
+    Tab *t = a->tabs[(size_t)i].get();
     if (t->state == ST_ACTIVITY || t->state == ST_BELL) t->state = ST_IDLE;
     a->strip_scroll = -1;
     app_redraw(a);
     ended_prompt(a, t);
 }
 
-static void hook_wake(void *u) { (void)u; app_wake(); }
-static void hook_activity(void *u) { Tab *t = u; if (t->files) files_note_activity(t->files); if (app_cur_tab(t->app) != t && t->state == ST_IDLE) t->state = ST_ACTIVITY; }
-static void hook_bell(void *u) { Tab *t = u; if (app_cur_tab(t->app) != t && (t->state == ST_IDLE || t->state == ST_ACTIVITY)) t->state = ST_BELL; }
-static void hook_exited(void *u, int st) {
-    (void)st; Tab *t = u;
+static void hook_wake(void *) { app_wake(); }
+static void hook_activity(void *u) { Tab *t = static_cast<Tab *>(u); if (t->files) t->files->note_activity(); if (app_cur_tab(t->app) != t && t->state == ST_IDLE) t->state = ST_ACTIVITY; }
+static void hook_bell(void *u) { Tab *t = static_cast<Tab *>(u); if (app_cur_tab(t->app) != t && (t->state == ST_IDLE || t->state == ST_ACTIVITY)) t->state = ST_BELL; }
+static void hook_exited(void *u, int) {
+    Tab *t = static_cast<Tab *>(u);
     t->state = ST_ENDED; t->asked = false;
     if (t->app->quit_on_exit) t->app->running = false;
     else ended_prompt(t->app, t);
 }
-static void hook_restarted(void *u) { Tab *t = u; t->state = ST_IDLE; t->asked = false; }
-static void hook_cwd(void *u, const char *p) { Tab *t = u; if (t->files) files_set_cwd(t->files, p); }
-static void hook_clip_set(void *u, const char *text, bool primary) { (void)u; if (primary) SDL_SetPrimarySelectionText(text); else SDL_SetClipboardText(text); }
+static void hook_restarted(void *u) { Tab *t = static_cast<Tab *>(u); t->state = ST_IDLE; t->asked = false; }
+static void hook_cwd(void *u, const char *p) { Tab *t = static_cast<Tab *>(u); if (t->files) t->files->set_cwd(p); }
+static void hook_clip_set(void *, const char *text, bool primary) { if (primary) SDL_SetPrimarySelectionText(text); else SDL_SetClipboardText(text); }
 static void hook_clip_request(void *u, bool primary) {
-    Tab *t = u;
+    Tab *t = static_cast<Tab *>(u);
     char *s = primary ? SDL_GetPrimarySelectionText() : SDL_GetClipboardText();
     if (s && *s && t->term) tcore_paste(t->term, s);
     SDL_free(s);
 }
 
-static void tab_free(Tab *t) {
-    g_free(t->title); g_free(t->color); g_free(t->control_path);
-    if (t->conn) sd_conn_free(t->conn);
-    g_strfreev(t->local_argv);
-    g_free(t);
+Tab::~Tab() {
+    if (term) { tcore_close(term); tcore_free(term); }
+    if (files) files->close();
+    if (!control_path.empty()) sd_xfer_remove_control_path(control_path);
 }
 
 static void tab_destroy(App *a, Tab *t) {
     int idx = tab_index(a, t);
-    if (t->term) { tcore_close(t->term); tcore_free(t->term); }
-    if (t->files) files_free(t->files);
-    if (t->control_path) sd_xfer_remove_control_path(t->control_path);
-    g_ptr_array_remove_index(a->tabs, (guint)idx);
-    tab_free(t);
-    if (a->cur >= (int)a->tabs->len) a->cur = (int)a->tabs->len - 1;
+    if (idx < 0) return;
+    a->tabs.erase(a->tabs.begin() + idx);
+    if (a->cur >= (int)a->tabs.size()) a->cur = (int)a->tabs.size() - 1;
     else if (idx < a->cur) a->cur--;
     app_redraw(a);
 }
 
-static void close_confirmed(App *a, void *user) { Tab *t = user; if (tab_index(a, t) >= 0) tab_destroy(a, t); }
-
 void app_close_tab(App *a, Tab *t) {
-    if (t->term && tcore_running(t->term)) dlg_confirm(a, "Close session", "This session is still running. Close it?", "Close", close_confirmed, t);
+    if (t->term && tcore_running(t->term))
+        dlg_confirm(a, "Close session", "This session is still running. Close it?", "Close", [a, t] { if (tab_index(a, t) >= 0) tab_destroy(a, t); });
     else tab_destroy(a, t);
 }
 
 /* MobaXterm-style choices when a session ends (exit, logout, dropped ssh). Asked once per ending, for the visible tab. */
-static void ended_choice(App *a, int i, void *user) {
-    Tab *t = user;
-    if (tab_index(a, t) < 0) return;
-    if (i == 0) { if (t->term) tcore_restart(t->term); }
-    else if (i == 1) app_dup_tab(a, t);
-    else if (i == 2) tab_destroy(a, t);
-    app_redraw(a);
-}
-
 static void ended_prompt(App *a, Tab *t) {
     if (t->state != ST_ENDED || t->asked || app_cur_tab(a) != t || dlg_active(a)) return;
     t->asked = true;
-    static const char *const labels[] = {"Restart session", "Duplicate in a new tab", "Close tab", "Keep the tab open"};
-    char msg[200];
-    snprintf(msg, sizeof msg, "\"%s\" has ended. What do you want to do?", t->title);
-    dlg_choice(a, "Session ended", msg, labels, 4, ended_choice, t);
+    dlg_choice(a, "Session ended", "\"" + t->title + "\" has ended. What do you want to do?",
+               {"Restart session", "Duplicate in a new tab", "Close tab", "Keep the tab open"}, [a, t](int i) {
+                   if (tab_index(a, t) < 0) return;
+                   if (i == 0) { if (t->term) tcore_restart(t->term); }
+                   else if (i == 1) app_dup_tab(a, t);
+                   else if (i == 2) tab_destroy(a, t);
+                   app_redraw(a);
+               });
 }
 
-static Tab *tab_add(App *a, TabKind kind, const char *title) {
-    Tab *t = g_new0(Tab, 1);
-    t->app = a; t->kind = kind; t->title = g_strdup(title); t->color = g_strdup("");
-    g_ptr_array_add(a->tabs, t);
-    select_tab(a, (int)a->tabs->len - 1);
-    return t;
+static Tab *tab_add(App *a, TabKind kind, const std::string &title) {
+    auto t = std::make_unique<Tab>();
+    t->app = a; t->kind = kind; t->title = title;
+    Tab *raw = t.get();
+    a->tabs.push_back(std::move(t));
+    select_tab(a, (int)a->tabs.size() - 1);
+    return raw;
 }
 
 static bool g_fastcat = true;
 
-static char *exe_dir(void) {
+static std::string exe_dir() {
     char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
-    if (n <= 0) return NULL;
-    buf[n] = 0;
-    return g_path_get_dirname(buf);
+    if (n <= 0) return {};
+    return lx::dirname(std::string(buf, (size_t)n));
 }
 
-static char *find_shipped(const char *const rel[]) {
-    char *dir = exe_dir();
-    char *found = NULL;
-    for (int i = 0; dir && rel[i] && !found; i++) {
-        char *p = g_build_filename(dir, rel[i], NULL);
-        if (g_file_test(p, G_FILE_TEST_EXISTS)) found = g_canonicalize_filename(p, NULL); 
-        g_free(p);
+static std::string find_shipped(std::initializer_list<const char *> rel) {
+    std::string dir = exe_dir();
+    if (dir.empty()) return {};
+    for (const char *r : rel) {
+        std::string p = lx::path_join(dir, r);
+        if (lx::exists(p)) return lx::canonicalize(p);
     }
-    g_free(dir);
-    return found;
+    return {};
 }
 
 void app_fastcat_apply(App *a) {
-    static char *cat_dir;
-    g_free(cat_dir); cat_dir = NULL;
-    tcore_cat_dir = NULL;
+    static std::string cat_dir;
+    cat_dir.clear();
+    tcore_cat_dir = nullptr;
     if (!a->fast_cat || !g_fastcat) return;
-    const char *const cands[] = {"lxcat", "../build/lxcat", NULL};
-    char *lx = find_shipped(cands);
-    if (!lx) return;
-    char *dir = g_build_filename(g_get_user_cache_dir(), "lestrix", "bin", NULL);
-    g_mkdir_with_parents(dir, 0700);
-    char *link = g_build_filename(dir, "cat", NULL);
-    char *cur = g_file_read_link(link, NULL);
-    if (!cur || strcmp(cur, lx) != 0) { unlink(link); if (symlink(lx, link) != 0) { g_free(dir); dir = NULL; } }
-    g_free(cur); g_free(link); g_free(lx);
+    std::string lxcat = find_shipped({"lxcat", "../build/lxcat"});
+    if (lxcat.empty()) return;
+    std::string dir = lx::path_join(lx::cache_dir(), "lestrix", "bin");
+    lx::mkdir_p(dir, 0700);
+    std::string link = lx::path_join(dir, "cat");
+    if (lx::read_link(link) != lxcat) {
+        unlink(link.c_str());
+        if (symlink(lxcat.c_str(), link.c_str()) != 0) return;
+    }
     cat_dir = dir;
-    tcore_cat_dir = cat_dir;
+    tcore_cat_dir = cat_dir.c_str();
 }
 
-static TermCore *make_term(App *a, Tab *t, char *const argv[], const char *cwd, bool fastcat) {
-    TermHooks h = {.wake = hook_wake, .activity = hook_activity, .bell = hook_bell, .exited = hook_exited, .restarted = hook_restarted,
-                   .cwd = hook_cwd, .clip_set = hook_clip_set, .clip_request = hook_clip_request};
+static TermCore *make_term(App *a, Tab *t, const std::vector<std::string> &args, const char *cwd, bool fastcat) {
+    TermHooks h{};
+    h.wake = hook_wake; h.activity = hook_activity; h.bell = hook_bell; h.exited = hook_exited; h.restarted = hook_restarted;
+    h.cwd = hook_cwd; h.clip_set = hook_clip_set; h.clip_request = hook_clip_request;
     int cols, rows;
     float cw = (float)a->W - (a->pinned && a->dock_shown ? P(a->panel_w) : 0) - P(34), ch = (float)a->H - P(130);
     tv_fit(a->term_font, cw, ch, &cols, &rows);
-    return tcore_new(argv, cwd, cols, rows, &h, t, fastcat && g_fastcat);
+    std::vector<char *> argv;
+    for (const std::string &s : args) argv.push_back(const_cast<char *>(s.c_str()));
+    argv.push_back(nullptr);
+    return tcore_new(argv.data(), cwd, cols, rows, &h, t, fastcat && g_fastcat);
 }
 
-char **app_default_shell_argv(const char *shell) {
-    const char *s = shell ? shell : g_getenv("SHELL");
-    if (!s || !*s) s = "/bin/sh";
-    char **argv = g_new0(char *, 3);
-    argv[0] = g_strdup(s);
-    return argv;
+std::vector<std::string> app_default_shell_argv(const std::string &shell) {
+    std::string s = shell.empty() ? lx::env("SHELL") : shell;
+    return {s.empty() ? "/bin/sh" : s};
 }
 
-Tab *app_open_local(App *a, const char *title, char **argv, const char *cwd) {
+Tab *app_open_local(App *a, const std::string &title, const std::vector<std::string> &argv, const char *cwd) {
     Tab *t = tab_add(a, TAB_LOCAL, title);
     t->term = make_term(a, t, argv, cwd, true);
-    t->local_argv = g_strdupv(argv);
+    t->local_argv = argv;
     return t;
 }
 
-void app_set_tab_color(App *a, Tab *t, const char *hex) {
-    g_free(t->color);
-    t->color = g_strdup(hex ? hex : "");
-    if (t->conn) sd_store_set_color(a->store, t->conn->id, t->color);
+void app_set_tab_color(App *a, Tab *t, const std::string &hex) {
+    t->color = hex;
+    if (t->conn) a->store->set_color(t->conn->id, t->color);
     app_redraw(a);
 }
 
-typedef struct { SdConn *conn; } FtpOpen;
-
-static void ftp_open_with_password(App *a, const SdConn *c, const char *password) {
-    SdXfer *x = sd_xfer_new_ftp(c, password);
-    Tab *t = tab_add(a, TAB_FTP, c->name);
-    t->files = files_new(a, x, false);
-    t->conn = sd_conn_copy(c);
-    g_free(t->color);
-    t->color = g_strdup(c->color);
+static void ftp_open_with_password(App *a, const SdConn &c, const std::string &password) {
+    Tab *t = tab_add(a, TAB_FTP, c.name);
+    t->files = FilesPane::create(a, SdXfer::new_ftp(c, password), false);
+    t->conn = std::make_unique<SdConn>(c);
+    t->color = c.color;
 }
 
-static void on_ftp_password(App *a, const char *pw, void *user) {
-    FtpOpen *o = user;
-    ftp_open_with_password(a, o->conn, pw);
-    sd_conn_free(o->conn);
-    g_free(o);
-}
-
-static Tab *open_connection_copy(App *a, const SdConn *c) {
-    if (g_str_equal(c->protocol, "ftp") || g_str_equal(c->protocol, "ftps")) {
-        if (*c->user) {
-            FtpOpen *o = g_new0(FtpOpen, 1);
-            o->conn = sd_conn_copy(c);
-            char *title = g_strdup_printf("Password for %s@%s", c->user, c->host);
-            dlg_text(a, title, NULL, "", true, on_ftp_password, o);
-            g_free(title);
-        } else ftp_open_with_password(a, c, NULL);
-        return NULL;
+static Tab *open_connection_copy(App *a, const SdConn &c) {
+    if (c.protocol == "ftp" || c.protocol == "ftps") {
+        if (!c.user.empty()) dlg_text(a, "Password for " + c.user + "@" + c.host, "", "", true, [a, c](const std::string &pw) { ftp_open_with_password(a, c, pw); });
+        else ftp_open_with_password(a, c, "");
+        return nullptr;
     }
-    char *cp = sd_xfer_new_control_path();
-    char **argv = sd_conn_argv(c, cp);
-    Tab *t = tab_add(a, TAB_SSH, c->name);
-    t->term = make_term(a, t, argv, NULL, false);
-    g_strfreev(argv);
-    t->conn = sd_conn_copy(c);
+    std::string cp = sd_xfer_new_control_path();
+    Tab *t = tab_add(a, TAB_SSH, c.name);
+    t->term = make_term(a, t, c.argv(cp.c_str()), nullptr, false);
+    t->conn = std::make_unique<SdConn>(c);
     t->control_path = cp;
-    g_free(t->color);
-    t->color = g_strdup(c->color);
-    t->files = files_new(a, sd_xfer_new_ssh(c, cp), a->follow_default);
+    t->color = c.color;
+    t->files = FilesPane::create(a, SdXfer::new_ssh(c, cp), a->follow_default);
     return t;
 }
 
-Tab *app_open_connection(App *a, const SdConn *conn) {
-    SdConn *c = sd_conn_copy(conn);
-    sd_store_touch(a->store, c->id);
+Tab *app_open_connection(App *a, const SdConn &conn) {
+    SdConn c = conn;
+    a->store->touch(c.id);
     app_refresh(a);
-    Tab *t = open_connection_copy(a, c);
-    sd_conn_free(c);
-    return t;
+    return open_connection_copy(a, c);
 }
 
 void app_dup_tab(App *a, Tab *t) {
-    if (t->conn) app_open_connection(a, t->conn);
-    else if (t->local_argv) app_open_local(a, t->title, t->local_argv, NULL);
+    if (t->conn) app_open_connection(a, *t->conn);
+    else if (!t->local_argv.empty()) app_open_local(a, t->title, t->local_argv, nullptr);
 }
 
 static void move_current_tab(App *a, int delta) {
-    int i = a->cur, n = (int)a->tabs->len;
+    int i = a->cur, n = (int)a->tabs.size();
     if (i < 0 || i + delta < 0 || i + delta >= n) return;
-    gpointer x = a->tabs->pdata[i];
-    a->tabs->pdata[i] = a->tabs->pdata[i + delta];
-    a->tabs->pdata[i + delta] = x;
+    std::swap(a->tabs[(size_t)i], a->tabs[(size_t)(i + delta)]);
     a->cur = i + delta;
     a->strip_scroll = -1;
 }
 
-typedef struct { char *id, *name, *group, *color, *hay, *tip; bool live; } Row;
-typedef struct { char *id, *name, *dest, *age; } Recent;
+struct Row {
+    std::string id, name, group, color, hay, tip;
+    bool live;
+};
+struct Recent {
+    std::string id, name, dest, age;
+};
 
-static Row *rows;
-static int nrows;
-static Recent recents[9];
-static int nrecent;
+static std::vector<Row> rows;
+static std::vector<Recent> recents;
 static char meta_text[96];
 
-static void rows_clear(void) {
-    for (int i = 0; i < nrows; i++) { g_free(rows[i].id); g_free(rows[i].name); g_free(rows[i].group); g_free(rows[i].color); g_free(rows[i].hay); g_free(rows[i].tip); }
-    g_free(rows);
-    rows = NULL; nrows = 0;
-    for (int i = 0; i < nrecent; i++) { g_free(recents[i].id); g_free(recents[i].name); g_free(recents[i].dest); g_free(recents[i].age); }
-    nrecent = 0;
-}
-
-static int conn_cmp(gconstpointer x, gconstpointer y) {
-    const SdConn *a = *(SdConn *const *)x, *b = *(SdConn *const *)y;
-    int c = g_ascii_strcasecmp(a->group, b->group);
-    return c ? c : g_ascii_strcasecmp(a->name, b->name);
-}
-
 void app_refresh(App *a) {
-    sd_store_reload_ssh_config(a->store, a->show_ssh_config, NULL);
-    rows_clear();
-    GPtrArray *all = sd_store_all(a->store);
-    g_ptr_array_sort(all, conn_cmp);
-    rows = g_new0(Row, all->len + 1);
-    nrows = (int)all->len;
-    for (guint i = 0; i < all->len; i++) {
-        SdConn *c = all->pdata[i];
-        Row *r = &rows[i];
-        r->id = g_strdup(c->id); r->name = g_strdup(c->name); r->group = g_strdup(c->group); r->color = g_strdup(c->color);
-        char *h = g_strdup_printf("%s %s %s", c->name, c->host, c->group);
-        r->hay = g_utf8_strdown(h, -1);
-        g_free(h);
-        r->live = sd_conn_is_live(c);
-        r->tip = r->live ? g_strdup_printf("ssh %s  (from ~/.ssh/config)", c->alias) : g_strdup_printf("%s://%s:%d", c->protocol, c->host, c->port);
+    a->store->reload_ssh_config(a->show_ssh_config);
+    std::vector<SdConn *> all = a->store->all();
+    std::stable_sort(all.begin(), all.end(), [](const SdConn *x, const SdConn *y) {
+        int c = strcasecmp(x->group.c_str(), y->group.c_str());
+        return c ? c < 0 : strcasecmp(x->name.c_str(), y->name.c_str()) < 0;
+    });
+    rows.clear();
+    for (const SdConn *c : all) {
+        Row r;
+        r.id = c->id; r.name = c->name; r.group = c->group; r.color = c->color;
+        r.hay = lx::utf8_lower(c->name + " " + c->host + " " + c->group);
+        r.live = c->is_live();
+        r.tip = r.live ? "ssh " + c->alias + "  (from ~/.ssh/config)" : lx::strprintf("%s://%s:%d", c->protocol.c_str(), c->host.c_str(), c->port);
+        rows.push_back(std::move(r));
     }
-    if (all->len) snprintf(meta_text, sizeof meta_text, "%u connection%s saved", all->len, all->len == 1 ? "" : "s");
+    if (!all.empty()) snprintf(meta_text, sizeof meta_text, "%zu connection%s saved", all.size(), all.size() == 1 ? "" : "s");
     else snprintf(meta_text, sizeof meta_text, "No connections yet");
-    g_ptr_array_free(all, TRUE);
-    GPtrArray *rec = sd_store_recent(a->store, 9);
-    for (guint i = 0; i < rec->len && i < 9; i++) {
-        SdConn *c = rec->pdata[i];
-        recents[nrecent].id = g_strdup(c->id); recents[nrecent].name = g_strdup(c->name);
-        recents[nrecent].dest = sd_conn_dest(c); recents[nrecent].age = relative_age(c->last_used);
-        nrecent++;
-    }
-    g_ptr_array_free(rec, TRUE);
+    recents.clear();
+    for (const SdConn *c : a->store->recent(9)) recents.push_back({c->id, c->name, c->dest(), relative_age(c->last_used)});
     app_redraw(a);
 }
 
-typedef struct { char *id, *host; int port; int ok; } Probe;
-
-static void *probe_work(void *arg) {
-    Probe *p = arg;
-    struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM}, *res = NULL;
-    char ps[16];
-    snprintf(ps, sizeof ps, "%d", p->port);
-    p->ok = 0;
-    if (getaddrinfo(p->host, ps, &hints, &res) == 0) {
-        for (struct addrinfo *ai = res; ai && !p->ok; ai = ai->ai_next) {
-            int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-            if (fd < 0) continue;
-            fcntl(fd, F_SETFL, O_NONBLOCK);
-            int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
-            if (rc == 0) p->ok = 1;
-            else if (errno == EINPROGRESS) {
-                struct pollfd pf = {fd, POLLOUT, 0};
-                if (poll(&pf, 1, 3000) > 0) { int err = 0; socklen_t l = sizeof err; getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l); p->ok = err == 0; }
-            }
-            close(fd);
+/* Is the host's port reachable? Runs on a worker thread; the result is applied on the UI thread. */
+static bool probe_port(const std::string &host, int port) {
+    struct addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = nullptr;
+    bool ok = false;
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return false;
+    for (struct addrinfo *ai = res; ai && !ok; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc == 0) ok = true;
+        else if (errno == EINPROGRESS) {
+            struct pollfd pf = {fd, POLLOUT, 0};
+            if (poll(&pf, 1, 3000) > 0) { int err = 0; socklen_t l = sizeof err; getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l); ok = err == 0; }
         }
-        freeaddrinfo(res);
+        close(fd);
     }
-    return NULL;
-}
-
-static void probe_done(void *arg, void *r) {
-    (void)r;
-    Probe *p = arg;
-    if (g_app) { g_hash_table_insert(g_app->up, g_strdup(p->id), GINT_TO_POINTER(p->ok ? 1 : 2)); app_redraw(g_app); }
-    g_free(p->id); g_free(p->host); g_free(p);
+    freeaddrinfo(res);
+    return ok;
 }
 
 static void probe_all(App *a) {
-    GPtrArray *all = sd_store_all(a->store);
-    for (guint i = 0; i < all->len; i++) {
-        SdConn *c = all->pdata[i];
-        Probe *p = g_new0(Probe, 1);
-        p->id = g_strdup(c->id); p->host = g_strdup(c->host); p->port = c->port;
-        jobs_run(probe_work, probe_done, p);
+    for (const SdConn *c : a->store->all()) {
+        auto ok = std::make_shared<bool>(false);
+        jobs_run([ok, host = c->host, port = c->port] { *ok = probe_port(host, port); },
+                 [ok, id = c->id] {
+                     if (g_app) { g_app->up[id] = *ok ? 1 : 2; app_redraw(g_app); }
+                 });
     }
-    g_ptr_array_free(all, TRUE);
 }
 
 enum {
@@ -574,113 +510,94 @@ static const struct { const char *label; int lines; } SB_PRESETS[] = {
     {"1,000,000 lines", 1000000}, {"Unlimited (old lines move to disk)", -1},
 };
 
-static char *shells[16];
-static int nshells;
+
+static std::vector<std::string> shells;
 static uint32_t tab_swatch[8];
 static Tab *ctx_tab;
 
-static void find_shells(void) {
-    const char *names[] = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "xonsh", "elvish", "pwsh", NULL};
-    for (int i = 0; names[i] && nshells < 16; i++) { char *p = g_find_program_in_path(names[i]); if (p) shells[nshells++] = p; }
+static void find_shells() {
+    for (const char *n : {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "xonsh", "elvish", "pwsh"}) {
+        std::string p = lx::find_program(n);
+        if (!p.empty() && shells.size() < 16) shells.push_back(p);
+    }
 }
 
 static void open_bar_menu(App *a, int which, float x, float y) {
     UiMenuItem it[48];
     int n = 0;
-#define ADD(...) it[n++] = (UiMenuItem){__VA_ARGS__}
-#define SEP() ADD(NULL, NULL, 0, MI_SEP, NULL, 0)
+    auto add = [&](const char *label, const char *hint, int id, int flags) { it[n++] = UiMenuItem{label, hint, id, flags, nullptr, 0}; };
+    auto sep = [&] { add(nullptr, nullptr, 0, MI_SEP); };
     static char sh_labels[16][64];
     if (which == 0) {
-        ADD("New connection\xe2\x80\xa6", "Ctrl+N", A_NEW_CONN, 0, NULL, 0);
-        ADD("New local shell", "Ctrl+Shift+T", A_NEW_LOCAL, 0, NULL, 0);
-        if (nshells) { SEP(); ADD("New local shell as\xe2\x80\xa6", NULL, 0, MI_HEADER, NULL, 0); }
-        for (int i = 0; i < nshells && n < 40; i++) { { char *bn = g_path_get_basename(shells[i]); snprintf(sh_labels[i], sizeof sh_labels[i], "   %s", bn); g_free(bn); } ADD(sh_labels[i], NULL, A_SHELL + i, 0, NULL, 0); }
-        SEP();
-        ADD("Import Ansible inventory\xe2\x80\xa6", NULL, A_IMPORT_INV, 0, NULL, 0);
-        ADD("Copy ~/.ssh/config hosts into saved connections", NULL, A_IMPORT_SSH, 0, NULL, 0);
-        SEP();
-        ADD("Quit", "Ctrl+Q", A_QUIT, 0, NULL, 0);
+        add("New connection\xe2\x80\xa6", "Ctrl+N", A_NEW_CONN, 0);
+        add("New local shell", "Ctrl+Shift+T", A_NEW_LOCAL, 0);
+        if (!shells.empty()) { sep(); add("New local shell as\xe2\x80\xa6", nullptr, 0, MI_HEADER); }
+        for (size_t i = 0; i < shells.size() && n < 40; i++) {
+            snprintf(sh_labels[i], sizeof sh_labels[i], "   %s", lx::basename(shells[i]).c_str());
+            add(sh_labels[i], nullptr, A_SHELL + (int)i, 0);
+        }
+        sep();
+        add("Import Ansible inventory\xe2\x80\xa6", nullptr, A_IMPORT_INV, 0);
+        add("Copy ~/.ssh/config hosts into saved connections", nullptr, A_IMPORT_SSH, 0);
+        sep();
+        add("Quit", "Ctrl+Q", A_QUIT, 0);
     } else if (which == 1) {
-        ADD("Toggle sidebar", "Ctrl+B", A_SIDEBAR, 0, NULL, 0);
-        ADD("Sessions / Files sidebar", "Ctrl+Shift+B", A_FILES, 0, NULL, 0);
-        ADD("Bigger font", "Ctrl+=", A_BIGGER, 0, NULL, 0);
-        ADD("Smaller font", "Ctrl+-", A_SMALLER, 0, NULL, 0);
-        ADD("Re-check hosts", "F5", A_RECHECK, 0, NULL, 0);
-        SEP();
-        ADD("Theme", NULL, 0, MI_HEADER, NULL, 0);
-        ADD("Follow fleetwm theme", NULL, A_FLEET, MI_CHECK | (a->follow_fleet ? MI_CHECKED : 0) | (a->fleet.found ? 0 : MI_DISABLED), NULL, 0);
-        ADD("Rounded corners", NULL, A_ROUND, MI_CHECK | (a->rounded ? MI_CHECKED : 0), NULL, 0);
-        for (int i = 0; i < UI_THEME_COUNT && n < 44; i++) ADD(UI_THEMES[i].name, NULL, A_THEME + i, MI_CHECK | (a->theme == &UI_THEMES[i] ? MI_CHECKED : 0), NULL, 0);
-        ADD("Accent color\xe2\x80\xa6", NULL, A_ACCENT, 0, NULL, 0);
-        ADD("Reset accent", NULL, A_ACCENT_RESET, 0, NULL, 0);
-        SEP();
-        ADD("Scrollback", NULL, 0, MI_HEADER, NULL, 0);
-        for (unsigned i = 0; i < sizeof SB_PRESETS / sizeof *SB_PRESETS; i++) ADD(SB_PRESETS[i].label, NULL, A_SB + (int)i, MI_CHECK | (a->scrollback == SB_PRESETS[i].lines ? MI_CHECKED : 0), NULL, 0);
-        ADD("Spill old scrollback to disk", NULL, A_SPILL, MI_CHECK | (a->sb_spill ? MI_CHECKED : 0), NULL, 0);
-        SEP();
-        ADD("Fast cat in local tabs (lxcat)", NULL, A_FASTCAT, MI_CHECK | (a->fast_cat ? MI_CHECKED : 0), NULL, 0);
-        ADD("Show performance overlay", NULL, A_HUD, MI_CHECK | (a->hud ? MI_CHECKED : 0), NULL, 0);
-        ADD("Show hosts from ~/.ssh/config", NULL, A_SSHCFG, MI_CHECK | (a->show_ssh_config ? MI_CHECKED : 0), NULL, 0);
-        ADD("Open a local shell on startup", NULL, A_STARTUP, MI_CHECK | (a->startup_shell ? MI_CHECKED : 0), NULL, 0);
+        add("Toggle sidebar", "Ctrl+B", A_SIDEBAR, 0);
+        add("Sessions / Files sidebar", "Ctrl+Shift+B", A_FILES, 0);
+        add("Bigger font", "Ctrl+=", A_BIGGER, 0);
+        add("Smaller font", "Ctrl+-", A_SMALLER, 0);
+        add("Re-check hosts", "F5", A_RECHECK, 0);
+        sep();
+        add("Theme", nullptr, 0, MI_HEADER);
+        add("Follow fleetwm theme", nullptr, A_FLEET, MI_CHECK | (a->follow_fleet ? MI_CHECKED : 0) | (a->fleet.found ? 0 : MI_DISABLED));
+        add("Rounded corners", nullptr, A_ROUND, MI_CHECK | (a->rounded ? MI_CHECKED : 0));
+        for (int i = 0; i < UI_THEME_COUNT && n < 44; i++) add(UI_THEMES[i].name, nullptr, A_THEME + i, MI_CHECK | (a->theme == &UI_THEMES[i] ? MI_CHECKED : 0));
+        add("Accent color\xe2\x80\xa6", nullptr, A_ACCENT, 0);
+        add("Reset accent", nullptr, A_ACCENT_RESET, 0);
+        sep();
+        add("Scrollback", nullptr, 0, MI_HEADER);
+        for (size_t i = 0; i < std::size(SB_PRESETS); i++) add(SB_PRESETS[i].label, nullptr, A_SB + (int)i, MI_CHECK | (a->scrollback == SB_PRESETS[i].lines ? MI_CHECKED : 0));
+        add("Spill old scrollback to disk", nullptr, A_SPILL, MI_CHECK | (a->sb_spill ? MI_CHECKED : 0));
+        sep();
+        add("Fast cat in local tabs (lxcat)", nullptr, A_FASTCAT, MI_CHECK | (a->fast_cat ? MI_CHECKED : 0));
+        add("Show performance overlay", nullptr, A_HUD, MI_CHECK | (a->hud ? MI_CHECKED : 0));
+        add("Show hosts from ~/.ssh/config", nullptr, A_SSHCFG, MI_CHECK | (a->show_ssh_config ? MI_CHECKED : 0));
+        add("Open a local shell on startup", nullptr, A_STARTUP, MI_CHECK | (a->startup_shell ? MI_CHECKED : 0));
     } else {
-        ADD("About Lestrix", NULL, A_ABOUT, 0, NULL, 0);
+        add("About Lestrix", nullptr, A_ABOUT, 0);
     }
     ui_menu_open(a->ui, x, y, it, n, TAG_BAR + which);
-#undef ADD
-#undef SEP
 }
 
 static void open_tab_menu(App *a, Tab *t, float x, float y) {
     ctx_tab = t;
     for (int i = 0; i < 8; i++) tab_swatch[i] = ui_rgba(TAB_COLORS[i][1], 255);
     UiMenuItem it[] = {
-        {"Rename\xe2\x80\xa6", NULL, A_T_RENAME, 0, NULL, 0},
-        {"Tab color", NULL, 0, MI_HEADER, NULL, 0},
-        {NULL, NULL, A_T_COLOR, 0, tab_swatch, 8},
-        {"Custom color\xe2\x80\xa6", NULL, A_T_CUSTOM, 0, NULL, 0},
-        {"Default color", NULL, A_T_DEFAULT, 0, NULL, 0},
-        {NULL, NULL, 0, MI_SEP, NULL, 0},
-        {"Duplicate tab", "Ctrl+Shift+D", A_T_DUP, 0, NULL, 0},
-        {"Close tab", "Ctrl+Shift+W", A_T_CLOSE, 0, NULL, 0},
-        {"Close other tabs", NULL, A_T_OTHERS, a->tabs->len > 1 ? 0 : MI_DISABLED, NULL, 0},
+        {"Rename\xe2\x80\xa6", nullptr, A_T_RENAME, 0, nullptr, 0},
+        {"Tab color", nullptr, 0, MI_HEADER, nullptr, 0},
+        {nullptr, nullptr, A_T_COLOR, 0, tab_swatch, 8},
+        {"Custom color\xe2\x80\xa6", nullptr, A_T_CUSTOM, 0, nullptr, 0},
+        {"Default color", nullptr, A_T_DEFAULT, 0, nullptr, 0},
+        {nullptr, nullptr, 0, MI_SEP, nullptr, 0},
+        {"Duplicate tab", "Ctrl+Shift+D", A_T_DUP, 0, nullptr, 0},
+        {"Close tab", "Ctrl+Shift+W", A_T_CLOSE, 0, nullptr, 0},
+        {"Close other tabs", nullptr, A_T_OTHERS, a->tabs.size() > 1 ? 0 : MI_DISABLED, nullptr, 0},
     };
     ui_menu_open(a->ui, x, y, it, (int)(sizeof it / sizeof *it), TAG_TAB);
 }
 
-static void rename_cb(App *a, const char *text, void *user) {
-    Tab *t = user;
-    if (tab_index(a, t) < 0) return;
-    g_free(t->title);
-    t->title = g_strdup(text);
-}
-
-static void custom_color_cb(App *a, const char *text, void *user) {
-    Tab *t = user;
-    if (tab_index(a, t) >= 0) app_set_tab_color(a, t, text);
-}
-
-static void accent_cb(App *a, const char *text, void *user) { (void)user; a->follow_fleet = false; app_set_accent(a, text); }
-
-static void inventory_cb(App *a, char **paths, int n, void *user) {
-    (void)user;
-    if (n < 1) return;
-    GError *err = NULL;
-    GPtrArray *items = sd_parse_ansible_inventory(paths[0], &err);
-    if (!items) { dlg_message(a, "Import failed", err ? err->message : "unknown error"); g_clear_error(&err); }
-    else { sd_store_add_imported(a->store, items); app_refresh(a); }
+static void rename_tab_dialog(App *a, Tab *t) {
+    dlg_text(a, "Rename tab", "", t->title, false, [a, t](const std::string &text) { if (tab_index(a, t) >= 0) t->title = text; });
 }
 
 static void apply_history(App *a) {
-    for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->term) tcore_set_history(t->term, a->scrollback, a->sb_ram_mb, a->sb_disk_mb, a->sb_spill); }
+    for (auto &t : a->tabs) if (t->term) tcore_set_history(t->term, a->scrollback, a->sb_ram_mb, a->sb_disk_mb, a->sb_spill);
     tcore_set_history_defaults(a->scrollback, a->sb_ram_mb, a->sb_disk_mb, a->sb_spill);
 }
 
-static void do_new_local(App *a, const char *shell) {
-    char **argv = app_default_shell_argv(shell);
-    char *base = g_path_get_basename(argv[0]);
-    app_open_local(a, shell ? base : "local", argv, NULL);
-    g_free(base);
-    g_strfreev(argv);
+static void do_new_local(App *a, const std::string &shell) {
+    std::vector<std::string> argv = app_default_shell_argv(shell);
+    app_open_local(a, shell.empty() ? "local" : lx::basename(argv[0]), argv, nullptr);
 }
 
 static void side_select(App *a, int page) {
@@ -696,23 +613,29 @@ static void side_select(App *a, int page) {
 
 static void run_action(App *a, int id) {
     switch (id) {
-    case A_NEW_CONN: dlg_conn_editor(a, NULL, false); break;
-    case A_NEW_LOCAL: do_new_local(a, NULL); break;
-    case A_IMPORT_INV: dlg_pick_file(a, "Ansible inventory (INI or YAML)", false, false, g_get_home_dir(), inventory_cb, NULL); break;
-    case A_IMPORT_SSH: {
-        char *path = g_build_filename(g_get_home_dir(), ".ssh", "config", NULL);
-        GPtrArray *items = sd_parse_ssh_config(path, false);
-        g_free(path);
-        if (items) { sd_store_add_imported(a->store, items); app_refresh(a); }
+    case A_NEW_CONN: dlg_conn_editor(a, nullptr, false); break;
+    case A_NEW_LOCAL: do_new_local(a, ""); break;
+    case A_IMPORT_INV:
+        dlg_pick_file(a, "Ansible inventory (INI or YAML)", false, false, lx::home_dir(), [a](const std::vector<std::string> &paths) {
+            if (paths.empty()) return;
+            std::string err;
+            auto items = sd_parse_ansible_inventory(paths[0], &err);
+            if (!items) { dlg_message(a, "Import failed", err.empty() ? "unknown error" : err); return; }
+            a->store->add_imported(std::move(*items));
+            app_refresh(a);
+        });
         break;
-    }
+    case A_IMPORT_SSH:
+        a->store->add_imported(sd_parse_ssh_config(lx::path_join(lx::home_dir(), ".ssh", "config"), false));
+        app_refresh(a);
+        break;
     case A_QUIT: a->running = false; break;
     case A_SIDEBAR: if (a->lite) break; if (a->pinned) { a->dock_shown = !a->dock_shown; app_settings_save(a); } else a->side_open = !a->side_open; ui_want_frames(a->ui, 0.3); break;
     case A_FILES: if (a->lite) break; side_select(a, a->side_page == 0 ? 1 : 0); break;
     case A_BIGGER: if (a->font_size < 32) { a->font_size++; app_apply_font(a); app_settings_save(a); } break;
     case A_SMALLER: if (a->font_size > 7) { a->font_size--; app_apply_font(a); app_settings_save(a); } break;
-    case A_RECHECK: g_hash_table_remove_all(a->up); probe_all(a); break;
-    case A_ACCENT: dlg_color(a, "Accent color", a->accent, accent_cb, NULL); break;
+    case A_RECHECK: a->up.clear(); probe_all(a); break;
+    case A_ACCENT: dlg_color(a, "Accent color", a->accent, [a](const std::string &text) { a->follow_fleet = false; app_set_accent(a, text); }); break;
     case A_ACCENT_RESET: app_set_accent(a, ""); break;
     case A_HUD: if (a->lite) break; a->hud = !a->hud; app_settings_save(a); break;
     case A_FASTCAT: a->fast_cat = !a->fast_cat; app_fastcat_apply(a); app_settings_save(a); break;
@@ -725,7 +648,7 @@ static void run_action(App *a, int id) {
     default:
         if (id >= A_THEME && id < A_THEME + UI_THEME_COUNT) { a->follow_fleet = false; app_apply_theme(a, &UI_THEMES[id - A_THEME]); app_settings_save(a); }
         else if (id >= A_SB && id < A_SB + 6) { a->scrollback = SB_PRESETS[id - A_SB].lines; apply_history(a); app_settings_save(a); }
-        else if (id >= A_SHELL && id < A_SHELL + nshells) do_new_local(a, shells[id - A_SHELL]);
+        else if (id >= A_SHELL && id < A_SHELL + (int)shells.size()) do_new_local(a, shells[(size_t)(id - A_SHELL)]);
         break;
     }
 }
@@ -733,44 +656,34 @@ static void run_action(App *a, int id) {
 static void run_tab_action(App *a, int id) {
     Tab *t = ctx_tab;
     if (!t || tab_index(a, t) < 0) return;
-    if (id == A_T_RENAME) dlg_text(a, "Rename tab", NULL, t->title, false, rename_cb, t);
+    if (id == A_T_RENAME) rename_tab_dialog(a, t);
     else if (id >= A_T_COLOR && id < A_T_COLOR + 8) app_set_tab_color(a, t, TAB_COLORS[id - A_T_COLOR][1]);
-    else if (id == A_T_CUSTOM) dlg_color(a, "Tab color", t->color, custom_color_cb, t);
+    else if (id == A_T_CUSTOM) dlg_color(a, "Tab color", t->color, [a, t](const std::string &text) { if (tab_index(a, t) >= 0) app_set_tab_color(a, t, text); });
     else if (id == A_T_DEFAULT) app_set_tab_color(a, t, "");
     else if (id == A_T_DUP) app_dup_tab(a, t);
     else if (id == A_T_CLOSE) app_close_tab(a, t);
     else if (id == A_T_OTHERS) {
-        GPtrArray *others = g_ptr_array_new();
-        for (guint i = 0; i < a->tabs->len; i++) if (a->tabs->pdata[i] != t) g_ptr_array_add(others, a->tabs->pdata[i]);
-        for (guint i = 0; i < others->len; i++) app_close_tab(a, others->pdata[i]);
-        g_ptr_array_free(others, TRUE);
+        std::vector<Tab *> others;
+        for (auto &o : a->tabs) if (o.get() != t) others.push_back(o.get());
+        for (Tab *o : others) app_close_tab(a, o);
     }
 }
 
-static void delete_confirmed(App *a, void *user) { sd_store_remove(a->store, user); g_free(user); app_refresh(a); }
-
 static void run_row_action(App *a, int id) {
-    SdConn *c = a->ctx_id ? sd_store_get(a->store, a->ctx_id) : NULL;
-    if (id == A_R_NEW) { dlg_conn_editor(a, NULL, false); return; }
+    SdConn *c = a->ctx_id.empty() ? nullptr : a->store->get(a->ctx_id);
+    if (id == A_R_NEW) { dlg_conn_editor(a, nullptr, false); return; }
     if (!c) return;
-    if (id == A_R_CONNECT) app_open_connection(a, c);
-    else if (id == A_R_EDIT) dlg_conn_editor(a, c, sd_conn_is_live(c));
-    else if (id == A_R_DUP && !sd_conn_is_live(c)) {
-        SdConn *cp = sd_conn_copy(c);
-        char *nid = g_uuid_string_random();
-        sd_conn_set(&cp->id, g_strdelimit(nid, "-", 'x'));
-        g_free(nid);
-        char *nm = g_strconcat(c->name, " copy", NULL);
-        sd_conn_set(&cp->name, nm);
-        g_free(nm);
-        cp->last_used = 0;
-        sd_store_upsert(a->store, cp);
-        sd_conn_free(cp);
+    if (id == A_R_CONNECT) app_open_connection(a, *c);
+    else if (id == A_R_EDIT) dlg_conn_editor(a, c, c->is_live());
+    else if (id == A_R_DUP && !c->is_live()) {
+        SdConn cp = *c;
+        cp.id = SdConn().id;
+        cp.name = c->name + " copy";
+        cp.last_used = 0;
+        a->store->upsert(cp);
         app_refresh(a);
-    } else if (id == A_R_DELETE && !sd_conn_is_live(c)) {
-        char *msg = g_strdup_printf("Delete \"%s\"?", c->name);
-        dlg_confirm(a, "Delete connection", msg, "Delete", delete_confirmed, g_strdup(c->id));
-        g_free(msg);
+    } else if (id == A_R_DELETE && !c->is_live()) {
+        dlg_confirm(a, "Delete connection", "Delete \"" + c->name + "\"?", "Delete", [a, cid = c->id] { a->store->remove(cid); app_refresh(a); });
     }
 }
 
@@ -796,7 +709,7 @@ static void compute_layout(App *a) {
     float px = a->pinned ? rail_w : rail_w - (1.f - anim) * pw;
     lay.panel = R(px, top, pw, bottom - top);
     float cx = rail_w + docked;
-    float strip_h = a->tabs->len ? P(36) : 0;
+    float strip_h = a->tabs.size() ? P(36) : 0;
     lay.strip = R(cx, top, a->W - cx, strip_h);
     lay.content = R(cx, top + strip_h, a->W - cx, bottom - top - strip_h);
 }
@@ -834,7 +747,7 @@ static void draw_rail(App *a) {
         a->side_open = false;
         a->side_anim = 0;
         app_settings_save(a);
-        for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->term) { tcore_lock(t->term); vt_mark_all_dirty(tcore_vt(t->term)); tcore_unlock(t->term); } }
+        mark_terms_dirty(a);
     }
     y += w + P(4);
     static const char *names[2] = {"SESSIONS", "FILES"};
@@ -859,63 +772,58 @@ static void draw_sessions(App *a, Rect r) {
     float pad = P(10), y = r.y + pad;
     float addw = P(34);
     ui_input(u, R(r.x + pad, y, r.w - 2 * pad - addw - P(6), P(32)), &a->search, "Search connections", false);
-    if (ui_icon_button(u, R(r.x + r.w - pad - addw, y, addw, P(32)), IC_PLUS, "New connection (Ctrl+N)", 0)) dlg_conn_editor(a, NULL, false);
+    if (ui_icon_button(u, R(r.x + r.w - pad - addw, y, addw, P(32)), IC_PLUS, "New connection (Ctrl+N)", 0)) dlg_conn_editor(a, nullptr, false);
     y += P(42);
     Rect list = R(r.x, y, r.w, r.y + r.h - y);
-    char needle[128];
-    char *lowered = g_utf8_strdown(a->search.s, -1);
-    snprintf(needle, sizeof needle, "%s", lowered);
-    g_free(lowered);
+    std::string needle = lx::utf8_lower(a->search.s);
     float rowh = P(30), headh = P(26);
     float ch = 0;
-    const char *prev = NULL;
-    for (int i = 0; i < nrows; i++) {
-        if (needle[0] && !strstr(rows[i].hay, needle)) continue;
-        if (!prev || !g_str_equal(prev, rows[i].group)) { ch += headh; prev = rows[i].group; }
+    const std::string *prev = nullptr;
+    for (const Row &row : rows) {
+        if (!needle.empty() && row.hay.find(needle) == std::string::npos) continue;
+        if (!prev || *prev != row.group) { ch += headh; prev = &row.group; }
         ch += rowh;
     }
     ui_scroll_begin(u, list, ch + P(10), &a->list_scroll);
     float yy = list.y - a->list_scroll;
-    prev = NULL;
-    for (int i = 0; i < nrows; i++) {
-        Row *row = &rows[i];
-        if (needle[0] && !strstr(row->hay, needle)) continue;
-        if (!prev || !g_str_equal(prev, row->group)) {
-            char *up = g_utf8_strup(row->group, -1);
-            if (yy + headh > list.y && yy < list.y + list.h) ui_text(u, r.x + pad + P(4), yy + P(9), up, c->muted);
-            g_free(up);
+    prev = nullptr;
+    for (const Row &row : rows) {
+        if (!needle.empty() && row.hay.find(needle) == std::string::npos) continue;
+        if (!prev || *prev != row.group) {
+            if (yy + headh > list.y && yy < list.y + list.h) ui_text(u, r.x + pad + P(4), yy + P(9), lx::utf8_upper(row.group).c_str(), c->muted);
             yy += headh;
-            prev = row->group;
+            prev = &row.group;
         }
         Rect rr = R(r.x + P(4), yy, r.w - P(8), rowh);
         if (rr.y + rr.h > list.y && rr.y < list.y + list.h) {
             bool hov = ui_hover(u, rr) && rect_has(list, ui_mx(u), ui_my(u));
-            bool sel = a->ctx_id && g_str_equal(a->ctx_id, row->id);
+            bool sel = a->ctx_id == row.id;
             if (sel) ui_rrect(u, rr, c->accent, P(8));
             else if (hov) ui_rrect(u, rr, c->hover, P(8));
-            int st = GPOINTER_TO_INT(g_hash_table_lookup(a->up, row->id));
+            auto up_it = a->up.find(row.id);
+            int st = up_it == a->up.end() ? 0 : up_it->second;
             uint32_t dot = st == 1 ? c->up : st == 2 ? c->down : c->border2;
             ui_rrect(u, R(rr.x + P(12), rr.y + (rowh - P(8)) / 2, P(8), P(8)), dot, P(4));
-            uint32_t tc = sel ? c->bg1 : row->color[0] ? ui_rgba(row->color, 255) : c->ink;
-            ui_text_fit(u, R(rr.x + P(30), rr.y, rr.w - P(38), rowh), row->name, tc, 0);
+            uint32_t tc = sel ? c->bg1 : !row.color.empty() ? ui_rgba(row.color.c_str(), 255) : c->ink;
+            ui_text_fit(u, R(rr.x + P(30), rr.y, rr.w - P(38), rowh), row.name.c_str(), tc, 0);
             if (hov) {
-                ui_tip(u, rr, row->tip);
+                ui_tip(u, rr, row.tip.c_str());
                 ui_set_cursor(u, 2);
                 if (ui_mouse_pressed(u, 1, rr)) {
-                    g_free(a->ctx_id); a->ctx_id = g_strdup(row->id);
-                    if (ui_clicks(u) >= 2) { SdConn *cn = sd_store_get(a->store, row->id); if (cn) { app_open_connection(a, cn); ui_scroll_end(u); return; } }
+                    a->ctx_id = row.id;
+                    if (ui_clicks(u) >= 2) { SdConn *cn = a->store->get(row.id); if (cn) { app_open_connection(a, *cn); ui_scroll_end(u); return; } }
                 }
                 if (ui_mouse_pressed(u, 3, rr)) {
-                    g_free(a->ctx_id); a->ctx_id = g_strdup(row->id);
-                    SdConn *cn = sd_store_get(a->store, row->id);
-                    bool live = cn && sd_conn_is_live(cn);
+                    a->ctx_id = row.id;
+                    SdConn *cn = a->store->get(row.id);
+                    bool live = cn && cn->is_live();
                     UiMenuItem it[] = {
-                        {"Connect", NULL, A_R_CONNECT, 0, NULL, 0},
-                        {live ? "Save a copy to edit\xe2\x80\xa6" : "Edit\xe2\x80\xa6", NULL, A_R_EDIT, 0, NULL, 0},
-                        {"Duplicate", NULL, A_R_DUP, live ? MI_DISABLED : 0, NULL, 0},
-                        {"Delete", NULL, A_R_DELETE, live ? MI_DISABLED : 0, NULL, 0},
-                        {NULL, NULL, 0, MI_SEP, NULL, 0},
-                        {"New connection\xe2\x80\xa6", NULL, A_R_NEW, 0, NULL, 0},
+                        {"Connect", nullptr, A_R_CONNECT, 0, nullptr, 0},
+                        {live ? "Save a copy to edit\xe2\x80\xa6" : "Edit\xe2\x80\xa6", nullptr, A_R_EDIT, 0, nullptr, 0},
+                        {"Duplicate", nullptr, A_R_DUP, live ? MI_DISABLED : 0, nullptr, 0},
+                        {"Delete", nullptr, A_R_DELETE, live ? MI_DISABLED : 0, nullptr, 0},
+                        {nullptr, nullptr, 0, MI_SEP, nullptr, 0},
+                        {"New connection\xe2\x80\xa6", nullptr, A_R_NEW, 0, nullptr, 0},
                     };
                     ui_menu_open(u, ui_mx(u), ui_my(u), it, 6, TAG_ROW);
                 }
@@ -923,7 +831,7 @@ static void draw_sessions(App *a, Rect r) {
         }
         yy += rowh;
     }
-    if (!nrows) ui_text(u, r.x + pad, list.y + P(10), "No connections yet. Press + to add one.", c->muted);
+    if (rows.empty()) ui_text(u, r.x + pad, list.y + P(10), "No connections yet. Press + to add one.", c->muted);
     ui_scroll_end(u);
 }
 
@@ -932,10 +840,8 @@ static void draw_files_page(App *a, Rect r) {
     const UiColors *c = &a->colors;
     Tab *t = app_cur_tab(a);
     if (t && t->kind == TAB_SSH && t->files) {
-        char *up = g_ascii_strup(t->title, -1);
-        ui_text(u, r.x + P(14), r.y + P(12), up, c->muted);
-        g_free(up);
-        files_draw(a, t->files, R(r.x, r.y + P(34), r.w, r.h - P(34)));
+        ui_text(u, r.x + P(14), r.y + P(12), lx::ascii_upper(t->title).c_str(), c->muted);
+        t->files->draw(a, R(r.x, r.y + P(34), r.w, r.h - P(34)));
     } else {
         ui_text(u, r.x + P(14), r.y + P(12), "NO SSH SESSION", c->muted);
         ui_text(u, r.x + P(14), r.y + P(44), "The file browser appears", c->muted);
@@ -986,9 +892,9 @@ static void draw_strip(App *a) {
     if (ui_icon_button(u, R(x + 3 * btn, s.y + P(3), btn, btn), IC_DUPLICATE, "Duplicate tab (Ctrl+Shift+D)", ct ? 0 : UB_DISABLED) && ct) app_dup_tab(a, ct);
     Rect tabs_area = R(s.x, s.y, s.w - acts_w, s.h);
     float total = 0;
-    for (guint i = 0; i < a->tabs->len; i++) {
-        Tab *t = a->tabs->pdata[i];
-        float w = ui_text_w(u, t->title) + P(16 + 8 + 8 + 14 + 22);
+    for (auto &tp : a->tabs) {
+        Tab *t = tp.get();
+        float w = ui_text_w(u, t->title.c_str()) + P(16 + 8 + 8 + 14 + 22);
         t->w = w < P(110) ? P(110) : w > P(230) ? P(230) : w;
         total += t->w;
     }
@@ -998,8 +904,8 @@ static void draw_strip(App *a) {
     float maxs = total > view.w ? total - view.w : 0;
     if (a->strip_scroll < 0) {
         float tx = 0;
-        for (int i = 0; i < a->cur && i < (int)a->tabs->len; i++) tx += ((Tab *)a->tabs->pdata[i])->w;
-        float tw = a->cur < (int)a->tabs->len ? ((Tab *)a->tabs->pdata[a->cur])->w : 0;
+        for (int i = 0; i < a->cur && i < (int)a->tabs.size(); i++) tx += a->tabs[(size_t)i]->w;
+        float tw = a->cur < (int)a->tabs.size() ? a->tabs[(size_t)a->cur]->w : 0;
         float cur = a->strip_scroll == -1 ? 0 : a->strip_scroll;
         (void)cur;
         a->strip_scroll = tx + tw > view.w ? tx + tw - view.w : 0;
@@ -1015,8 +921,8 @@ static void draw_strip(App *a) {
     ui_clip(u, view);
     float tx = view.x - a->strip_scroll;
     int close_idx = -1;
-    for (guint i = 0; i < a->tabs->len; i++) {
-        Tab *t = a->tabs->pdata[i];
+    for (size_t i = 0; i < a->tabs.size(); i++) {
+        Tab *t = a->tabs[i].get();
         t->x = tx;
         Rect r = R(tx, s.y, t->w, s.h);
         tx += t->w;
@@ -1025,11 +931,11 @@ static void draw_strip(App *a) {
         bool hov = ui_hover(u, r) && rect_has(view, ui_mx(u), ui_my(u));
         if (active) { ui_rect(u, r, a->pal.bg); ui_rect(u, R(r.x, r.y + r.h - P(2), r.w, P(2)), c->accent); }
         else if (hov) ui_rect(u, r, c->hover);
-        uint32_t tint = t->color[0] ? ui_rgba(t->color, 255) : (active ? c->ink : c->ink2);
+        uint32_t tint = !t->color.empty() ? ui_rgba(t->color.c_str(), 255) : (active ? c->ink : c->ink2);
         ui_icon(u, kind_icon(t->kind), R(r.x + P(10), r.y + (r.h - P(16)) / 2, P(16), P(16)), t->color[0] ? tint : c->muted);
         float lx = r.x + P(10 + 16 + 8);
         float dotw = t->state == ST_IDLE ? 0 : P(14);
-        ui_text_fit(u, R(lx, r.y, r.w - P(10 + 16 + 8) - P(30) - dotw, r.h), t->title, tint, 0);
+        ui_text_fit(u, R(lx, r.y, r.w - P(10 + 16 + 8) - P(30) - dotw, r.h), t->title.c_str(), tint, 0);
         if (t->state != ST_IDLE) {
             uint32_t dc = t->state == ST_ACTIVITY ? c->blue : t->state == ST_BELL ? c->red : c->muted;
             ui_rrect(u, R(r.x + r.w - P(30) - P(10), r.y + (r.h - P(8)) / 2, P(8), P(8)), dc, P(4));
@@ -1044,37 +950,38 @@ static void draw_strip(App *a) {
             select_tab(a, (int)i);
             a->strip_scroll = a->strip_scroll < 0 ? 0 : a->strip_scroll;
             a->drag_tab = (int)i; a->drag_dx = ui_mx(u) - r.x; a->drag_moved = false;
-            if (ui_clicks(u) >= 2) dlg_text(a, "Rename tab", NULL, t->title, false, rename_cb, t);
+            if (ui_clicks(u) >= 2) rename_tab_dialog(a, t);
         } else if (hov && ui_mouse_pressed(u, 2, r)) close_idx = (int)i;
         else if (hov && ui_mouse_pressed(u, 3, r)) { select_tab(a, (int)i); open_tab_menu(a, t, ui_mx(u), ui_my(u)); }
     }
     ui_unclip(u);
     if (a->drag_tab >= 0) {
-        if (ui_mouse_down(u, 1) && a->drag_tab < (int)a->tabs->len) {
+        if (ui_mouse_down(u, 1) && a->drag_tab < (int)a->tabs.size()) {
             float mx = ui_mx(u);
-            Tab *dt = a->tabs->pdata[a->drag_tab];
+            Tab *dt = a->tabs[(size_t)(a->drag_tab)].get();
             if (fabsf(mx - (dt->x + a->drag_dx)) > P(6)) a->drag_moved = true;
             if (a->drag_moved) {
                 int i = a->drag_tab;
-                if (i > 0) { Tab *l = a->tabs->pdata[i - 1]; if (mx < l->x + l->w / 2 + P(0)) { gpointer x2 = a->tabs->pdata[i]; a->tabs->pdata[i] = a->tabs->pdata[i - 1]; a->tabs->pdata[i - 1] = x2; a->drag_tab--; a->cur = a->drag_tab; } }
-                if (i < (int)a->tabs->len - 1) { Tab *rr = a->tabs->pdata[i + 1]; if (mx > rr->x + rr->w / 2) { gpointer x2 = a->tabs->pdata[i]; a->tabs->pdata[i] = a->tabs->pdata[i + 1]; a->tabs->pdata[i + 1] = x2; a->drag_tab++; a->cur = a->drag_tab; } }
+                if (i > 0) { Tab *l = a->tabs[(size_t)(i - 1)].get(); if (mx < l->x + l->w / 2 + P(0)) { std::swap(a->tabs[(size_t)i], a->tabs[(size_t)(i - 1)]); a->drag_tab--; a->cur = a->drag_tab; } }
+                if (i < (int)a->tabs.size() - 1) { Tab *rr = a->tabs[(size_t)(i + 1)].get(); if (mx > rr->x + rr->w / 2) { std::swap(a->tabs[(size_t)i], a->tabs[(size_t)(i + 1)]); a->drag_tab++; a->cur = a->drag_tab; } }
             }
         } else a->drag_tab = -1;
     }
-    if (close_idx >= 0) app_close_tab(a, a->tabs->pdata[close_idx]);
+    if (close_idx >= 0) app_close_tab(a, a->tabs[(size_t)(close_idx)].get());
 }
 
 static void draw_welcome(App *a, Rect r) {
     Ui *u = a->ui;
     const UiColors *c = &a->colors;
     ui_rect(u, r, a->pal.bg);
-    float w = fminf(P(620), r.w - P(60)), x = r.x + (r.w - w) / 2, y = r.y + fmaxf(P(40), (r.h - P(120) - (nrecent + 1) * P(40)) / 3);
+    float w = fminf(P(620), r.w - P(60)), x = r.x + (r.w - w) / 2, y = r.y + fmaxf(P(40), (r.h - P(120) - ((float)recents.size() + 1) * P(40)) / 3);
     ui_text_font(u, a->big_font, FS_BOLD, x, y, "Lestrix", c->ink);
     y += font_cell_h(a->big_font) + P(2);
     ui_text(u, x, y, meta_text, c->muted);
     y += P(36);
     ui_text(u, x, y, "RECENT", c->muted);
     y += P(26);
+    int nrecent = (int)recents.size();
     for (int i = 0; i <= nrecent; i++) {
         bool local = i == nrecent;
         Rect row = R(x, y, w, P(38));
@@ -1086,17 +993,17 @@ static void draw_welcome(App *a, Rect r) {
         Rect kb = R(row.x + P(4), row.y + (row.h - P(22)) / 2, P(24), P(22));
         ui_outline(u, kb, c->border2, P(4), 1);
         ui_text_fit(u, kb, key, c->muted, 1);
-        ui_text_font(u, a->ui_font, FS_BOLD, row.x + P(42), row.y + (row.h - ui_line_h(u)) / 2, local ? "Local shell" : recents[i].name, c->ink);
-        ui_text_fit(u, R(row.x + P(200), row.y, w - P(200) - P(100), row.h), local ? "this machine" : recents[i].dest, c->ink2, 0);
-        if (!local) ui_text_fit(u, R(row.x + w - P(90), row.y, P(86), row.h), recents[i].age, c->muted, 2);
+        ui_text_font(u, a->ui_font, FS_BOLD, row.x + P(42), row.y + (row.h - ui_line_h(u)) / 2, local ? "Local shell" : recents[(size_t)i].name.c_str(), c->ink);
+        ui_text_fit(u, R(row.x + P(200), row.y, w - P(200) - P(100), row.h), local ? "this machine" : recents[(size_t)i].dest.c_str(), c->ink2, 0);
+        if (!local) ui_text_fit(u, R(row.x + w - P(90), row.y, P(86), row.h), recents[(size_t)i].age.c_str(), c->muted, 2);
         if (hov) ui_set_cursor(u, 2);
         if (ui_mouse_pressed(u, 1, row)) {
-            if (local) do_new_local(a, NULL);
-            else { SdConn *cn = sd_store_get(a->store, recents[i].id); if (cn) { app_open_connection(a, cn); return; } }
+            if (local) do_new_local(a, "");
+            else { SdConn *cn = a->store->get(recents[(size_t)i].id); if (cn) { app_open_connection(a, *cn); return; } }
         }
         y += P(38);
     }
-    if (!nrecent) ui_text(u, x, y + P(14), "Double-click a host on the left, or press + to add one.", c->muted);
+    if (recents.empty()) ui_text(u, x, y + P(14), "Double-click a host on the left, or press + to add one.", c->muted);
 }
 
 static void draw_content(App *a) {
@@ -1106,7 +1013,7 @@ static void draw_content(App *a) {
     if (!t) { draw_welcome(a, R(r.x, r.y, r.w, r.h)); term_rect = R(0, 0, 0, 0); return; }
     if (!t->term) {
         term_rect = R(0, 0, 0, 0);
-        if (t->files) files_draw(a, t->files, r);
+        if (t->files) t->files->draw(a, r);
         return;
     }
     term_rect = r;
@@ -1216,23 +1123,20 @@ static void hud_tick(App *a) {
     if (t && t->term) {
         VtHistoryStats st;
         tcore_history_stats(t->term, &st);
-        char *mem = fmt_mb((double)(st.hot_bytes + st.packed_bytes)), *disk = fmt_mb((double)st.disk_bytes);
-        snprintf(hist, sizeof hist, "scrlbck %ld ln, %s mem, %s disk", st.lines, mem, disk);
-        g_free(mem); g_free(disk);
+        snprintf(hist, sizeof hist, "scrlbck %ld ln, %s mem, %s disk", st.lines, fmt_mb((double)(st.hot_bytes + st.packed_bytes)).c_str(), fmt_mb((double)st.disk_bytes).c_str());
     }
-    char *rss = fmt_mb((double)proc_rss_kb() * 1024);
+    std::string rss = fmt_mb((double)proc_rss_kb() * 1024);
     snprintf(a->hud_seg[0], sizeof a->hud_seg[0], "fps %.0f", fps);
     snprintf(a->hud_seg[1], sizeof a->hud_seg[1], "%s", dims);
     snprintf(a->hud_seg[2], sizeof a->hud_seg[2], "parse %.3f GB/s", rate / 1024);
     snprintf(a->hud_parse_tip, sizeof a->hud_parse_tip, "Parse rate: program output the terminal engine consumed over the last second. Right now: %.0f MB/s.", rate);
     snprintf(a->hud_seg[3], sizeof a->hud_seg[3], "cpu %.0f%% (%ld)", cpu, sysconf(_SC_NPROCESSORS_ONLN));
     snprintf(a->hud_seg[4], sizeof a->hud_seg[4], "irq %s%s", irq_txt, a->hud_irq_total ? "" : "/s");
-    snprintf(a->hud_seg[5], sizeof a->hud_seg[5], "memory %s", rss);
+    snprintf(a->hud_seg[5], sizeof a->hud_seg[5], "memory %s", rss.c_str());
     snprintf(a->hud_seg[6], sizeof a->hud_seg[6], "%d thr/%uc", proc_threads(), (unsigned)sysconf(_SC_NPROCESSORS_ONLN));
     { char rr_[24]; fmt_count(rd_rate, rr_, sizeof rr_); snprintf(a->hud_seg[7], sizeof a->hud_seg[7], "reads %s/s @%.0fK", rr_, rd_avg / 1024); }
     snprintf(a->hud_seg[8], sizeof a->hud_seg[8], "%s", cache);
     snprintf(a->hud_seg[9], sizeof a->hud_seg[9], "%s", hist);
-    g_free(rss);
     if (a->lite) {
         char title[400];
         snprintf(title, sizeof title, "Lestrix Lite  |  %.40s  |  %.40s  |  %.80s  |  glyphs %u  |  ascii %d/512%s%.60s", a->hud_seg[0], a->hud_seg[3], a->hud_seg[8],
@@ -1244,11 +1148,11 @@ static void hud_tick(App *a) {
 
 static void trim_tick(App *a) {
     uint64_t total = 0;
-    for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->term) total += tcore_bytes_fed(t->term); }
+    for (auto &t : a->tabs) if (t->term) total += tcore_bytes_fed(t->term);
     if (total != a->trim_prev_bytes) { a->trim_prev_bytes = total; a->trim_dirty = true; return; }
     if (!a->trim_dirty) return;
     a->trim_dirty = false;
-    for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->term) tcore_compact(t->term); }
+    for (auto &t : a->tabs) if (t->term) tcore_compact(t->term);
     malloc_trim(0);
 }
 
@@ -1289,7 +1193,7 @@ static void build_frame(App *a) {
 
 static bool shortcut(App *a, SDL_Keycode k, Uint16 m) {
     bool ctrl = m & KMOD_CTRL, shift = m & KMOD_SHIFT, alt = m & KMOD_ALT;
-    int n = (int)a->tabs->len;
+    int n = (int)a->tabs.size();
     if (ctrl && !shift && !alt) {
         if (k == SDLK_n) { run_action(a, A_NEW_CONN); return true; }
         if (k == SDLK_q) { a->running = false; return true; }
@@ -1315,10 +1219,10 @@ static bool shortcut(App *a, SDL_Keycode k, Uint16 m) {
     }
     if (k == SDLK_F5 && !ctrl && !alt) { run_action(a, A_RECHECK); return true; }
     if (!n && !ctrl && !alt && !dlg_active(a) && !ui_keyboard_taken(a->ui)) {
-        if (k == SDLK_0) { do_new_local(a, NULL); return true; }
-        if (k >= SDLK_1 && k <= SDLK_9 && k - SDLK_1 < nrecent) {
-            SdConn *cn = sd_store_get(a->store, recents[k - SDLK_1].id);
-            if (cn) app_open_connection(a, cn);
+        if (k == SDLK_0) { do_new_local(a, ""); return true; }
+        if (k >= SDLK_1 && k <= SDLK_9 && k - SDLK_1 < (int)recents.size()) {
+            SdConn *cn = a->store->get(recents[(size_t)(k - SDLK_1)].id);
+            if (cn) app_open_connection(a, *cn);
             return true;
         }
     }
@@ -1363,7 +1267,7 @@ static void handle_event(App *a, SDL_Event *e) {
         } else if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED || e->window.event == SDL_WINDOWEVENT_FOCUS_LOST || e->window.event == SDL_WINDOWEVENT_EXPOSED) app_redraw(a);
         break;
     case SDL_DROPFILE: {
-        if (t && t->files) files_drop(t->files, e->drop.file);
+        if (t && t->files) t->files->drop(e->drop.file);
         SDL_free(e->drop.file);
         break;
     }
@@ -1429,15 +1333,14 @@ static void handle_event(App *a, SDL_Event *e) {
         break;
     }
     default:
-        if (e->type == EV_WAKE) atomic_store(&wake_pending, 0);
+        if (e->type == EV_WAKE) wake_pending.store(0);
         break;
     }
 }
 
-static void *prewarm_main(void *unused) { (void)unused; font_prewarm(); return NULL; }
 
 static void write_ppm(App *a, const char *path) {
-    uint8_t *px = malloc((size_t)a->W * a->H * 4);
+    uint8_t *px = static_cast<uint8_t*>(malloc((size_t)a->W * a->H * 4));
     glReadPixels(0, 0, a->W, a->H, GL_RGBA, GL_UNSIGNED_BYTE, px);
     FILE *fp = fopen(path, "wb");
     if (fp) {
@@ -1484,21 +1387,29 @@ static bool gl_init(App *a, GlKind kind) {
     return true;
 }
 
-typedef struct { bool local; const char *cwd, *theme, *connect; char **exec; } Startup;
+struct Startup {
+    bool local = false;
+    const char *cwd = nullptr, *theme = nullptr, *connect = nullptr;
+    std::vector<std::string> exec;
+};
 
-typedef struct { char **steps; int n, i; double wait_until; char *shot_file; } Script;
+/* The --script test driver: steps like "w:0.5" (wait), "c:x,y" (click), "k:escape", "t:text", "s:file.ppm" (screenshot). */
+struct Script {
+    std::vector<std::string> steps;
+    size_t i = 0;
+    double wait_until = 0;
+};
 
-static void script_key(const char *spec) {
+static void script_key(const std::string &spec) {
     Uint16 mod = 0;
-    char buf[64];
-    snprintf(buf, sizeof buf, "%s", spec);
-    char *name = buf, *plus;
-    while ((plus = strchr(name, '+')) && plus[1]) {
-        *plus = 0;
-        if (!strcmp(name, "ctrl")) mod |= KMOD_CTRL; else if (!strcmp(name, "shift")) mod |= KMOD_SHIFT; else if (!strcmp(name, "alt")) mod |= KMOD_ALT;
-        name = plus + 1;
+    std::string name = spec;
+    size_t plus;
+    while ((plus = name.find('+')) != std::string::npos && plus + 1 < name.size()) {
+        std::string m = name.substr(0, plus);
+        if (m == "ctrl") mod |= KMOD_CTRL; else if (m == "shift") mod |= KMOD_SHIFT; else if (m == "alt") mod |= KMOD_ALT;
+        name.erase(0, plus + 1);
     }
-    SDL_Keycode k = SDL_GetKeyFromName(name);
+    SDL_Keycode k = SDL_GetKeyFromName(name.c_str());
     if (k == SDLK_UNKNOWN) return;
     SDL_Event e;
     SDL_zero(e);
@@ -1506,64 +1417,59 @@ static void script_key(const char *spec) {
     SDL_PushEvent(&e);
 }
 
-static void script_mouse(App *a, int type, int button, int x, int y) {
+static void script_mouse(int type, int button, int x, int y) {
     SDL_Event e;
     SDL_zero(e);
     e.type = type;
-    float f = 1.f / a->scale;
-    (void)f;
     if (type == SDL_MOUSEMOTION) { e.motion.x = x; e.motion.y = y; }
     else { e.button.x = x; e.button.y = y; e.button.button = (Uint8)button; e.button.clicks = 1; e.button.state = type == SDL_MOUSEBUTTONDOWN ? SDL_PRESSED : SDL_RELEASED; }
     SDL_PushEvent(&e);
 }
 
-static bool script_run(App *a, Script *sc, const char **shot_out) {
-    if (!sc->n || sc->i >= sc->n || a->now < sc->wait_until) return false;
-    char *st = sc->steps[sc->i++];
+static bool script_run(App *a, Script &sc, std::string &shot_out) {
+    if (sc.steps.empty() || sc.i >= sc.steps.size() || a->now < sc.wait_until) return false;
+    const std::string &st = sc.steps[sc.i++];
     int x, y, sx, sy;
     double w;
-    if (sscanf(st, "w:%lf", &w) == 1) sc->wait_until = a->now + w;
-    else if (sscanf(st, "m:%d,%d", &x, &y) == 2) script_mouse(a, SDL_MOUSEMOTION, 0, x, y);
-    else if (sscanf(st, "c:%d,%d", &x, &y) == 2 || sscanf(st, "d:%d,%d", &x, &y) == 2) {
-        script_mouse(a, SDL_MOUSEMOTION, 0, x, y);
-        script_mouse(a, SDL_MOUSEBUTTONDOWN, 1, x, y);
-        script_mouse(a, SDL_MOUSEBUTTONUP, 1, x, y);
-        sc->wait_until = a->now + 0.12;
-    } else if (sscanf(st, "r:%d,%d", &x, &y) == 2) {
-        script_mouse(a, SDL_MOUSEMOTION, 0, x, y);
-        script_mouse(a, SDL_MOUSEBUTTONDOWN, 3, x, y);
-        script_mouse(a, SDL_MOUSEBUTTONUP, 3, x, y);
-        sc->wait_until = a->now + 0.12;
-    } else if (sscanf(st, "p:%d,%d,%d,%d", &x, &y, &sx, &sy) == 4) {
-        script_mouse(a, SDL_MOUSEMOTION, 0, x, y);
-        script_mouse(a, SDL_MOUSEBUTTONDOWN, 1, x, y);
-        script_mouse(a, SDL_MOUSEMOTION, 0, (x + sx) / 2, (y + sy) / 2);
-        script_mouse(a, SDL_MOUSEMOTION, 0, sx, sy);
-        script_mouse(a, SDL_MOUSEBUTTONUP, 1, sx, sy);
-        sc->wait_until = a->now + 0.15;
-    } else if (sscanf(st, "x:%d", &x) == 1) {
+    if (sscanf(st.c_str(), "w:%lf", &w) == 1) sc.wait_until = a->now + w;
+    else if (sscanf(st.c_str(), "m:%d,%d", &x, &y) == 2) script_mouse(SDL_MOUSEMOTION, 0, x, y);
+    else if (sscanf(st.c_str(), "c:%d,%d", &x, &y) == 2 || sscanf(st.c_str(), "d:%d,%d", &x, &y) == 2) {
+        script_mouse(SDL_MOUSEMOTION, 0, x, y);
+        script_mouse(SDL_MOUSEBUTTONDOWN, 1, x, y);
+        script_mouse(SDL_MOUSEBUTTONUP, 1, x, y);
+        sc.wait_until = a->now + 0.12;
+    } else if (sscanf(st.c_str(), "r:%d,%d", &x, &y) == 2) {
+        script_mouse(SDL_MOUSEMOTION, 0, x, y);
+        script_mouse(SDL_MOUSEBUTTONDOWN, 3, x, y);
+        script_mouse(SDL_MOUSEBUTTONUP, 3, x, y);
+        sc.wait_until = a->now + 0.12;
+    } else if (sscanf(st.c_str(), "p:%d,%d,%d,%d", &x, &y, &sx, &sy) == 4) {
+        script_mouse(SDL_MOUSEMOTION, 0, x, y);
+        script_mouse(SDL_MOUSEBUTTONDOWN, 1, x, y);
+        script_mouse(SDL_MOUSEMOTION, 0, (x + sx) / 2, (y + sy) / 2);
+        script_mouse(SDL_MOUSEMOTION, 0, sx, sy);
+        script_mouse(SDL_MOUSEBUTTONUP, 1, sx, sy);
+        sc.wait_until = a->now + 0.15;
+    } else if (sscanf(st.c_str(), "x:%d", &x) == 1) {
         SDL_Event we;
         SDL_zero(we);
         we.type = SDL_MOUSEWHEEL; we.wheel.y = x; we.wheel.preciseY = (float)x;
         SDL_PushEvent(&we);
-        sc->wait_until = a->now + 0.1;
-    } else if (!strncmp(st, "k:", 2)) { script_key(st + 2); sc->wait_until = a->now + 0.08; }
-    else if (!strncmp(st, "t:", 2)) { SDL_Event e; SDL_zero(e); e.type = SDL_TEXTINPUT; snprintf(e.text.text, sizeof e.text.text, "%s", st + 2); SDL_PushEvent(&e); sc->wait_until = a->now + 0.08; }
-    else if (!strncmp(st, "s:", 2)) { *shot_out = st + 2; sc->wait_until = a->now + 0.3; }
+        sc.wait_until = a->now + 0.1;
+    } else if (st.starts_with("k:")) { script_key(st.substr(2)); sc.wait_until = a->now + 0.08; }
+    else if (st.starts_with("t:")) { SDL_Event e; SDL_zero(e); e.type = SDL_TEXTINPUT; snprintf(e.text.text, sizeof e.text.text, "%s", st.c_str() + 2); SDL_PushEvent(&e); sc.wait_until = a->now + 0.08; }
+    else if (st.starts_with("s:")) { shot_out = st.substr(2); sc.wait_until = a->now + 0.3; }
     a->dirty = true;
     return true;
 }
 
-static void jobs_wake(void) { app_wake(); }
-
 static bool cmd_pending(App *a) {
-    for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->term && tcore_cmd_active(t->term)) return true; }
+    for (auto &t : a->tabs) if (t->term && tcore_cmd_active(t->term)) return true;
     return false;
 }
 
 static void cmd_poll_all(App *a) {
-    for (guint i = 0; i < a->tabs->len; i++) {
-        Tab *t = a->tabs->pdata[i];
+    for (auto &t : a->tabs) {
         double secs; uint64_t bytes;
         if (!t->term || !tcore_cmd_active(t->term) || !tcore_cmd_poll(t->term, a->now, &secs, &bytes) || !a->hud) continue;
         double gbs = secs > 0 ? (double)bytes / secs / 1073741824.0 : 0;
@@ -1577,83 +1483,93 @@ static void cmd_poll_all(App *a) {
 
 static void pump_all(App *a) {
     if (jobs_pump()) app_redraw(a);
-    for (guint i = 0; i < a->tabs->len; i++) {
-        Tab *t = a->tabs->pdata[i];
-        if (t->term && tcore_pump(t->term)) { if (i == (guint)a->cur) app_redraw(a); else app_redraw(a); }
-        if (t->files) files_tick(a, t->files);
+    for (size_t i = 0; i < a->tabs.size(); i++) {
+        Tab *t = a->tabs[i].get();
+        if (t->term && tcore_pump(t->term)) app_redraw(a);
+        if (t->files) t->files->tick(a);
     }
 }
 
+static void print_task_cpu() {
+    for (const std::string &n : lx::list_dir("/proc/self/task")) {
+        auto txt = lx::read_file("/proc/self/task/" + n + "/stat");
+        if (!txt) continue;
+        size_t rp = txt->rfind(')'), lp = txt->find('(');
+        unsigned long ut = 0, st = 0;
+        if (rp != std::string::npos && lp != std::string::npos && sscanf(txt->c_str() + rp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) == 2 && ut + st > 3)
+            printf("  thread %-16s user %.2fs sys %.2fs\n", txt->substr(lp + 1, rp - lp - 1).c_str(), (double)ut / 100.0, (double)st / 100.0);
+    }
+}
+
+static const char *HELP_TEXT =
+    "Usage: lestrix [--local] [--working-directory DIR] [-e COMMAND [ARGS...]]\n"
+    "  --local               open a local shell on startup\n"
+    "  --no-fast-output      keep the kernel's newline processing on the pty while cat, grep, ls, find and similar print (default: switch it off for them and let the terminal add the carriage returns; about 3x faster)\n"
+    "  --lite                terminal only: no sidebar, no stats bar; fps, cpu and cache stats go in the title bar\n"
+    "  --working-directory   start the local shell in DIR\n"
+    "  --benchmark           measure this machine's terminal throughput and exit\n"
+    "  --connect NAME        open the saved connection NAME on startup\n"
+    "  --max-fps N           cap drawing at N frames per second (default 60; 0 = no cap, vsync off)\n"
+    "  --io-fps N            cap drawing at N fps while a big dump pours in, so reading output gets the CPU\n"
+    "                        (default 24; lower is faster for output; 0 = no extra cap)\n"
+    "  --read-delay US       wait US microseconds after a tiny (under 1 KB) read of program output (default 200; 0 = off):\n"
+    "                        far fewer system calls and less CPU in a flood\n"
+    "  --render-threads N    helper threads that build the rows of a frame (default 0: measured no gain at this frame cost)\n"
+    "  --io-threads N        2: a reader and a writer thread per tab besides the parser; 0: one thread (default: 2 from 4 cores up)\n"
+    "  --parse-threads N     helper threads that build big batches of plain text in parallel (default: half the cores, up to 8; 0 = off)\n"
+    "  --compress-threads N  threads that compress old scrollback (default: a quarter of the cores, 2 to 8)\n"
+    "  --no-fastcat          do not let programs in a local tab use `lxcat` to print big files at memory speed\n"
+    "  --theme NAME          Xylonic Dark, Xylonic Light, Graphite, Nord, Gruvbox or Solarized Dark\n"
+    "  -e COMMAND ...        run COMMAND in a new tab (works as x-terminal-emulator)\n\n" APP_CREDIT;
 
 int main(int argc, char **argv) {
     mallopt(M_ARENA_MAX, 2);
     mallopt(M_MMAP_THRESHOLD, 64 * 1024);
     mallopt(M_TRIM_THRESHOLD, 256 * 1024);
     signal(SIGCHLD, SIG_DFL);  /* a launcher may start us with SIGCHLD ignored; that survives exec and breaks waitpid here and in every shell child (git: "waitpid failed: No child processes") */
-    Startup s = {0};
-    char *flood = NULL, *run_cmd = NULL, *shot = NULL, *script_arg = NULL;
+    Startup s;
+    const char *flood = nullptr, *run_cmd = nullptr, *shot = nullptr, *script_arg = nullptr;
     double shot_after = 3.0;
     for (int i = 1; i < argc; i++) {
-        if (g_str_equal(argv[i], "--version")) { g_print("Lestrix %s\n" APP_CREDIT, APP_VERSION); return 0; }
-        if (g_str_equal(argv[i], "--benchmark")) return sd_benchmark(stdout, 8.0);
-        if (g_str_equal(argv[i], "--max-fps") && i + 1 < argc) { g_max_fps = atof(argv[++i]); continue; }
-        if (g_str_equal(argv[i], "--read-delay") && i + 1 < argc) { tcore_read_delay_us = atoi(argv[++i]); continue; }
-        if (g_str_equal(argv[i], "--no-fastcat")) { g_fastcat = false; continue; }
-        if (g_str_equal(argv[i], "--render-threads") && i + 1 < argc) { g_render_threads = atoi(argv[++i]); continue; }
-        if (g_str_equal(argv[i], "--io-threads") && i + 1 < argc) { tcore_io_threads = atoi(argv[++i]); continue; }
-        if (g_str_equal(argv[i], "--parse-threads") && i + 1 < argc) { g_parse_threads = atoi(argv[++i]); continue; }
-        if (g_str_equal(argv[i], "--compress-threads") && i + 1 < argc) { g_compress_threads = atoi(argv[++i]); continue; }
-        if (g_str_equal(argv[i], "--io-fps") && i + 1 < argc) { g_io_fps = atof(argv[++i]); continue; }
-        if (g_str_equal(argv[i], "--help") || g_str_equal(argv[i], "-h")) {
-            g_print("Usage: lestrix [--local] [--working-directory DIR] [-e COMMAND [ARGS...]]\n"
-                    "  --local               open a local shell on startup\n"
-                    "  --no-fast-output      keep the kernel's newline processing on the pty while cat, grep, ls, find and similar print (default: switch it off for them and let the terminal add the carriage returns; about 3x faster)\n"
-                    "  --lite                terminal only: no sidebar, no stats bar; fps, cpu and cache stats go in the title bar\n"
-                    "  --working-directory   start the local shell in DIR\n"
-                    "  --benchmark           measure this machine's terminal throughput and exit\n"
-                    "  --connect NAME        open the saved connection NAME on startup\n"
-                    "  --max-fps N           cap drawing at N frames per second (default 60; 0 = no cap, vsync off)\n"
-                    "  --io-fps N            cap drawing at N fps while a big dump pours in, so reading output gets the CPU\n"
-                    "                        (default 24; lower is faster for output; 0 = no extra cap)\n"
-                    "  --read-delay US       wait US microseconds after a tiny (under 1 KB) read of program output (default 200; 0 = off):\n"
-                    "                        far fewer system calls and less CPU in a flood\n"
-                    "  --render-threads N    helper threads that build the rows of a frame (default 0: measured no gain at this frame cost)\n"
-                    "  --io-threads N        2: a reader and a writer thread per tab besides the parser; 0: one thread (default: 2 from 4 cores up)\n"
-                    "  --parse-threads N     helper threads that build big batches of plain text in parallel (default: half the cores, up to 8; 0 = off)\n"
-                    "  --compress-threads N  threads that compress old scrollback (default: a quarter of the cores, 2 to 8)\n"
-                    "  --no-fastcat          do not let programs in a local tab use `lxcat` to print big files at memory speed\n"
-                    "  --theme NAME          Xylonic Dark, Xylonic Light, Graphite, Nord, Gruvbox or Solarized Dark\n"
-                    "  -e COMMAND ...        run COMMAND in a new tab (works as x-terminal-emulator)\n\n" APP_CREDIT);
-            return 0;
-        }
-        if (g_str_equal(argv[i], "--local")) s.local = true;
-        else if (g_str_equal(argv[i], "--lite")) { g_lite = true; s.local = true; }
-        else if (g_str_equal(argv[i], "--no-fast-output")) tcore_set_fast_output(false);
-        else if (g_str_equal(argv[i], "--working-directory") && i + 1 < argc) s.cwd = argv[++i];
-        else if (g_str_equal(argv[i], "--theme") && i + 1 < argc) s.theme = argv[++i];
-        else if (g_str_equal(argv[i], "--connect") && i + 1 < argc) s.connect = argv[++i];
-        else if (g_str_equal(argv[i], "--flood") && i + 1 < argc) flood = argv[++i];
-        else if (g_str_equal(argv[i], "--run") && i + 1 < argc) run_cmd = argv[++i];
-        else if (g_str_equal(argv[i], "--shot") && i + 1 < argc) shot = argv[++i];
-        else if (g_str_equal(argv[i], "--script") && i + 1 < argc) script_arg = argv[++i];
-        else if (g_str_equal(argv[i], "--shot-after") && i + 1 < argc) shot_after = atof(argv[++i]);
-        else if (g_str_equal(argv[i], "-e") || g_str_equal(argv[i], "--execute")) {
-            s.exec = g_new0(char *, (gsize)(argc - i));
-            for (int k = i + 1; k < argc; k++) s.exec[k - i - 1] = argv[k];
+        std::string_view arg = argv[i];
+        bool more = i + 1 < argc;
+        if (arg == "--version") { printf("Lestrix %s\n" APP_CREDIT, APP_VERSION); return 0; }
+        if (arg == "--benchmark") return sd_benchmark(stdout, 8.0);
+        if (arg == "--max-fps" && more) { g_max_fps = atof(argv[++i]); continue; }
+        if (arg == "--read-delay" && more) { tcore_read_delay_us = atoi(argv[++i]); continue; }
+        if (arg == "--no-fastcat") { g_fastcat = false; continue; }
+        if (arg == "--render-threads" && more) { g_render_threads = atoi(argv[++i]); continue; }
+        if (arg == "--io-threads" && more) { tcore_io_threads = atoi(argv[++i]); continue; }
+        if (arg == "--parse-threads" && more) { g_parse_threads = atoi(argv[++i]); continue; }
+        if (arg == "--compress-threads" && more) { g_compress_threads = atoi(argv[++i]); continue; }
+        if (arg == "--io-fps" && more) { g_io_fps = atof(argv[++i]); continue; }
+        if (arg == "--help" || arg == "-h") { fputs(HELP_TEXT, stdout); return 0; }
+        if (arg == "--local") s.local = true;
+        else if (arg == "--lite") { g_lite = true; s.local = true; }
+        else if (arg == "--no-fast-output") tcore_set_fast_output(false);
+        else if (arg == "--working-directory" && more) s.cwd = argv[++i];
+        else if (arg == "--theme" && more) s.theme = argv[++i];
+        else if (arg == "--connect" && more) s.connect = argv[++i];
+        else if (arg == "--flood" && more) flood = argv[++i];
+        else if (arg == "--run" && more) run_cmd = argv[++i];
+        else if (arg == "--shot" && more) shot = argv[++i];
+        else if (arg == "--script" && more) script_arg = argv[++i];
+        else if (arg == "--shot-after" && more) shot_after = atof(argv[++i]);
+        else if (arg == "-e" || arg == "--execute") {
+            for (int k = i + 1; k < argc; k++) s.exec.push_back(argv[k]);
             break;
         }
     }
-    for (int i = 1; i < argc; i++) if (g_str_equal(argv[i], "--lite")) g_lite = true;
-    g_setenv("SDL_VIDEO_X11_WMCLASS", g_lite ? "lestrix-lite" : "lestrix", FALSE);
-    g_setenv("SDL_VIDEO_WAYLAND_WMCLASS", g_lite ? "lestrix-lite" : "lestrix", FALSE);
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--lite")) g_lite = true;
+    setenv("SDL_VIDEO_X11_WMCLASS", g_lite ? "lestrix-lite" : "lestrix", 0);
+    setenv("SDL_VIDEO_WAYLAND_WMCLASS", g_lite ? "lestrix-lite" : "lestrix", 0);
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     tmark("main entered");
-    pthread_t prewarm_thread;
-    bool prewarming = pthread_create(&prewarm_thread, NULL, (void *(*)(void *))prewarm_main, NULL) == 0;
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
+    std::thread prewarm(font_prewarm);
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); prewarm.join(); return 1; }
     EV_WAKE = SDL_RegisterEvents(1);
-    App *a = g_new0(App, 1);
+    App *a = new App();
     g_app = a;
     tmark("SDL_Init done");
     {
@@ -1663,11 +1579,11 @@ int main(int argc, char **argv) {
         if (force) { first = !strcmp(force, "es3") ? 1 : !strcmp(force, "es2") ? 2 : 0; n = first + 1; }
         bool ok = false;
         for (int i = first; i < n && !ok; i++) ok = gl_init(a, order[i]);
-        if (!ok) { fprintf(stderr, "Lestrix needs OpenGL 3.3, OpenGL ES 3.0 or OpenGL ES 2.0\n"); return 1; }
+        if (!ok) { fprintf(stderr, "Lestrix needs OpenGL 3.3, OpenGL ES 3.0 or OpenGL ES 2.0\n"); prewarm.join(); return 1; }
         if (getenv("LESTRIX_TIMING")) fprintf(stderr, "OpenGL: %s (%s)\n", a->gl_desc, sd_gl_kind == GLK_CORE ? "desktop core" : sd_gl_kind == GLK_ES3 ? "ES 3.0" : "ES 2.0");
     }
     tmark("GL functions loaded");
-    if (prewarming) { pthread_join(prewarm_thread, NULL); prewarming = false; }
+    prewarm.join();
     tmark("fontconfig warmed");
     vt_set_threads(g_parse_threads, g_compress_threads);
     wp_configure(g_render_threads);
@@ -1675,19 +1591,16 @@ int main(int argc, char **argv) {
     app_fastcat_apply(a);
     tmark("settings loaded");
     if (s.theme) a->theme = ui_theme_find(s.theme);
-    if (!a->font_family || !*a->font_family) { g_free(a->font_family); a->font_family = pick_font_family(); }
+    if (a->font_family.empty()) a->font_family = pick_font_family();
     a->ui_font = font_open("sans", 13 * a->scale, false);
     a->big_font = font_open("sans", 34 * a->scale, false);
-    a->term_font = font_open(a->font_family, a->font_size * 96.0 / 72.0 * a->scale, true);
+    a->term_font = font_open(a->font_family.c_str(), a->font_size * 96.0 / 72.0 * a->scale, true);
     if (!a->term_font) a->term_font = font_open("monospace", a->font_size * 96.0 / 72.0 * a->scale, true);
     if (!a->ui_font || !a->term_font || !a->big_font) { fprintf(stderr, "no usable fonts found\n"); return 1; }
     tmark("fonts opened");
     a->ui_mono = font_open("monospace", 12 * a->scale, true);
     tmark("atlas and renderer ready");
     a->ui = ui_new(a->r, a->ui_font, a->ui_mono, a->scale);
-    a->tabs = g_ptr_array_new();
-    a->up = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    a->recent_ids = g_ptr_array_new_with_free_func(g_free);
     a->cur = -1;
     a->drag_tab = -1;
     a->dock_shown = true;
@@ -1698,10 +1611,10 @@ int main(int argc, char **argv) {
     fleetwm_read(&a->fleet);
     if (a->follow_fleet && a->fleet.found) app_follow_fleetwm(a); else app_apply_theme(a, a->theme);
     tmark("theme applied");
-    a->store = sd_store_new(NULL);
+    a->store = std::make_unique<SdStore>();
     tmark("store loaded");
     tcore_set_history_defaults(a->scrollback, a->sb_ram_mb, a->sb_disk_mb, a->sb_spill);
-    jobs_init(jobs_wake);
+    jobs_init(app_wake);
     find_shells();
     tmark("shells found");
     app_refresh(a);
@@ -1711,26 +1624,16 @@ int main(int argc, char **argv) {
     SDL_StartTextInput();
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
 
-    if (s.exec && s.exec[0]) {
-        char *base = g_path_get_basename(s.exec[0]);
+    if (!s.exec.empty()) {
         a->quit_on_exit = true;
-        app_open_local(a, base, s.exec, s.cwd);
-        g_free(base);
+        app_open_local(a, lx::basename(s.exec[0]), s.exec, s.cwd);
     } else if (flood || run_cmd) {
-        char **sh = app_default_shell_argv(NULL);
-        app_open_local(a, "local", sh, NULL);
-        g_strfreev(sh);
+        app_open_local(a, "local", app_default_shell_argv(""), nullptr);
     } else if (s.connect) {
-        GPtrArray *all = sd_store_all(a->store);
-        for (guint i = 0; i < all->len; i++) {
-            SdConn *c = all->pdata[i];
-            if (g_str_equal(c->name, s.connect) || g_str_equal(c->id, s.connect)) { app_open_connection(a, c); break; }
-        }
-        g_ptr_array_free(all, TRUE);
+        for (SdConn *c : a->store->all())
+            if (c->name == s.connect || c->id == s.connect) { app_open_connection(a, *c); break; }
     } else if (s.local || a->startup_shell) {
-        char **sh = app_default_shell_argv(NULL);
-        app_open_local(a, "local", sh, s.cwd);
-        g_strfreev(sh);
+        app_open_local(a, "local", app_default_shell_argv(""), s.cwd);
     }
     double t0 = now_s(), last_draw = 0;
     a->next_probe = t0 + 30; a->next_hud = t0 + 1; a->next_trim = t0 + 5;
@@ -1738,9 +1641,9 @@ int main(int argc, char **argv) {
     uint64_t last_draw_bytes = 0;
     bool flood_sent = false;
     double flood_t = 0;
-    Script script = {0};
-    if (script_arg) { script.steps = g_strsplit(script_arg, ";", -1); script.n = (int)g_strv_length(script.steps); }
-    const char *script_shot = NULL;
+    Script script;
+    if (script_arg) script.steps = lx::split(script_arg, ';');
+    std::string script_shot;
     SDL_Event e;
     while (a->running) {
         a->now = now_s();
@@ -1767,33 +1670,21 @@ int main(int argc, char **argv) {
         a->now = now_s();
         pump_all(a);
         cmd_poll_all(a);
-        while (script_run(a, &script, &script_shot)) { if (a->now < script.wait_until) break; }
+        {
+            std::string shot_name;
+            while (script_run(a, script, shot_name)) {
+                if (!shot_name.empty()) script_shot = std::move(shot_name);
+                if (a->now < script.wait_until) break;
+            }
+        }
         if (flood && !flood_sent && a->now - t0 > 1.0 && app_cur_tab(a)) {
-            char cmd[1024];
-            snprintf(cmd, sizeof cmd, "cat '%s'; echo FLOOD_DONE_$((6*7))\r", flood);
-            tcore_send_str(app_cur_tab(a)->term, cmd);
+            tcore_send_str(app_cur_tab(a)->term, lx::strprintf("cat '%s'; echo FLOOD_DONE_$((6*7))\r", flood).c_str());
             flood_sent = true; flood_t = a->now;
         }
         if (run_cmd && !flood_sent && a->now - t0 > 1.0 && app_cur_tab(a)) { tcore_send_str(app_cur_tab(a)->term, run_cmd); flood_sent = true; }
         if (flood && flood_sent && app_cur_tab(a) && tcore_screen_contains(app_cur_tab(a)->term, "FLOOD_DONE_42")) {
             printf("flood finished in %.2fs\n", a->now - flood_t);
-            if (getenv("LESTRIX_THREADS")) {
-                GDir *d = g_dir_open("/proc/self/task", 0, NULL);
-                const char *n;
-                while (d && (n = g_dir_read_name(d))) {
-                    char *path = g_strdup_printf("/proc/self/task/%s/stat", n), *txt = NULL;
-                    if (g_file_get_contents(path, &txt, NULL, NULL)) {
-                        char *rp = strrchr(txt, ')'), *lp = strchr(txt, '(');
-                        unsigned long ut = 0, st = 0;
-                        if (rp && lp && sscanf(rp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) == 2 && ut + st > 3) {
-                            *rp = 0;
-                            printf("  thread %-16s user %.2fs sys %.2fs\n", lp + 1, ut / 100.0, st / 100.0);
-                        }
-                    }
-                    g_free(txt); g_free(path);
-                }
-                if (d) g_dir_close(d);
-            }
+            if (getenv("LESTRIX_THREADS")) print_task_cpu();
             break;
         }
         if (a->follow_fleet && !a->fleet_watch) a->fleet_watch = fleetwm_watch_start();
@@ -1818,11 +1709,11 @@ int main(int argc, char **argv) {
             r_end(a->r);
             a->frames++;
             { static bool first = true; if (first) { first = false; tmark("first frame drawn"); } }
-            if (script_shot) {
-                write_ppm(a, script_shot);
-                script_shot = NULL;
+            if (!script_shot.empty()) {
+                write_ppm(a, script_shot.c_str());
+                script_shot.clear();
             }
-            if (script.n && script.i >= script.n && a->now > script.wait_until + 0.2 && !shot) a->running = false;
+            if (!script.steps.empty() && script.i >= script.steps.size() && a->now > script.wait_until + 0.2 && !shot) a->running = false;
             if (shot && a->now - t0 > shot_after) {
                 write_ppm(a, shot);
                 a->running = false;
@@ -1831,8 +1722,8 @@ int main(int argc, char **argv) {
         }
     }
     app_settings_save(a);
-    for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->term) tcore_close(t->term); }
-    for (guint i = 0; i < a->tabs->len; i++) { Tab *t = a->tabs->pdata[i]; if (t->control_path) sd_xfer_remove_control_path(t->control_path); }
+    for (auto &t : a->tabs) if (t->term) tcore_close(t->term);
+    for (auto &t : a->tabs) if (!t->control_path.empty()) sd_xfer_remove_control_path(t->control_path);
     jobs_shutdown();
     return 0;
 }

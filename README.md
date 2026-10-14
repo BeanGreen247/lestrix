@@ -4,13 +4,13 @@
   <img src="native/data/lestrix.png" alt="Lestrix logo" width="96"/>
 </p>
 
-A fast, light SSH terminal manager in plain C. No GTK, no Qt: the window, the widgets and the text rendering are its own code on SDL2 and OpenGL. Saved connections on the left, terminal tabs on the right, an SFTP/FTP file browser that follows your shell, and a live performance bar along the bottom. Think MobaXterm, built to start instantly and stay small.
+A fast, light SSH terminal manager in C++. No GTK, no Qt: the window, the widgets and the text rendering are its own code on SDL2 and OpenGL. Saved connections on the left, terminal tabs on the right, an SFTP/FTP file browser that follows your shell, and a live performance bar along the bottom. Think MobaXterm, built to start instantly and stay small.
 
 <p align="center">
   <img src="native/docs/welcome.png" alt="Lestrix start page with saved connections" width="900"/>
 </p>
 
-**Version:** 0.3.0  
+**Version:** 0.4.0  
 **Author:** BeanGreen247  
 **License:** MIT
 
@@ -68,7 +68,28 @@ Connections live in `~/.config/lestrix/connections.json`. No passwords are saved
 
 ## Under the hood
 
-The program lives in `native/` and is plain C (GNU C11, not C++): its own terminal engine, its own widget toolkit, drawing and text rendering on SDL2 (windowing and input) and OpenGL (3.3, ES 3.0 or ES 2.0), FreeType and fontconfig for fonts, and `libcurl` for FTP. (An earlier Python/Qt prototype where the features were worked out was removed in 0.2.2; it is still in the git history before commit `26beddf`.)
+The program lives in `native/` and is C++20 (`g++`, built with `-fno-rtti`): its own terminal engine, its own widget toolkit, drawing and text rendering on SDL2 (windowing and input) and OpenGL (3.3, ES 3.0 or ES 2.0), FreeType and fontconfig for fonts, and `libcurl` for FTP. Since 0.4.0 nothing depends on GLib any more: strings, containers, files, processes and settings use the C++ standard library plus a small `util.h` of Lestrix's own. (An earlier Python/Qt prototype where the features were worked out was removed in 0.2.2; it is still in the git history before commit `26beddf`.)
+
+### 0.4.0: the rewrite from C to C++, and what it did to speed
+
+The whole program was moved from C11 to C++20 to make it easier to maintain: ownership is now `std::string`, `std::vector`, `std::unique_ptr` and `std::shared_ptr` instead of `g_strdup`/`g_free` pairs, dialogs are classes with `std::function` callbacks instead of `void *` context structs, background work is a `std::function` job pool, the file browser is a class that stays valid while a transfer is still running after its tab closed, and the JSON, inventory, store and transfer code return values and `std::optional` instead of `GError`. The terminal engine (`vt.cpp`, `lz.cpp`) and the per-tab threading (`tcore.cpp`) keep their C-style hot loops on purpose and are only compiled as C++; the earlier research (`native/docs/CPP_PORT_RESEARCH.md`) had found that the language does not change their speed.
+
+Measured on the same machine (Intel i5-8265U, Debian 13, g++ 14.2 against gcc 14.2, same flags apart from the language), C build of 0.3.0 against the C++ build of 0.4.0, interleaved runs:
+
+| Measure | 0.3.0 (C) | 0.4.0 (C++) | Change |
+|---|---|---|---|
+| Engine, plain log, no scrollback (`make bench`, 3 runs) | 1453 / 1507 / 1521 MB/s | 1538 / 1495 / 1532 MB/s | none (within the run-to-run spread) |
+| Engine, plain log, 10,000-line scrollback | 882 / 815 / 889 MB/s | 869 / 873 / 882 MB/s | none |
+| Engine, colour output, 10,000-line scrollback | 320 / 295 / 324 MB/s | 262 / 314 / 311 MB/s | none (one low run) |
+| Engine, unlimited scrollback | 449 - 878 MB/s | 330 - 841 MB/s | none (this row varies by 2x from run to run in both builds) |
+| Scrollback compressor | 9.6 - 9.9 GB/s per core | 9.3 - 9.6 GB/s per core | about 2% lower, within noise |
+| Speed gate (`perf_gate`), no scrollback / 10,000 lines | 1486 / 915 MB/s | 1478 / 928 MB/s | none |
+| Start to first frame (median of 5, Xvfb) | 165 ms | 178 ms | about 8% slower, noisy |
+| Memory at rest (RSS, 5 runs) | 139.5 MB | 138.2 MB | about 1% less |
+| Executable size | 488 KB | 1.0 MB | about 2x larger (the C++ standard library templates) |
+| Tests | 32 + 52 + 16 + 1005 + 120 + 120 + 34163 checks | the same checks, all passing | |
+
+So the rewrite is a maintenance change, not a speed change: throughput is unchanged, start-up is slightly slower and the binary is larger. No speed-up was expected or found.
 
 ### Speed is a feature
 

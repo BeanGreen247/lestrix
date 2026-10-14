@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define _GNU_SOURCE
 #include "vt.h"
 #ifdef __SSE2__
 #include <sys/prctl.h>
@@ -25,7 +24,8 @@
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
-#include <stdatomic.h>
+#include <atomic>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,7 +76,7 @@ typedef struct {
 #define DEFAULT_DISK_BUDGET ((size_t)4 << 30)
 
 typedef struct Job {
-    atomic_int refs, done;
+    std::atomic<int> refs, done;
     uint8_t *raw; size_t raw_size;
     uint8_t *out; size_t out_size;
     int stored;
@@ -241,10 +241,10 @@ static inline uint32_t hash_style(uint32_t fg, uint32_t bg, uint16_t attrs) {
 
 static void style_table_init(Vt *t) {
     t->cstyles = 64;
-    t->styles = calloc(t->cstyles, sizeof(VtStyle));
+    t->styles = static_cast<VtStyle*>(calloc(t->cstyles, sizeof(VtStyle)));
     t->nstyles = 1;
     t->hash_mask = 127;
-    t->style_hash = calloc(t->hash_mask + 1, sizeof(uint32_t));
+    t->style_hash = static_cast<uint32_t*>(calloc(t->hash_mask + 1, sizeof(uint32_t)));
 }
 
 static uint32_t intern_style(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
@@ -258,13 +258,13 @@ static uint32_t intern_style(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
     if (t->nstyles >= MAX_STYLES) return 0;
     if (t->nstyles == t->cstyles) {
         t->cstyles *= 2;
-        t->styles = realloc(t->styles, t->cstyles * sizeof(VtStyle));
+        t->styles = static_cast<VtStyle*>(realloc(t->styles, t->cstyles * sizeof(VtStyle)));
     }
     uint32_t id = t->nstyles++;
     t->styles[id] = (VtStyle){fg, bg, attrs};
     if (t->nstyles * 2 > t->hash_mask) {
         uint32_t nm = (t->hash_mask + 1) * 2 - 1;
-        uint32_t *nh = calloc(nm + 1, sizeof(uint32_t));
+        uint32_t *nh = static_cast<uint32_t*>(calloc(nm + 1, sizeof(uint32_t)));
         for (uint32_t k = 1; k < t->nstyles; k++) {
             uint32_t j = hash_style(t->styles[k].fg, t->styles[k].bg, t->styles[k].attrs) & nm;
             while (nh[j]) j = (j + 1) & nm;
@@ -309,10 +309,10 @@ static unsigned comb_index(Vt *t, uint32_t cp) {
 }
 
 static void scr_alloc(Scr *s, int cols, int rows) {
-    s->cells = calloc((size_t)cols * (size_t)rows, sizeof(VtCell));
-    s->meta = calloc((size_t)rows, sizeof(VtLineMeta));
-    s->order = malloc((size_t)rows * sizeof(int));
-    s->sh = malloc((size_t)cols * (size_t)rows);
+    s->cells = static_cast<VtCell*>(calloc((size_t)cols * (size_t)rows, sizeof(VtCell)));
+    s->meta = static_cast<VtLineMeta*>(calloc((size_t)rows, sizeof(VtLineMeta)));
+    s->order = static_cast<int*>(malloc((size_t)rows * sizeof(int)));
+    s->sh = static_cast<uint8_t*>(malloc((size_t)cols * (size_t)rows));
     for (int i = 0; i < rows; i++) { s->order[i] = i; s->meta[i].dirty = 1; }
 }
 
@@ -371,8 +371,8 @@ static long total_lines(const Vt *t) { return (long)t->hcount + t->block_lines; 
 
 static HSeg *seg_new(Vt *t) {
     size_t cap = (size_t)BLOCK_LINES * (size_t)t->cols;
-    HSeg *g = malloc(sizeof *g);
-    uint8_t *buf = g ? malloc(2 * (size_t)BLOCK_LINES + cap * sizeof(VtCell)) : NULL;
+    HSeg *g = static_cast<HSeg*>(malloc(sizeof *g));
+    uint8_t *buf = g ? static_cast<uint8_t*>(malloc(2 * (size_t)BLOCK_LINES + cap * sizeof(VtCell))) : NULL;
     if (!buf) { free(g); return NULL; }
     g->buf = buf; g->cells = (VtCell *)(buf + 2 * (size_t)BLOCK_LINES); g->used = 0; g->cap = cap; g->lines = g->live = 0;
     g->bytes = g->bbuf = NULL; g->bused = 0; g->bcap = 0;
@@ -404,11 +404,11 @@ static struct { pthread_mutex_t m; pthread_cond_t c; Job *head, *tail; int start
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0};
 
 static void job_unref(Job *j) {
-    if (atomic_fetch_sub(&j->refs, 1) == 1) { free(j->raw); free(j->out); free(j); }
+    if (j->refs.fetch_sub(1) == 1) { free(j->raw); free(j->out); delete j; }
 }
 
 static uint8_t *shuffle_block(const uint8_t *raw, size_t raw_size, int nlines) {
-    uint8_t *sh = malloc(raw_size ? raw_size : 1);
+    uint8_t *sh = static_cast<uint8_t*>(malloc(raw_size ? raw_size : 1));
     if (!sh) return NULL;
     size_t head = 2 * (size_t)nlines, ncells = (raw_size - head) / 8;
     memcpy(sh, raw, head);
@@ -465,16 +465,16 @@ static uint8_t *shuffle_block(const uint8_t *raw, size_t raw_size, int nlines) {
 static void job_run(Job *j) {
     uint8_t *sh = j->plain ? NULL : shuffle_block(j->raw, j->raw_size, j->nlines);
     const uint8_t *src = j->plain ? j->raw : sh;
-    uint8_t *out = src ? malloc(sd_lz_bound(j->raw_size)) : NULL;
+    uint8_t *out = src ? static_cast<uint8_t*>(malloc(sd_lz_bound(j->raw_size))) : NULL;
     size_t n = out ? sd_lz_compress(src, j->raw_size, out, sd_lz_bound(j->raw_size)) : 0;
     free(sh);
     if (n == 0 || n >= j->raw_size) { free(out); j->out = NULL; j->stored = 1; j->out_size = j->raw_size; }
     else {
-        uint8_t *shrunk = realloc(out, n);
+        uint8_t *shrunk = static_cast<uint8_t*>(realloc(out, n));
         j->out = shrunk ? shrunk : out;
         j->out_size = n;
     }
-    atomic_store_explicit(&j->done, 1, memory_order_release);
+    j->done.store(1, std::memory_order_release);
     job_unref(j);
 }
 
@@ -530,7 +530,7 @@ static inline Block *blk(const Vt *t, int i) { return &t->blocks[(t->bhead + i) 
 
 static void block_apply(Vt *t, Block *b) {
     Job *j = b->job;
-    if (!j || !atomic_load_explicit(&j->done, memory_order_acquire)) return;
+    if (!j || !j->done.load(std::memory_order_acquire)) return;
     t->pending_bytes -= b->raw_size;
     t->pending_blocks--;
     if (j->stored) { b->data = j->raw; j->raw = NULL; b->comp_size = b->raw_size; b->stored = 1; b->shuffled = 0; }
@@ -691,8 +691,8 @@ static inline void copy_cells(VtCell *dst, const VtCell *src, size_t len) {
 static void block_push(Vt *t, uint8_t *raw, size_t raw_size, Job *j, int n, int v2) {
     if (t->bcount == t->bcap) {
         int ncap = t->bcap ? t->bcap * 2 : 16;
-        Block *nb = malloc((size_t)ncap * sizeof(Block));
-        if (!nb) { free(raw); free(j); return; }
+        Block *nb = static_cast<Block*>(malloc((size_t)ncap * sizeof(Block)));
+        if (!nb) { free(raw); delete j; return; }
         for (int i = 0; i < t->bcount; i++) nb[i] = *blk(t, i);
         free(t->blocks);
         t->blocks = nb; t->bcap = ncap; t->bhead = 0;
@@ -703,8 +703,8 @@ static void block_push(Vt *t, uint8_t *raw, size_t raw_size, Job *j, int n, int 
     b->nlines = n;
     b->raw_size = (uint32_t)raw_size;
     b->disk_off = -1;
-    atomic_init(&j->refs, 2);
-    atomic_init(&j->done, 0);
+    j->refs.store(2, std::memory_order_relaxed);
+    j->done.store(0, std::memory_order_relaxed);
     j->raw = raw; j->raw_size = raw_size; j->out = NULL; j->out_size = 0; j->stored = 0; j->nlines = n; j->plain = v2;
     b->v2 = v2;
     b->job = j;
@@ -734,10 +734,10 @@ static void pack_oldest(Vt *t) {
         HEnt *f = &t->hist[t->hhead], *l = &t->hist[(t->hhead + n - 1) & t->hmask];
         HSeg *cg = f->seg;
         if (f->cb && cg->bbuf && cg->lines == BLOCK_LINES && cg->live == BLOCK_LINES && l->seg == cg && cg != t->hseg && cg->used == 0 && f->cb == cg->bytes && l->cb + l->len == cg->bytes + cg->bused) {
-            Job *j3 = malloc(sizeof *j3);
+            Job *j3 = new (std::nothrow) Job;
             if (j3) {
                 size_t raw_size = COMPACT_HDR + cg->bused;
-                uint8_t *small = realloc(cg->bbuf, raw_size);
+                uint8_t *small = static_cast<uint8_t*>(realloc(cg->bbuf, raw_size));
                 uint8_t *raw = small ? small : cg->bbuf;
                 for (int i = 0; i < n; i++) {
                     HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
@@ -763,11 +763,11 @@ static void pack_oldest(Vt *t) {
     if (whole) ncells = g->used;
     else for (int i = 0; i < n; i++) ncells += (size_t)t->hist[(t->hhead + i) & t->hmask].len;
     size_t raw_size = 2 * (size_t)n + 8 * ncells;
-    uint8_t *raw = whole ? g->buf : malloc(raw_size);
-    Job *j = malloc(sizeof *j);
+    uint8_t *raw = whole ? g->buf : static_cast<uint8_t*>(malloc(raw_size));
+    Job *j = new (std::nothrow) Job;
     if (!raw || !j || raw_size > UINT32_MAX) {
         if (!whole) free(raw);
-        free(j);
+        delete j;
         hist_release(t, &t->hist[t->hhead]);
         t->hhead = (t->hhead + 1) & t->hmask;
         t->hcount--;
@@ -781,7 +781,7 @@ static void pack_oldest(Vt *t) {
         if (!whole) { copy_cells((VtCell *)cells, h->cells, (size_t)h->len); cells += (size_t)h->len * sizeof(VtCell); }
     }
     if (whole) {
-        uint8_t *small = realloc(raw, raw_size);
+        uint8_t *small = static_cast<uint8_t*>(realloc(raw, raw_size));
         if (small) raw = small;
         g->buf = NULL;
         free(g);
@@ -804,11 +804,11 @@ static void pack_oldest_v2(Vt *t) {
         HEnt *h = &t->hist[(t->hhead + i) & t->hmask];
         raw_size += h->cb ? 4 + (size_t)h->len : 8 * (size_t)h->len;
     }
-    uint8_t *raw = raw_size <= UINT32_MAX ? malloc(raw_size) : NULL;
-    Job *j = malloc(sizeof *j);
+    uint8_t *raw = raw_size <= UINT32_MAX ? static_cast<uint8_t*>(malloc(raw_size)) : NULL;
+    Job *j = new (std::nothrow) Job;
     if (!raw || !j) {
         free(raw);
-        free(j);
+        delete j;
         hist_release(t, &t->hist[t->hhead]);
         t->hhead = (t->hhead + 1) & t->hmask;
         t->hcount--;
@@ -876,7 +876,7 @@ static void hist_add_compact(Vt *t, const uint8_t *src, int hw, uint32_t sf, VtL
     }
     if (!g->bytes) {
         g->bcap = (size_t)BLOCK_LINES * (size_t)t->cols;
-        g->bbuf = malloc(COMPACT_HDR + (g->bcap ? g->bcap : 1));
+        g->bbuf = static_cast<uint8_t*>(malloc(COMPACT_HDR + (g->bcap ? g->bcap : 1)));
         if (!g->bbuf) { g->bcap = 0; return; }
         g->bytes = g->bbuf + COMPACT_HDR;
     }
@@ -955,7 +955,7 @@ void vt_clear_history(Vt *t) {
 }
 
 static CacheEntry *decode_entry(Vt *t, Block *b) {
-    CacheEntry *e = calloc(1, sizeof *e);
+    CacheEntry *e = static_cast<CacheEntry*>(calloc(1, sizeof *e));
     if (!e) return NULL;
     e->id = b->id;
     e->nlines = b->nlines;
@@ -966,7 +966,7 @@ static CacheEntry *decode_entry(Vt *t, Block *b) {
     else if (b->data || b->disk_off >= 0) {
         const uint8_t *src = b->data;
         if (!src) {
-            comp = malloc(b->comp_size);
+            comp = static_cast<uint8_t*>(malloc(b->comp_size));
             ssize_t got = 0;
             if (comp && t->spill_fd >= 0) got = pread(t->spill_fd, comp, b->comp_size, b->disk_off);
             if (got == (ssize_t)b->comp_size) src = comp;
@@ -974,7 +974,7 @@ static CacheEntry *decode_entry(Vt *t, Block *b) {
         if (src) {
             if (b->stored) raw = src;
             else {
-                tmp = malloc(b->raw_size);
+                tmp = static_cast<uint8_t*>(malloc(b->raw_size));
                 if (tmp && sd_lz_decompress(src, b->comp_size, tmp, b->raw_size)) { raw = tmp; shuffled = b->shuffled; }
             }
         }
@@ -994,7 +994,7 @@ static CacheEntry *decode_entry(Vt *t, Block *b) {
     }
     if (ok && b->raw_size != need) ok = 0;
     if (ok) {
-        e->cells = malloc((ncells ? ncells : 1) * sizeof(VtCell));
+        e->cells = static_cast<VtCell*>(malloc((ncells ? ncells : 1) * sizeof(VtCell)));
         ok = e->cells != NULL;
     }
     if (ok) {
@@ -1067,7 +1067,7 @@ static int hist_lookup(Vt *t, int idx, VtCell **cells, int *len, VtLineMeta **me
     if (k < t->hcount) {
         HEnt *h = &t->hist[(t->hhead + t->hcount - 1 - k) & t->hmask];
         if (h->cb && !h->cells) {
-            VtCell *pc = malloc(((size_t)h->len ? (size_t)h->len : 1) * sizeof(VtCell));
+            VtCell *pc = static_cast<VtCell*>(malloc(((size_t)h->len ? (size_t)h->len : 1) * sizeof(VtCell)));
             if (pc) { fill_ascii(pc, h->cb, (size_t)h->len, h->csf); h->cells = pc; h->promoted = 1; t->hot_bytes += (size_t)h->len * sizeof(VtCell); }
         }
         if (cells) *cells = h->cells;
@@ -1101,7 +1101,7 @@ void vt_set_history(Vt *t, int max_lines, size_t ram_budget, size_t disk_budget,
         }
         int sz = 1;
         while (sz < want) sz <<= 1;
-        HEnt *nh = calloc((size_t)sz, sizeof(HEnt));
+        HEnt *nh = static_cast<HEnt*>(calloc((size_t)sz, sizeof(HEnt)));
         if (nh) {
             for (int i = 0; i < t->hcount; i++) nh[i] = t->hist[(t->hhead + i) & t->hmask];
             free(t->hist);
@@ -2043,7 +2043,7 @@ static void btask_emit(BTask *tk, const VtCell *row, int hw) {
     if (tk->ncells + (size_t)hw > tk->ccap) {
         size_t nc = tk->ccap ? tk->ccap * 2 : 65536;
         while (nc < tk->ncells + (size_t)hw) nc *= 2;
-        VtCell *p = realloc(tk->cells, nc * sizeof(VtCell));
+        VtCell *p = static_cast<VtCell*>(realloc(tk->cells, nc * sizeof(VtCell)));
         if (!p) { tk->stopped = true; return; }
         tk->cells = p; tk->ccap = nc;
     }
@@ -2051,7 +2051,7 @@ static void btask_emit(BTask *tk, const VtCell *row, int hw) {
         int nr = tk->rcap ? tk->rcap * 2 : 4096;
         void *p = realloc(tk->rows, (size_t)nr * sizeof *tk->rows);
         if (!p) { tk->stopped = true; return; }
-        tk->rows = p; tk->rcap = nr;
+        tk->rows = static_cast<decltype(tk->rows)>(p); tk->rcap = nr;
     }
     tk->rows[tk->nrows].off = (uint32_t)tk->ncells; tk->rows[tk->nrows].hw = (uint16_t)hw; tk->rows[tk->nrows].compact = 0; tk->nrows++;
     copy_cells(tk->cells + tk->ncells, row, (size_t)hw);
@@ -2062,7 +2062,7 @@ static bool btask_breserve(BTask *tk, size_t extra) {
     if (tk->nbytes + extra <= tk->bcap) return true;
     size_t nc = tk->bcap ? tk->bcap * 2 : 65536;
     while (nc < tk->nbytes + extra) nc *= 2;
-    uint8_t *p = realloc(tk->bytes, nc);
+    uint8_t *p = static_cast<uint8_t*>(realloc(tk->bytes, nc));
     if (!p) { tk->stopped = true; return false; }
     tk->bytes = p; tk->bcap = nc;
     return true;
@@ -2073,7 +2073,7 @@ static void btask_emit_bytes(BTask *tk, int hw) {
         int nr = tk->rcap ? tk->rcap * 2 : 4096;
         void *p = realloc(tk->rows, (size_t)nr * sizeof *tk->rows);
         if (!p) { tk->stopped = true; return; }
-        tk->rows = p; tk->rcap = nr;
+        tk->rows = static_cast<decltype(tk->rows)>(p); tk->rcap = nr;
     }
     tk->rows[tk->nrows].off = (uint32_t)tk->nbytes; tk->rows[tk->nrows].hw = (uint16_t)hw; tk->rows[tk->nrows].compact = 1; tk->nrows++;
     tk->nbytes += (size_t)hw;
@@ -2084,7 +2084,7 @@ static void btask_build(BTask *tk) {
     const size_t n = tk->n;
     const int cols = tk->cols;
     const uint32_t sf = tk->sf;
-    VtCell *row = calloc((size_t)cols + 4, sizeof(VtCell));
+    VtCell *row = static_cast<VtCell*>(calloc((size_t)cols + 4, sizeof(VtCell)));
     if (!row) { tk->stopped = true; return; }
     if (!btask_breserve(tk, (size_t)cols + 4)) { free(row); return; }
     uint8_t *rb = tk->bytes + tk->nbytes;
@@ -2238,7 +2238,7 @@ static void bulk_commit(Vt *t, BTask *tk, int ntasks) {
     long old_stay = M < keep ? keep - M : 0;
     VtCell *saved = NULL; uint16_t *saved_hw = NULL;
     if (old_stay) {
-        saved = malloc((size_t)old_stay * (size_t)cols * sizeof(VtCell)); saved_hw = malloc((size_t)old_stay * sizeof *saved_hw);
+        saved = static_cast<VtCell*>(malloc((size_t)old_stay * (size_t)cols * sizeof(VtCell))); saved_hw = static_cast<uint16_t*>(malloc((size_t)old_stay * sizeof *saved_hw));
         if (saved && saved_hw) for (long j = 0; j < old_stay; j++) {
             int y = (int)(M + j);
             memcpy(saved + j * cols, rowp(t, y), (size_t)cols * sizeof(VtCell));
@@ -2309,7 +2309,7 @@ static int split_tasks(Vt *t, BTask *tk, const uint8_t *p, size_t base, size_t e
         size_t end = end_all;
         if (k < want - 1) {
             size_t target = base + len * (size_t)(k + 1) / (size_t)want;
-            const uint8_t *nl = target > start ? memchr(p + target, '\n', end_all - target) : NULL;
+            const uint8_t *nl = target > start ? static_cast<const uint8_t*>(memchr(p + target, '\n', end_all - target)) : NULL;
             end = nl ? (size_t)(nl - p) + 1 : end_all;
         }
         if (end <= start) continue;
@@ -2337,14 +2337,14 @@ static size_t bulk_region(Vt *t, const uint8_t *p, size_t n) {
     int nb = 1;
     for (int b = 1; b < nbatch; b++) {
         size_t target = n * (size_t)b / (size_t)nbatch;
-        const uint8_t *nl = memchr(p + target, '\n', n - target);
+        const uint8_t *nl = static_cast<const uint8_t*>(memchr(p + target, '\n', n - target));
         size_t e = nl ? (size_t)(nl - p) + 1 : n;
         if (e <= bstart[nb - 1] || e >= n) continue;
         bstart[nb++] = e;
     }
     bstart[nb] = n;
     int per = workers + 1;
-    BTask *tk = calloc((size_t)nb * (size_t)per, sizeof *tk);
+    BTask *tk = static_cast<BTask*>(calloc((size_t)nb * (size_t)per, sizeof *tk));
     if (!tk) return 0;
     int off[BULK_MAX_BATCHES], cnt[BULK_MAX_BATCHES];
     for (int b = 0; b < nb; b++) {
@@ -2384,7 +2384,7 @@ static size_t feed_bulk(Vt *t, const uint8_t *p, size_t n) {
     while (i < n) {
         if (!bulk_off && n - i >= BULK_MIN) {
             for (int guard = 0; i < n && !bulk_state_ok(t) && guard < t->rows + 4; guard++) {
-                const uint8_t *nl = memchr(p + i, '\n', n - i);
+                const uint8_t *nl = static_cast<const uint8_t*>(memchr(p + i, '\n', n - i));
                 size_t upto = nl ? (size_t)(nl - p) + 1 : n;
                 size_t used = feed_serial(t, p + i, upto - i);
                 i += used;
@@ -2395,10 +2395,10 @@ static size_t feed_bulk(Vt *t, const uint8_t *p, size_t n) {
                 size_t end = n;
                 if (t->esc_scan > 0) {
                     t->esc_scan--;
-                    const uint8_t *esc = memchr(p + i, 0x1b, n - i);
+                    const uint8_t *esc = static_cast<const uint8_t*>(memchr(p + i, 0x1b, n - i));
                     if (esc) { const uint8_t *ls = esc; while (ls > p + i && ls[-1] != '\n') ls--; end = (size_t)(ls - p); t->esc_scan = 16; }
                 }
-                const uint8_t *last = end > i ? memrchr(p + i, '\n', end - i) : NULL;
+                const uint8_t *last = end > i ? static_cast<const uint8_t*>(memrchr(p + i, '\n', end - i)) : NULL;
                 if (last && last > p + i && (last[-1] == '\r' || t->force_nl || t->stream_nl) && (size_t)(last - p) + 1 - i >= BULK_MIN / 2) {
                     size_t rlen = (size_t)(last - p) + 1 - i;
                     size_t used = bulk_region(t, p + i, rlen);
@@ -2449,7 +2449,7 @@ bool vt_take_stream(Vt *t, char *path, size_t cap, uint64_t *off, uint64_t *len,
 
 static void reset_tabs(Vt *t) {
     free(t->tabs);
-    t->tabs = calloc((size_t)t->cols + 1, 1);
+    t->tabs = static_cast<uint8_t*>(calloc((size_t)t->cols + 1, 1));
     for (int i = 8; i < t->cols; i += 8) t->tabs[i] = 1;
 }
 
@@ -2487,7 +2487,7 @@ Vt *vt_new(int cols, int rows, int scrollback) {
 #ifdef __GLIBC__
     pthread_once(&malloc_tuned, malloc_once);
 #endif
-    Vt *t = calloc(1, sizeof *t);
+    Vt *t = static_cast<Vt*>(calloc(1, sizeof *t));
     if (cols < 2) cols = 2;
     if (rows < 2) rows = 2;
     t->cols = cols; t->rows = rows;
@@ -2497,7 +2497,7 @@ Vt *vt_new(int cols, int rows, int scrollback) {
     t->spill = true;
     t->max_lines = scrollback < 0 ? -1 : scrollback;
     t->hcap = (scrollback < 0 || scrollback > HOT_KEEP + BLOCK_LINES) ? HOT_KEEP + BLOCK_LINES : (scrollback > 0 ? scrollback : 1);
-    { int sz = 1; while (sz < t->hcap) sz <<= 1; t->hmask = sz - 1; t->hist = calloc((size_t)sz, sizeof(HEnt)); }
+    { int sz = 1; while (sz < t->hcap) sz <<= 1; t->hmask = sz - 1; t->hist = static_cast<HEnt*>(calloc((size_t)sz, sizeof(HEnt))); }
     style_table_init(t);
     scr_alloc(&t->main, cols, rows);
     scr_alloc(&t->alt, cols, rows);

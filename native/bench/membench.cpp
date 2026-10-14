@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -15,7 +14,7 @@
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 typedef struct { char *a,*b; size_t n; int mode; int reps; double t; uint64_t sink; int cpu; } Job;
 static void *run(void *p){
-    Job *j=p; cpu_set_t s; CPU_ZERO(&s); CPU_SET(j->cpu,&s); sched_setaffinity(0,sizeof s,&s);
+    Job *j=static_cast<Job*>(p); cpu_set_t s; CPU_ZERO(&s); CPU_SET(j->cpu,&s); sched_setaffinity(0,sizeof s,&s);
     double t0=now(); uint64_t acc=0;
     for(int r=0;r<j->reps;r++){
         if(j->mode==0) memcpy(j->b,j->a,j->n);
@@ -27,7 +26,7 @@ static void *run(void *p){
 }
 static double bench(int threads,size_t per,int mode,int reps){
     Job jobs[16]; pthread_t th[16];
-    for(int i=0;i<threads;i++){ jobs[i].a=aligned_alloc(4096,per); jobs[i].b=aligned_alloc(4096,per); memset(jobs[i].a,1,per); memset(jobs[i].b,2,per); jobs[i].n=per; jobs[i].mode=mode; jobs[i].reps=reps; jobs[i].cpu=i*2%8; }
+    for(int i=0;i<threads;i++){ jobs[i].a=static_cast<char*>(aligned_alloc(4096,per)); jobs[i].b=static_cast<char*>(aligned_alloc(4096,per)); memset(jobs[i].a,1,per); memset(jobs[i].b,2,per); jobs[i].n=per; jobs[i].mode=mode; jobs[i].reps=reps; jobs[i].cpu=i*2%8; }
     double t0=now();
     for(int i=0;i<threads;i++) pthread_create(&th[i],0,run,&jobs[i]);
     for(int i=0;i<threads;i++) pthread_join(th[i],0);

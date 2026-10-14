@@ -38,13 +38,13 @@ PM=""; for c in apt-get dnf yum pacman zypper; do have "$c" && { PM="$c"; break;
 pkgs() {
   local base cross=""
   case "$PM" in
-    apt-get) base="build-essential pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libglib2.0-dev libcurl4-openssl-dev libgl1 libegl1 libgles2 libgl1-mesa-dri python3 python3-pyte bc xvfb xauth"
-             [ "$ARM" = 1 ] && cross="gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf qemu-user" ;;
-    dnf|yum) base="gcc make pkgconf-pkg-config libasan libtsan libubsan SDL2-devel freetype-devel fontconfig-devel glib2-devel libcurl-devel mesa-libGL mesa-libEGL mesa-dri-drivers python3 bc xorg-x11-server-Xvfb xauth"
-             [ "$ARM" = 1 ] && cross="gcc-aarch64-linux-gnu gcc-arm-linux-gnu qemu-user" ;;
-    pacman)  base="base-devel pkgconf sdl2 freetype2 fontconfig glib2 curl mesa python bc xorg-server-xvfb xorg-xauth"
+    apt-get) base="build-essential pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libcurl4-openssl-dev libgl1 libegl1 libgles2 libgl1-mesa-dri python3 python3-pyte bc xvfb xauth"
+             [ "$ARM" = 1 ] && cross="g++-aarch64-linux-gnu g++-arm-linux-gnueabihf qemu-user" ;;
+    dnf|yum) base="gcc-c++ make pkgconf-pkg-config libasan libtsan libubsan SDL2-devel freetype-devel fontconfig-devel libcurl-devel mesa-libGL mesa-libEGL mesa-dri-drivers python3 bc xorg-x11-server-Xvfb xauth"
+             [ "$ARM" = 1 ] && cross="gcc-c++-aarch64-linux-gnu gcc-c++-arm-linux-gnu qemu-user" ;;
+    pacman)  base="base-devel pkgconf sdl2 freetype2 fontconfig curl mesa python bc xorg-server-xvfb xorg-xauth"
              [ "$ARM" = 1 ] && cross="aarch64-linux-gnu-gcc arm-none-eabi-gcc qemu-user" ;;
-    zypper)  base="gcc make pkg-config libasan8 libtsan2 libubsan1 SDL2-devel freetype2-devel fontconfig-devel glib2-devel libcurl-devel Mesa-libGL1 Mesa-libEGL1 Mesa-dri python3 bc xorg-x11-server-Xvfb xauth"
+    zypper)  base="gcc-c++ make pkg-config libasan8 libtsan2 libubsan1 SDL2-devel freetype2-devel fontconfig-devel libcurl-devel Mesa-libGL1 Mesa-libEGL1 Mesa-dri python3 bc xorg-x11-server-Xvfb xauth"
              [ "$ARM" = 1 ] && cross="cross-aarch64-gcc13 qemu-linux-user" ;;
   esac
   echo $base $cross
@@ -52,14 +52,14 @@ pkgs() {
 
 missing() {
   local m=""
-  have gcc || m="$m gcc"; have make || m="$m make"; have pkg-config || m="$m pkg-config"
-  pkg-config --exists sdl2 freetype2 fontconfig glib-2.0 gio-2.0 libcurl 2>/dev/null || m="$m dev-libraries"
+  have g++ || m="$m g++"; have make || m="$m make"; have pkg-config || m="$m pkg-config"
+  pkg-config --exists sdl2 freetype2 fontconfig libcurl 2>/dev/null || m="$m dev-libraries"
   have python3 || m="$m python3"; have bc || m="$m bc"
   { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || have xvfb-run; } || m="$m xvfb"
   echo "$m"
-  echo 'int main(void){return 0;}' | gcc -x c -fsanitize=address,undefined - -o /tmp/lx-san-check 2>/dev/null || echo " sanitizer-runtimes"
-  echo 'int main(void){return 0;}' | gcc -x c -fsanitize=thread - -o /tmp/lx-san-check 2>/dev/null || echo " thread-sanitizer-runtime"
-  [ "$ARM" = 1 ] && { have aarch64-linux-gnu-gcc || echo " aarch64-cross-compiler"; have qemu-aarch64 || have qemu-aarch64-static || echo " qemu-user"; }
+  echo 'int main(){return 0;}' | g++ -x c++ -fsanitize=address,undefined - -o /tmp/lx-san-check 2>/dev/null || echo " sanitizer-runtimes"
+  echo 'int main(){return 0;}' | g++ -x c++ -fsanitize=thread - -o /tmp/lx-san-check 2>/dev/null || echo " thread-sanitizer-runtime"
+  [ "$ARM" = 1 ] && { have aarch64-linux-gnu-g++ || echo " aarch64-cross-compiler"; have qemu-aarch64 || have qemu-aarch64-static || echo " qemu-user"; }
   rm -f /tmp/lx-san-check
 }
 
@@ -119,13 +119,13 @@ fi
 arm_tests() {
   local ok=0 name cc flags qemu out
   mkdir -p build/arm
-  for t in "aarch64:aarch64-linux-gnu-gcc:-march=armv8-a" "armhf:arm-linux-gnueabihf-gcc:-march=armv7-a -mfpu=neon-vfpv4"; do
+  for t in "aarch64:aarch64-linux-gnu-g++:-march=armv8-a" "armhf:arm-linux-gnueabihf-g++:-march=armv7-a -mfpu=neon-vfpv4"; do
     IFS=: read -r name cc flags <<<"$t"
     have "$cc" || { echo "skip $name: $cc not installed"; continue; }
     qemu=qemu-aarch64; [ "$name" = armhf ] && qemu=qemu-arm
     have "$qemu" || qemu="$qemu-static"; have "$qemu" || { echo "skip $name: qemu-user not installed"; continue; }
     for f in test_lz test_vt test_fast_paths; do
-      $cc -O3 -std=gnu11 -pthread $flags -static -I src -o build/arm/${name}_$f tests/$f.c src/vt.c src/lz.c 2>/dev/null || { echo "$name $f: build failed"; ok=1; continue; }
+      $cc -O3 -std=gnu++20 -pthread $flags -static -I src -o build/arm/${name}_$f tests/$f.cpp src/vt.cpp src/lz.cpp 2>/dev/null || { echo "$name $f: build failed"; ok=1; continue; }
       out=$($qemu build/arm/${name}_$f 2>&1 | tail -1); echo "$name $f: $out"
       case "$out" in *" 0 failures") ;; *) ok=1 ;; esac
     done

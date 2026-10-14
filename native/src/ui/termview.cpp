@@ -99,11 +99,11 @@ static void copy_row(Vt *vt, int idx, RowCopy *o) {
     memset(o, 0, sizeof *o);
     if (!line || len <= 0) return;
     o->len = len;
-    o->cells = malloc((size_t)len * sizeof(VtCell));
+    o->cells = static_cast<VtCell*>(malloc((size_t)len * sizeof(VtCell)));
     memcpy(o->cells, line, (size_t)len * sizeof(VtCell));
     int cap = 8, n = 0;
-    o->ids = malloc((size_t)cap * sizeof *o->ids);
-    o->styles = malloc((size_t)cap * sizeof *o->styles);
+    o->ids = static_cast<uint32_t*>(malloc((size_t)cap * sizeof *o->ids));
+    o->styles = static_cast<VtStyle*>(malloc((size_t)cap * sizeof *o->styles));
     o->ids[0] = 0; o->styles[0] = *vt_style(vt, 0); n = 1;
     uint32_t last = 0;
     for (int x = 0; x < len; x++) {
@@ -112,13 +112,13 @@ static void copy_row(Vt *vt, int idx, RowCopy *o) {
             int i = 0;
             while (i < n && o->ids[i] != id) i++;
             if (i == n) {
-                if (n == cap) { cap *= 2; o->ids = realloc(o->ids, (size_t)cap * sizeof *o->ids); o->styles = realloc(o->styles, (size_t)cap * sizeof *o->styles); }
+                if (n == cap) { cap *= 2; o->ids = static_cast<uint32_t*>(realloc(o->ids, (size_t)cap * sizeof *o->ids)); o->styles = static_cast<VtStyle*>(realloc(o->styles, (size_t)cap * sizeof *o->styles)); }
                 o->ids[n] = id; o->styles[n] = *vt_style(vt, id); n++;
             }
             last = id;
         }
         if (VT_CELL_COMB(line[x])) {
-            if (!o->comb) o->comb = calloc((size_t)len, sizeof *o->comb);
+            if (!o->comb) o->comb = static_cast<uint32_t*>(calloc((size_t)len, sizeof *o->comb));
             o->comb[x] = vt_comb_char(vt, VT_CELL_COMB(line[x]));
         }
     }
@@ -150,7 +150,7 @@ static void resolve(const TermPalette *p, const VtStyle *st, uint32_t *fg, uint3
 typedef struct { RInst *v; int n, cap; } Out;
 
 static void out_add(Out *o, const RInst *i) {
-    if (o->n == o->cap) { o->cap = o->cap ? o->cap * 2 : 256; o->v = realloc(o->v, (size_t)o->cap * sizeof *o->v); }
+    if (o->n == o->cap) { o->cap = o->cap ? o->cap * 2 : 256; o->v = static_cast<RInst*>(realloc(o->v, (size_t)o->cap * sizeof *o->v)); }
     o->v[o->n++] = *i;
 }
 
@@ -191,7 +191,7 @@ static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCop
                     g = atlas_find_custom(a, fid, cp);
                     if (!g && peek) { *miss = true; goto abandon; }
                     if (!g) {
-                        if (!procbuf) procbuf = malloc((size_t)cw * ch);
+                        if (!procbuf) procbuf = static_cast<uint8_t*>(malloc((size_t)cw * ch));
                         proc_bits(cp, cw, ch, procbuf);
                         g = atlas_custom(a, fid, cp, procbuf, cw, ch);
                     }
@@ -231,7 +231,7 @@ void tv_fit(const Font *f, float w, float h, int *cols, int *rows) {
 typedef struct { Renderer *r; Font *f; const TermPalette *pal; RowCopy *copies; Out *outs; bool *missed; const int *todo; } RTask;
 
 static void rtask_fn(void *arg, int i) {
-    RTask *c = arg;
+    RTask *c = static_cast<RTask*>(arg);
     int row = c->todo[i];
     bool miss = false;
     build_row(c->r, c->f, c->pal, &c->copies[row], &c->outs[row], true, &miss);
@@ -267,7 +267,7 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
             need[row] = false;
             VtLineMeta *m = metas[row];
             if (!m) continue;
-            RowCache *rc = m->cache;
+            RowCache *rc = static_cast<RowCache*>(m->cache);
             if (rc && !m->dirty && rc->gen == gen0 && rc->fontid == fid && rc->epoch == pal->epoch && rc->cols == cols) {
                 r_push_at(r, rc->v, rc->n, ox, oy + (float)(row * ch));
                 sd_cache.row_hit++;
@@ -322,16 +322,16 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
             if (!need[row]) continue;
             VtLineMeta *m = metas[row];
             if (m && !m->dirty && !reset) {
-                RowCache *rc = m->cache;
+                RowCache *rc = static_cast<RowCache*>(m->cache);
                 if (rc && rc->cap >= outs[row].n && rc->cap <= outs[row].n + 64) sd_cache.row_recycle++;
                 else {
                     int cap = outs[row].n + 16;
-                    RowCache *nr = malloc(sizeof(RowCache) + (size_t)cap * sizeof(RInst));
+                    RowCache *nr = static_cast<RowCache*>(malloc(sizeof(RowCache) + (size_t)cap * sizeof(RInst)));
                     if (nr) { nr->cap = cap; free(m->cache); m->cache = rc = nr; } else rc = NULL;
                 }
                 if (rc) {
                     rc->gen = gen0; rc->fontid = fid; rc->epoch = pal->epoch; rc->cols = cols; rc->n = outs[row].n;
-                    memcpy(rc->v, outs[row].v, (size_t)outs[row].n * sizeof(RInst));
+                    if (outs[row].n) memcpy(rc->v, outs[row].v, (size_t)outs[row].n * sizeof(RInst));
                 }
             }
         }

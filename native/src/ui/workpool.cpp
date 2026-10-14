@@ -6,7 +6,7 @@
 #include "workpool.h"
 
 #include <pthread.h>
-#include <stdatomic.h>
+#include <atomic>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -16,7 +16,7 @@ static struct {
     void (*fn)(void *, int);
     void *arg;
     int n;
-    atomic_int next, remaining;
+    std::atomic<int> next, remaining;
     unsigned generation;
     int workers, started, configured;
 } P = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0, 0, 0, 0, 0};
@@ -31,10 +31,10 @@ int wp_workers(void) {
 
 static void work(void) {
     for (;;) {
-        int i = atomic_fetch_add(&P.next, 1);
+        int i = P.next.fetch_add(1);
         if (i >= P.n) return;
         P.fn(P.arg, i);
-        if (atomic_fetch_sub(&P.remaining, 1) == 1) {
+        if (P.remaining.fetch_sub(1) == 1) {
             pthread_mutex_lock(&P.m);
             pthread_cond_broadcast(&P.done);
             pthread_mutex_unlock(&P.m);
@@ -70,12 +70,12 @@ void wp_run(void (*fn)(void *, int), void *arg, int n) {
         P.started++;
     }
     P.fn = fn; P.arg = arg; P.n = n;
-    atomic_store(&P.next, 0); atomic_store(&P.remaining, n);
+    P.next.store(0); P.remaining.store(n);
     P.generation++;
     pthread_cond_broadcast(&P.wake);
     pthread_mutex_unlock(&P.m);
     work();
     pthread_mutex_lock(&P.m);
-    while (atomic_load(&P.remaining) > 0) pthread_cond_wait(&P.done, &P.m);
+    while (P.remaining.load() > 0) pthread_cond_wait(&P.done, &P.m);
     pthread_mutex_unlock(&P.m);
 }

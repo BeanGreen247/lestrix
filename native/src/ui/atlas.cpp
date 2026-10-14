@@ -56,11 +56,11 @@ Atlas *atlas_new(int size) {
     GLint maxtex = 0;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxtex);
     if (maxtex > 0 && size > maxtex) size = maxtex;
-    Atlas *a = calloc(1, sizeof *a);
+    Atlas *a = static_cast<Atlas*>(calloc(1, sizeof *a));
     if (!a) return NULL;
     a->size = size;
     a->cap = 16384;
-    a->tab = calloc(a->cap, sizeof *a->tab);
+    a->tab = static_cast<Entry*>(calloc(a->cap, sizeof *a->tab));
     if (!a->tab) { free(a); return NULL; }
     glGenTextures(1, &a->tex);
     glBindTexture(GL_TEXTURE_2D, a->tex);

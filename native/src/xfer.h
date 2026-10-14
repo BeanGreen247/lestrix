@@ -6,42 +6,79 @@
 #ifndef SD_XFER_H
 #define SD_XFER_H
 
-#include <glib.h>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "store.h"
 
-typedef struct {
-    char *name;
-    gboolean is_dir, is_link;
-    gint64 size;
-    char *modified, *perms;
-} SdEntry;
+typedef void CURL;
 
-typedef struct SdXfer SdXfer;
+struct SdEntry {
+    std::string name;
+    bool is_dir = false, is_link = false;
+    int64_t size = 0;
+    std::string modified, perms;
+};
 
-#define SD_XFER_ERROR (g_quark_from_static_string("sd-xfer"))
+using EntryList = std::vector<SdEntry>;
 
-void sd_entry_free(SdEntry *e);
-GPtrArray *sd_parse_ls(const char *text);
-char *sd_xfer_new_control_path(void);
-void sd_xfer_remove_control_path(const char *path);
+EntryList sd_parse_ls(std::string_view text);
+std::string sd_xfer_new_control_path();
+void sd_xfer_remove_control_path(const std::string &path);
 
-SdXfer *sd_xfer_new_ssh(const SdConn *conn, const char *control_path);
-SdXfer *sd_xfer_new_ftp(const SdConn *conn, const char *password);
-void sd_xfer_free(SdXfer *x);
-gboolean sd_xfer_is_ftp(const SdXfer *x);
-char *sd_xfer_label(SdXfer *x);
-gboolean sd_xfer_ready(SdXfer *x);
-void sd_xfer_force_mode(SdXfer *x, const char *mode, const char *xfer_order);
+/* Remote file operations over an ssh master connection (sftp, then scp or a tar/cat stream) or over FTP/FTPS.
+ * Every call that can fail takes an optional std::string *err for the reason. */
+class SdXfer {
+public:
+    static std::unique_ptr<SdXfer> new_ssh(const SdConn &conn, const std::string &control_path);
+    static std::unique_ptr<SdXfer> new_ftp(const SdConn &conn, const std::string &password);
 
-char *sd_xfer_home(SdXfer *x, GError **err);
-GPtrArray *sd_xfer_list(SdXfer *x, const char *path, GError **err);
-gboolean sd_xfer_is_dir(SdXfer *x, const char *path);
-gboolean sd_xfer_mkdir(SdXfer *x, const char *path, GError **err);
-gboolean sd_xfer_rename(SdXfer *x, const char *from, const char *to, GError **err);
-gboolean sd_xfer_remove(SdXfer *x, const char *path, gboolean is_dir, GError **err);
-gboolean sd_xfer_download(SdXfer *x, const char *remote, const char *local_dir, gboolean is_dir, GError **err);
-gboolean sd_xfer_upload(SdXfer *x, const char *local, const char *remote_dir, GError **err);
-char *sd_xfer_terminal_cwd(SdXfer *x);
+    bool is_ftp() const { return ftp_; }
+    std::string label() const;
+    bool ready();
+    void force_mode(const char *mode, const char *xfer_order);
+
+    std::optional<std::string> home(std::string *err);
+    std::optional<EntryList> list(const std::string &path, std::string *err);
+    bool is_dir(const std::string &path);
+    bool mkdir(const std::string &path, std::string *err);
+    bool rename(const std::string &from, const std::string &to, std::string *err);
+    bool remove(const std::string &path, bool is_dir, std::string *err);
+    bool download(const std::string &remote, const std::string &local_dir, bool is_dir, std::string *err);
+    bool upload(const std::string &local, const std::string &remote_dir, std::string *err);
+    std::string terminal_cwd();
+
+private:
+    SdXfer(const SdConn &c) : conn_(c) {}
+
+    SdConn conn_;
+    std::string control_path_, dest_, password_;
+    bool ftp_ = false;
+    bool sftp_ok_ = true;
+    std::vector<std::string> xfer_order_;
+
+    std::vector<std::string> mux_args(const char *port_flag) const;
+    std::string ssh_prefix() const;
+    std::optional<std::string> ssh_run(const std::string &command, int timeout_s, std::string *err);
+    std::optional<std::string> sftp_batch(const std::vector<std::string> &cmds, int timeout_s, bool &unavailable, std::string *err);
+    std::optional<std::string> try_sftp(const std::vector<std::string> &cmds, int timeout_s, bool &used, std::string *err);
+    bool scp_run(const std::vector<std::string> &tail, std::string *err);
+    bool run_script(const std::string &script, std::string *err);
+    bool fallback_transfer(const std::function<bool(std::string *)> &scp, const std::function<bool(std::string *)> &stream, std::string *err);
+
+    CURL *ftp_handle(const std::string &path, bool dir);
+    std::optional<EntryList> ftp_list(const std::string &path, std::string *err);
+    bool ftp_quote(const std::string &dir, const std::string &cmd1, const std::string *cmd2, std::string *err);
+    bool ftp_get_file(const std::string &remote, const std::string &local, std::string *err);
+    bool ftp_put_file(const std::string &local, const std::string &remote, std::string *err);
+    bool ftp_remove_tree(const std::string &path, bool is_dir, std::string *err);
+    bool ftp_download_tree(const std::string &remote, const std::string &local_dir, bool is_dir, std::string *err);
+    bool ftp_upload_tree(const std::string &local, const std::string &remote_dir, std::string *err);
+};
 
 #endif

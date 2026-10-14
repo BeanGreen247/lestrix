@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define _GNU_SOURCE
 #include <stdbool.h>
 #include "pty.h"
 
@@ -23,7 +22,7 @@ static char **build_env(char *const extra[]) {
     while (environ && environ[n]) n++;
     size_t ne = 0;
     while (extra && extra[ne]) ne++;
-    char **env = malloc((n + ne + 4) * sizeof *env);
+    char **env = static_cast<char**>(malloc((n + ne + 4) * sizeof *env));
     size_t k = 0;
     for (size_t i = 0; i < n; i++) {
         const char *e = environ[i];

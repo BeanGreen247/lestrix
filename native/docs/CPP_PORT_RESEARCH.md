@@ -200,3 +200,5 @@ modest ceiling.
 
 One machine, one workload family, a pty-bound ceiling that hides some engine differences, and no Windows measurements. The
 pooled-allocator number comes from a scratch copy of the engine, not from the application.
+
+> Update (0.4.0): the application layer was rewritten in C++20 and GLib was removed. The measurements are in the main README, section "0.4.0: the rewrite from C to C++".

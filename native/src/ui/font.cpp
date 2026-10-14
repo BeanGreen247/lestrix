@@ -94,7 +94,7 @@ static void load_style(Font *f, int s) {
 }
 
 Font *font_open(const char *family, double px, bool mono) {
-    Font *f = calloc(1, sizeof *f);
+    Font *f = static_cast<Font*>(calloc(1, sizeof *f));
     if (!f) return NULL;
     f->px = px;
     f->mono = mono;
@@ -160,7 +160,7 @@ static FT_Face pick_face(Font *f, uint32_t cp, int style, bool *synth_bold, bool
         if (f->nfb == f->capfb) {
             int nc = f->capfb ? f->capfb * 2 : 8;
             if (nc > 64) { free(path); neg_add(f, cp); return NULL; }
-            FaceEnt *nf = realloc(f->fb, (size_t)nc * sizeof *nf);
+            FaceEnt *nf = static_cast<FaceEnt*>(realloc(f->fb, (size_t)nc * sizeof *nf));
             if (!nf) { free(path); return NULL; }
             f->fb = nf; f->capfb = nc;
         }
@@ -199,7 +199,7 @@ bool font_glyph(Font *f, uint32_t cp, int style, GlyphBmp *out) {
     out->adv = (float)(slot->advance.x / 64.0) + (sb ? 0.f : 0.f);
     size_t need = (size_t)out->w * out->h;
     if (need > f->scratch_cap) {
-        uint8_t *ns = realloc(f->scratch, need);
+        uint8_t *ns = static_cast<uint8_t*>(realloc(f->scratch, need));
         if (!ns) { out->w = out->h = 0; return false; }
         f->scratch = ns; f->scratch_cap = need;
     }

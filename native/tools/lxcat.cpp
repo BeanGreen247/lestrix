@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -82,7 +81,7 @@ static int stream_stdin(const char *token) {
             else if (have < 0) { drop(old, fd); rc = 1; break; }
         }
         if (!spliceable) {
-            if (!buf && !(buf = malloc(CHUNK))) { drop(old, fd); rc = 1; break; }
+            if (!buf && !(buf = static_cast<char *>(malloc(CHUNK)))) { drop(old, fd); rc = 1; break; }
             ssize_t n;
             have = 0;
             while ((size_t)have < CHUNK && (n = read(0, buf + have, CHUNK - have)) > 0) {
@@ -105,7 +104,8 @@ static int stream_stdin(const char *token) {
 }
 
 static void exec_real_cat(char **argv) {
-    argv[0] = "cat";
+    static char cat_name[] = "cat";
+    argv[0] = cat_name;
     execv("/usr/bin/cat", argv);
     execv("/bin/cat", argv);
     perror("cat");

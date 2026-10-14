@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
     FILE *f = fopen(argv[1], "wb");
     if (!f) { perror(argv[1]); return 1; }
     enum { BUF = 1 << 20 };
-    char *b = malloc(BUF + 16);
+    char *b = static_cast<char*>(malloc(BUF + 16));
     size_t done = 0, n = 0;
     int col = 0, linelen = 1 + (int)(rnd() % 160);
     while (done < total) {
