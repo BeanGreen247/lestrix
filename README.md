@@ -280,7 +280,17 @@ It is on by default and a toggle: View > Fast cat in local tabs (saved in the se
 
 The overlay shows the glyph and row caches as rates over the last second. For the totals since start, three ways (they work in every mode, including `--basic` where there is no overlay):
 
-- **`Ctrl+Shift+I`**, or View > Cache statistics: a dialog with the glyph atlas (glyphs cached, ASCII slots filled out of 512, texture size, how many times it was cleared), the glyph cache (hits, misses, hit rate, entries dropped by atlas clears), the row cache (hits, misses, hit rate, rows rebuilt in place) and the scrollback of the current tab (lines, memory, disk, decoded cache).
+- **`Ctrl+Shift+I`** (remappable, see below), or View > Cache statistics: a dialog with the glyph atlas (glyphs cached, ASCII slots filled out of 512, texture size, how many times it was cleared), the glyph cache (hits, misses, hit rate, entries dropped by atlas clears), the row cache (hits, misses, hit rate, rows rebuilt in place) and the scrollback of the current tab (lines, memory, disk, decoded cache).
+
+The shortcut does not collide with fleetwm's defaults (the compositor's only global `Ctrl+Shift` combination is the Task Manager on `Ctrl+Shift+Esc`; the frame-time overlay is on `Alt+Shift+I` and `Ctrl+Alt+I`). To move it, edit `~/.config/lestrix/settings.ini`, which gets a `[keys]` section the first time Lestrix saves its settings:
+
+```
+[keys]
+cache_stats=ctrl+shift+i
+```
+
+The syntax is the one of fleetwm's `keybinds.toml`: modifiers `super` (also `logo`, `win`, `meta`), `alt`, `ctrl` (or `control`) and `shift`, then a key name (`i`, `F9`, `Escape`, ...); the pressed modifiers must match exactly. `off` or an empty value switches the shortcut off; the View menu entry and the command-line ways below keep working, and the menu shows the key you set. It is read when Lestrix starts.
+
 - **`kill -USR1 $(pidof lestrix)`**: prints the same text to the standard error of the running Lestrix, handy from a script or another terminal.
 - **`lestrix --cache-stats`**: prints it to the terminal you started Lestrix from when Lestrix exits.
 

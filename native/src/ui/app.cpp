@@ -124,6 +124,39 @@ static std::string fmt_mb(double bytes) { return bytes >= 1048576 ? lx::strprint
 
 static bool g_lite, g_basic;
 
+/* "ctrl+shift+i" -> modifiers and key. Modifiers are super (logo, win, meta), alt, ctrl (control) and shift; the combo must match
+ * exactly when pressed, like fleetwm's keybinds.toml. Returns false for an empty, "off" or unusable text (the shortcut is then disabled). */
+static bool parse_shortcut(const std::string &text, unsigned *mods, int *sym) {
+    *mods = 0; *sym = 0;
+    std::string key;
+    for (const std::string &part : lx::split(text, '+')) {
+        std::string n = lx::ascii_lower(lx::trim(part));
+        if (n == "ctrl" || n == "control") *mods |= KMOD_CTRL;
+        else if (n == "shift") *mods |= KMOD_SHIFT;
+        else if (n == "alt") *mods |= KMOD_ALT;
+        else if (n == "super" || n == "logo" || n == "win" || n == "meta") *mods |= KMOD_GUI;
+        else key = std::string(lx::trim(part));
+    }
+    if (key.empty() || lx::iequals(key, "off")) return false;
+    SDL_Keycode k = SDL_GetKeyFromName(key.c_str());
+    if (k == SDLK_UNKNOWN && key.size() == 1) k = (SDL_Keycode)lx::ascii_lower(key)[0];
+    if (k == SDLK_UNKNOWN) k = SDL_GetKeyFromName(lx::ascii_upper(key.substr(0, 1)).append(key.substr(1)).c_str());
+    if (k == SDLK_UNKNOWN) return false;
+    *sym = (int)k;
+    return true;
+}
+
+static std::string shortcut_label(unsigned mods, int sym) {
+    std::string o;
+    if (mods & KMOD_GUI) o += "Super+";
+    if (mods & KMOD_CTRL) o += "Ctrl+";
+    if (mods & KMOD_ALT) o += "Alt+";
+    if (mods & KMOD_SHIFT) o += "Shift+";
+    std::string k = SDL_GetKeyName((SDL_Keycode)sym);
+    if (k.size() == 1) k = lx::ascii_upper(k);
+    return o + k;
+}
+
 static void settings_load(App *a) {
     a->settings_path = lx::path_join(sd_config_dir(), "settings.ini");
     a->settings.load(a->settings_path);
@@ -150,6 +183,8 @@ static void settings_load(App *a) {
     a->panel_w = s.get_int("ui", "panel_width", 300);
     if (a->panel_w < 200 || a->panel_w > 700) a->panel_w = 300;
     if (g_lite) { a->lite = true; a->hud = true; a->pinned = false; a->dock_shown = false; a->side_open = false; }
+    a->key_cache_stats = s.has("keys", "cache_stats") ? s.get_string("keys", "cache_stats") : "ctrl+shift+i";
+    if (!parse_shortcut(a->key_cache_stats, &a->key_cache_mods, &a->key_cache_sym)) a->key_cache_sym = 0;
     if (g_basic) { a->basic = true; a->hud = false; a->quit_on_exit = true; }
 }
 
@@ -176,6 +211,7 @@ void app_settings_save(App *a) {
     s.set_bool("ui", "follow_fleetwm", a->follow_fleet);
     s.set_bool("ui", "rounded_corners", a->rounded);
     s.set_int("ui", "panel_width", a->panel_w);
+    s.set_string("keys", "cache_stats", a->key_cache_stats);
     s.save(a->settings_path);
 }
 
@@ -556,7 +592,9 @@ static void open_bar_menu(App *a, int which, float x, float y) {
         sep();
         add("Fast cat in local tabs", nullptr, A_FASTCAT, MI_CHECK | (a->fast_cat ? MI_CHECKED : 0));
         add("Show performance overlay", nullptr, A_HUD, MI_CHECK | (a->hud ? MI_CHECKED : 0));
-        add("Cache statistics\xe2\x80\xa6", "Ctrl+Shift+I", A_CACHE, 0);
+        static char cache_hint[48];
+        snprintf(cache_hint, sizeof cache_hint, "%s", a->key_cache_sym ? shortcut_label(a->key_cache_mods, a->key_cache_sym).c_str() : "");
+        add("Cache statistics\xe2\x80\xa6", cache_hint[0] ? cache_hint : nullptr, A_CACHE, 0);
         add("Show hosts from ~/.ssh/config", nullptr, A_SSHCFG, MI_CHECK | (a->show_ssh_config ? MI_CHECKED : 0));
         add("Open a local shell on startup", nullptr, A_STARTUP, MI_CHECK | (a->startup_shell ? MI_CHECKED : 0));
     } else {
@@ -1202,7 +1240,11 @@ static void build_frame(App *a) {
 
 static bool shortcut(App *a, SDL_Keycode k, Uint16 m) {
     bool ctrl = m & KMOD_CTRL, shift = m & KMOD_SHIFT, alt = m & KMOD_ALT;
-    if (ctrl && shift && !alt && k == SDLK_i) { run_action(a, A_CACHE); return true; }
+    {
+        unsigned pressed = ((m & KMOD_CTRL) ? (unsigned)KMOD_CTRL : 0u) | ((m & KMOD_SHIFT) ? (unsigned)KMOD_SHIFT : 0u) |
+                           ((m & KMOD_ALT) ? (unsigned)KMOD_ALT : 0u) | ((m & KMOD_GUI) ? (unsigned)KMOD_GUI : 0u);
+        if (a->key_cache_sym && k == (SDL_Keycode)a->key_cache_sym && pressed == a->key_cache_mods) { run_action(a, A_CACHE); return true; }
+    }
     if (a->basic) {  /* one bare terminal: only the font size keys are Lestrix's, everything else goes to the program */
         if (ctrl && !shift && !alt && (k == SDLK_EQUALS || k == SDLK_PLUS || k == SDLK_KP_PLUS)) { run_action(a, A_BIGGER); return true; }
         if (ctrl && !shift && !alt && (k == SDLK_MINUS || k == SDLK_KP_MINUS)) { run_action(a, A_SMALLER); return true; }

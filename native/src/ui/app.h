@@ -104,6 +104,10 @@ struct App {
     bool quit_on_exit = false;
     char hud_cache_tip[448] = "", hud_parse_tip[256] = "", title_last[400] = "";
     bool lite = false;
+    /* remappable shortcut for the cache statistics, [keys] cache_stats in settings.ini (fleetwm style: ctrl+shift+i, empty or off disables) */
+    std::string key_cache_stats = "ctrl+shift+i";
+    unsigned key_cache_mods = 0;
+    int key_cache_sym = 0;
     bool basic = false;  /* --basic: one bare terminal, no menu bar, tabs, sidebar or stats; the shell's title goes in the window title */
     uint64_t hud_prev_reads = 0;
     char hud_seg[11][256] = {};
