@@ -470,7 +470,7 @@ static void probe_all(App *a) {
 
 enum {
     A_NEW_CONN = 100, A_NEW_LOCAL, A_IMPORT_INV, A_IMPORT_SSH, A_QUIT, A_SIDEBAR, A_FILES, A_BIGGER, A_SMALLER, A_RECHECK, A_ACCENT,
-    A_FASTCAT, A_ACCENT_RESET, A_HUD, A_SSHCFG, A_STARTUP, A_SPILL, A_ABOUT, A_FLEET, A_ROUND,
+    A_FASTCAT, A_ACCENT_RESET, A_HUD, A_SSHCFG, A_STARTUP, A_SPILL, A_ABOUT, A_FLEET, A_ROUND, A_CACHE,
     A_THEME = 200, A_SB = 300, A_SHELL = 400,
     A_T_RENAME = 600, A_T_CUSTOM, A_T_DEFAULT, A_T_DUP, A_T_CLOSE, A_T_OTHERS, A_T_COLOR = 650,
     A_R_CONNECT = 700, A_R_EDIT, A_R_DUP, A_R_DELETE, A_R_NEW
@@ -493,6 +493,29 @@ static void find_shells() {
         if (!p.empty() && shells.size() < 16) shells.push_back(p);
     }
 }
+
+/* Totals since start: what the performance bar shows as rates. Also printed by `kill -USR1`, `--cache-stats` and Ctrl+Shift+I. */
+static std::string cache_stats_text(App *a) {
+    auto pct = [](uint64_t hit, uint64_t miss) { return hit + miss ? 100.0 * (double)hit / (double)(hit + miss) : 0.0; };
+    std::string o = lx::strprintf("Glyph atlas: %u glyphs cached, ASCII %d/512 filled, texture %dx%d, cleared %u time(s)\n",
+                                  a->atlas ? (unsigned)atlas_count(a->atlas) : 0u, a->atlas ? atlas_ascii_filled(a->atlas) : 0,
+                                  a->atlas ? atlas_size(a->atlas) : 0, a->atlas ? atlas_size(a->atlas) : 0, a->atlas ? (unsigned)atlas_generation(a->atlas) : 0u);
+    o += lx::strprintf("Glyph cache: %llu hits, %llu misses (%.1f%% hit), %llu dropped by atlas clears\n", (unsigned long long)sd_cache.glyph_hit,
+                       (unsigned long long)sd_cache.glyph_miss, pct(sd_cache.glyph_hit, sd_cache.glyph_miss), (unsigned long long)sd_cache.glyph_recycle);
+    o += lx::strprintf("Row cache: %llu hits, %llu misses (%.1f%% hit), %llu rebuilt in place\n", (unsigned long long)sd_cache.row_hit,
+                       (unsigned long long)sd_cache.row_miss, pct(sd_cache.row_hit, sd_cache.row_miss), (unsigned long long)sd_cache.row_recycle);
+    Tab *t = app_cur_tab(a);
+    if (t && t->term) {
+        VtHistoryStats st;
+        tcore_history_stats(t->term, &st);
+        o += lx::strprintf("Scrollback (this tab): %ld lines, %s in memory, %s on disk, %s decoded cache", st.lines,
+                           fmt_mb((double)(st.hot_bytes + st.packed_bytes)).c_str(), fmt_mb((double)st.disk_bytes).c_str(), fmt_mb((double)st.cache_bytes).c_str());
+    }
+    return o;
+}
+
+static volatile sig_atomic_t g_print_stats;
+static void on_usr1(int) { g_print_stats = 1; }
 
 static void open_bar_menu(App *a, int which, float x, float y) {
     UiMenuItem it[48];
@@ -533,6 +556,7 @@ static void open_bar_menu(App *a, int which, float x, float y) {
         sep();
         add("Fast cat in local tabs", nullptr, A_FASTCAT, MI_CHECK | (a->fast_cat ? MI_CHECKED : 0));
         add("Show performance overlay", nullptr, A_HUD, MI_CHECK | (a->hud ? MI_CHECKED : 0));
+        add("Cache statistics\xe2\x80\xa6", "Ctrl+Shift+I", A_CACHE, 0);
         add("Show hosts from ~/.ssh/config", nullptr, A_SSHCFG, MI_CHECK | (a->show_ssh_config ? MI_CHECKED : 0));
         add("Open a local shell on startup", nullptr, A_STARTUP, MI_CHECK | (a->startup_shell ? MI_CHECKED : 0));
     } else {
@@ -615,6 +639,7 @@ static void run_action(App *a, int id) {
     case A_STARTUP: a->startup_shell = !a->startup_shell; app_settings_save(a); break;
     case A_SPILL: a->sb_spill = !a->sb_spill; apply_history(a); app_settings_save(a); break;
     case A_ABOUT: dlg_about(a); break;
+    case A_CACHE: dlg_message(a, "Cache statistics", cache_stats_text(a)); break;
     case A_FLEET: a->follow_fleet = !a->follow_fleet; if (a->follow_fleet) app_follow_fleetwm(a); else app_apply_theme(a, a->theme); app_settings_save(a); break;
     case A_ROUND: a->rounded = !a->rounded; a->follow_fleet = false; app_apply_theme(a, a->theme); app_settings_save(a); break;
     default:
@@ -1177,6 +1202,7 @@ static void build_frame(App *a) {
 
 static bool shortcut(App *a, SDL_Keycode k, Uint16 m) {
     bool ctrl = m & KMOD_CTRL, shift = m & KMOD_SHIFT, alt = m & KMOD_ALT;
+    if (ctrl && shift && !alt && k == SDLK_i) { run_action(a, A_CACHE); return true; }
     if (a->basic) {  /* one bare terminal: only the font size keys are Lestrix's, everything else goes to the program */
         if (ctrl && !shift && !alt && (k == SDLK_EQUALS || k == SDLK_PLUS || k == SDLK_KP_PLUS)) { run_action(a, A_BIGGER); return true; }
         if (ctrl && !shift && !alt && (k == SDLK_MINUS || k == SDLK_KP_MINUS)) { run_action(a, A_SMALLER); return true; }
@@ -1494,6 +1520,7 @@ static const char *HELP_TEXT =
     "Usage: lestrix [--local] [--working-directory DIR] [-e COMMAND [ARGS...]]\n"
     "  --local               open a local shell on startup\n"
     "  --no-fast-output      keep the kernel's newline processing on the pty while cat, grep, ls, find and similar print (default: switch it off for them and let the terminal add the carriage returns; about 3x faster)\n"
+    "  --cache-stats         print the glyph, ASCII and row cache statistics to the terminal when Lestrix exits (also: kill -USR1 PID prints them at any time, Ctrl+Shift+I shows them)\n"
     "  --basic               one bare terminal like a classic terminal window: no menu bar, tabs, buttons, sidebar or stats; the program's title is the window title\n"
     "  --lite                terminal only: no sidebar, no stats bar; fps, cpu and cache stats go in the title bar\n"
     "  --working-directory   start the local shell in DIR\n"
@@ -1518,6 +1545,8 @@ int main(int argc, char **argv) {
     mallopt(M_TRIM_THRESHOLD, 256 * 1024);
     signal(SIGCHLD, SIG_DFL);  /* a launcher may start us with SIGCHLD ignored; that survives exec and breaks waitpid here and in every shell child (git: "waitpid failed: No child processes") */
     Startup s;
+    bool print_stats_at_exit = false;
+    signal(SIGUSR1, on_usr1);
     const char *flood = nullptr, *run_cmd = nullptr, *shot = nullptr, *script_arg = nullptr;
     double shot_after = 3.0;
     for (int i = 1; i < argc; i++) {
@@ -1536,6 +1565,7 @@ int main(int argc, char **argv) {
         if (arg == "--help" || arg == "-h") { fputs(HELP_TEXT, stdout); return 0; }
         if (arg == "--local") s.local = true;
         else if (arg == "--lite") { g_lite = true; s.local = true; }
+        else if (arg == "--cache-stats") print_stats_at_exit = true;
         else if (arg == "--basic") { g_basic = g_lite = true; s.local = true; }
         else if (arg == "--no-fast-output") tcore_set_fast_output(false);
         else if (arg == "--working-directory" && more) s.cwd = argv[++i];
@@ -1659,6 +1689,7 @@ int main(int argc, char **argv) {
         if (flood && flood_sent && wait > 2) wait = 2;
         if (wait > 20 && cmd_pending(a)) wait = 20;
         if (SDL_WaitEventTimeout(&e, wait)) { do handle_event(a, &e); while (SDL_PollEvent(&e)); }
+        if (g_print_stats) { g_print_stats = 0; fprintf(stderr, "%s\n", cache_stats_text(a).c_str()); }
         a->now = now_s();
         pump_all(a);
         cmd_poll_all(a);
@@ -1713,6 +1744,7 @@ int main(int argc, char **argv) {
             SDL_GL_SwapWindow(a->win);
         }
     }
+    if (print_stats_at_exit) printf("%s\n", cache_stats_text(a).c_str());
     app_settings_save(a);
     for (auto &t : a->tabs) if (t->term) tcore_close(t->term);
     for (auto &t : a->tabs) if (!t->control_path.empty()) sd_xfer_remove_control_path(t->control_path);

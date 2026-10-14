@@ -157,7 +157,13 @@ public:
     MsgDlg(std::string title, std::string msg) : title_(std::move(title)), msg_(std::move(msg)) {}
     void draw(App *a) override {
         ui_set_blocked(a->ui, ui_menu_is_open(a->ui));
-        Rect r = dlg_frame(a, title_.c_str(), 440, 200);
+        /* long messages get a wider, taller box so the text never runs into the button */
+        bool wide = msg_.size() > 160;
+        float w = wide ? 640 : 440;
+        size_t per_line = wide ? 80 : 52, rows = 1;
+        for (size_t i = 0, run = 0; i < msg_.size(); i++) { if (msg_[i] == '\n' || ++run > per_line) { rows++; run = 0; } }
+        float h = std::max(200.f, 120.f + 25.f * (float)rows);
+        Rect r = dlg_frame(a, title_.c_str(), w, h);
         wrap_text(a, R(r.x, r.y, r.w, r.h - P(40)), msg_, ui_colors(a->ui)->ink2);
         if (ui_button(a->ui, R(r.x + r.w - P(90), r.y + r.h - P(32), P(90), P(32)), "OK", UB_PRIMARY) || esc(a) || ui_key(a->ui, SDLK_RETURN, 0)) done = true;
     }

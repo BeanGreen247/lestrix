@@ -276,6 +276,14 @@ Nothing is lost or repeated: the bytes `cat` had already read are written by `ca
 
 It is on by default and a toggle: View > Fast cat in local tabs (saved in the settings), or `--no-fastcat` to turn it off everywhere. SSH tabs never use it. Every tab gets a random secret that the in-band request must carry, so a remote host over SSH, or the contents of any file, cannot make Lestrix read local files; only regular files are read. Measured end to end (256 MB of random text, `cat` typed into a local tab, 3 runs): 0.32 - 0.38 s with the built-in path, against 6.2 - 7.1 s with `--no-fastcat`. Pipelines, 14 MB of numbered lines through the test harness: `cat file | cat` 1.08 s -> 0.30 s, `awk ... | cat` 1.45 s -> 0.46 s (the gain grows with the size; the pty is capped at about 35 MB/s).
 
+### Cache statistics on demand
+
+The overlay shows the glyph and row caches as rates over the last second. For the totals since start, three ways (they work in every mode, including `--basic` where there is no overlay):
+
+- **`Ctrl+Shift+I`**, or View > Cache statistics: a dialog with the glyph atlas (glyphs cached, ASCII slots filled out of 512, texture size, how many times it was cleared), the glyph cache (hits, misses, hit rate, entries dropped by atlas clears), the row cache (hits, misses, hit rate, rows rebuilt in place) and the scrollback of the current tab (lines, memory, disk, decoded cache).
+- **`kill -USR1 $(pidof lestrix)`**: prints the same text to the standard error of the running Lestrix, handy from a script or another terminal.
+- **`lestrix --cache-stats`**: prints it to the terminal you started Lestrix from when Lestrix exits.
+
 ### What the overlay shows
 
 The bar at the bottom of the window, left to right. Hover any figure for the same explanation in the app.
