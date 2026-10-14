@@ -129,7 +129,7 @@ Each terminal parses on its own thread, so the window stays responsive during a 
 
 Same machine as below (Intel i5-8265U, 8 threads, Debian 13, X11, `powersave` governor; `performance` is 7-12% faster, see native/docs/PERFORMANCE_2026-10-07.md), 200x50 windows at default settings, one run each, the `native/benchmark` script with this revision of Lestrix (rows 15-27 of the progression below). Every test ends with a cursor-position request that a terminal only answers after it has parsed everything before it, so the times are "until it has taken it all". **Lestrix (cat)** is Lestrix running plain `cat`, the same test every terminal gets; **Lestrix (lxcat)** is Lestrix's fast file path, which other terminals cannot do, so it is a separate column and not a like-for-like comparison. mate-terminal is left out: it hands its command to an already running server, so the script cannot measure it reliably. Best of the like-for-like terminals is in bold.
 
-| Total time, seconds | Lestrix (cat) | Lestrix (lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
+| Total time, seconds | Lestrix (cat) | Lestrix (built-in cat, was lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
 |---|---|---|---|---|---|---|---|
 | 107 MB log | **1.29** | 0.25 | 2.28 | 2.29 | 2.72 | 2.69 | 5.39 |
 | 40 MB colour text | **0.56** | 0.18 | 0.78 | 0.90 | 1.01 | 1.08 | 2.03 |
@@ -143,7 +143,7 @@ Same machine as below (Intel i5-8265U, 8 threads, Debian 13, X11, `powersave` go
 | 1 GB random text | **30.64** | 5.80 | 33.94 | 33.56 | 58.70 | 59.77 | 70.77 |
 | 2 GB random text | **63.01** | 11.98 | 68.43 | 67.41 | 117.90 | 120.25 | 141.71 |
 
-| CPU used, seconds | Lestrix (cat) | Lestrix (lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
+| CPU used, seconds | Lestrix (cat) | Lestrix (built-in cat, was lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
 |---|---|---|---|---|---|---|---|
 | 107 MB log | **1.01** | 0.61 | 2.40 | 3.33 | 2.29 | 2.28 | 5.37 |
 | 40 MB colour text | **0.43** | 0.26 | 0.83 | 1.11 | 0.93 | 0.99 | 2.01 |
@@ -152,7 +152,7 @@ Same machine as below (Intel i5-8265U, 8 threads, Debian 13, X11, `powersave` go
 | 1 GB random text | **24.85** | 20.57 | 36.11 | 58.28 | 51.54 | 52.77 | 70.69 |
 | 2 GB random text | **51.62** | 42.14 | 72.86 | 117.03 | 104.14 | 105.77 | 141.57 |
 
-| | Lestrix (cat) | Lestrix (lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
+| | Lestrix (cat) | Lestrix (built-in cat, was lxcat) | Alacritty | kitty | GNOME Terminal | Xfce Terminal | xterm |
 |---|---|---|---|---|---|---|---|
 | Start-up to first prompt | 0.18 s | 0.19 s | 0.24 s | 0.81 s | 0.38 s | 0.27 s | **0.10 s** |
 | Memory at rest | 97 MB | 97 MB | 99 MB | 126 MB | 55 MB | 53 MB | **11 MB** |
@@ -263,18 +263,20 @@ Reading it: on this file the kernel's pseudo-terminal is the bottleneck. A bare 
 
 Lestrix draws at most 60 frames a second, and while a big dump is pouring in it slows itself to 24 (`--io-fps 24`), so the CPU goes to reading the output instead of drawing frames nobody can read; it returns to the normal rate as soon as the output slows. Both limits are command-line flags: `--max-fps N` (0 removes the cap and turns vsync off) and `--io-fps N` (lower is faster for output; 0 adds no extra limit). When nothing changes it draws nothing: an idle window with a focused cursor draws two frames a second (the blink), an unfocused one almost none, and the loop sleeps until the next timer instead of polling. On this machine 256 MB through `lxcat` took 1.98 s at 60 fps, 2.06 s at 120, 2.25 s at 240 and 3.2 s with no limit (about 700 frames a second), so a lower dump rate is the faster way to print a lot of text; for reference, kitty documents about 100 fps as "more than sufficient for most uses" and Ghostty defaults to vsync.
 
-### lxcat: big files without the kernel's tty layer
+### Built-in fast `cat`: big files without the kernel's tty layer
 
-Everything a program prints goes through the kernel's pseudo-terminal, which works on every line and caps big output at about 35 MB/s on this machine, whichever terminal is on the other end. `lxcat` is `cat` for Lestrix: in a local Lestrix tab it sends the terminal one escape sequence naming the file, and Lestrix reads the file itself at memory speed and prints it at exactly that point in the output, so ordering is unchanged. Elsewhere, or when its output is not a terminal, it behaves like `cat`. Piped input is copied to `/dev/shm` first and handed over the same way.
+Everything a program prints goes through the kernel's pseudo-terminal, which works on every line and caps big output at about 35 MB/s on this machine, whichever terminal is on the other end. Since 0.4.0 Lestrix deals with the commonest big dump, `cat bigfile`, by itself, with no helper program, no `cat` wrapper on `PATH` and no environment variable: when the foreground job of a local tab is a plain `cat FILE` that prints to the terminal, the terminal reads the rest of the file itself at memory speed. (Before 0.4.0 a separate `lxcat` binary did this; the columns called `lxcat` in the older benchmark tables below are the same fast path.)
 
-```
-lxcat big.log            # same output as cat, 3-4x faster on big files
-some-command | lxcat
-```
+How it works, in order:
 
-In local Lestrix tabs plain `cat file` and `x | cat` use it automatically (View > Fast cat in local tabs): Lestrix puts a `cat` that points at `lxcat` first on `PATH` and, for bash, exports a `cat` function so it still works when a startup file rewrites `PATH`. Anything with options (`cat -n`, `-A`, ...) is passed to the real `cat`, and when output is not a terminal it simply copies, so scripts behave the same. Piped input is handed over in 8 MB chunks as it arrives (`tail -f x | cat` still shows lines live, and at most two chunks wait in memory).
+1. The shell, which is the parent of `cat`, is stopped, so it cannot print its next prompt in the middle of the hand-over.
+2. `cat` is stopped for an instant, the terminal reads how far into the file it is, moves its file offset to the end of the file (it gets at the same open file with `pidfd_getfd`) and lets it go. `cat` finishes the chunk it already holds and exits normally.
+3. Everything `cat` wrote is now in the pty ahead of the terminal, so the terminal writes one in-band request after it, naming the file and the offset where `cat` stopped. The terminal's normal reader then streams the rest of the file in order.
+4. The shell is let go; it reaps `cat` and prints the prompt after the file.
 
-It is built to be safe: every tab gets a random secret in `$LESTRIX_FASTCAT` that the escape sequence must carry, so a remote host over SSH, or any file's contents, cannot make Lestrix read local files; only regular files are read (no devices, pipes or sockets); SSH tabs have it switched off; and `--no-fastcat` turns it off everywhere. A unit test checks the refusals. It is not a replacement for `cat` in the cross-terminal benchmark (other terminals cannot do it), so the table lists it as a separate Lestrix row.
+Nothing is lost or repeated: the bytes `cat` had already read are written by `cat`, the bytes after them by the terminal, in that order. `make test-native-cat` runs a real shell on a pty: a 1.2 million line file must arrive every line once and in order, with the shell's next output after the last line; a small file, a pipe (`cat file | cat`) and an option (`cat -u file`) must be left alone; and Ctrl-C while a hand-over is going on must end it and leave the shell running. It declines before stopping anything when: there are options or more than one file, output is a pipe or a redirect, the file is under 1 MB or less than 256 KB of it is left, `cat` is not a direct child of the tab's shell, or the kernel refuses `pidfd_getfd` (for example under a strict `ptrace_scope`). In all those cases the output goes through the pty as it always did, so the result is the same, only slower. Pipelines such as `some-command | cat` are no longer sped up (the old `lxcat` could do that with a temporary file); they take the normal path.
+
+It is on by default and a toggle: View > Fast cat in local tabs (saved in the settings), or `--no-fastcat` to turn it off everywhere. SSH tabs never use it. Every tab gets a random secret that the in-band request must carry, so a remote host over SSH, or the contents of any file, cannot make Lestrix read local files; only regular files are read. Measured end to end (256 MB of random text, `cat` typed into a local tab, 3 runs): 0.32 - 0.38 s with the built-in path, against 6.2 - 7.1 s with `--no-fastcat`.
 
 ### What the overlay shows
 

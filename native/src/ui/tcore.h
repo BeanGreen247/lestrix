@@ -51,7 +51,9 @@ void tcore_set_fast_output(bool on);
 void tcore_cmd_begin(TermCore *t, double now);
 bool tcore_cmd_active(const TermCore *t);
 bool tcore_cmd_poll(TermCore *t, double now, double *secs, uint64_t *bytes);
-extern const char *tcore_cat_dir;
+/* Built-in fast `cat`: a plain `cat FILE` of a big file in a local tab is finished by the terminal reading the file itself. */
+void tcore_set_native_cat(bool on);
+unsigned tcore_native_cat_count();
 extern int tcore_io_threads;
 extern int tcore_read_delay_us;
 uint64_t tcore_reads(const TermCore *t);

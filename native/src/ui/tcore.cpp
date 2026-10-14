@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <atomic>
 #include <new>
+#include <dirent.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/random.h>
@@ -54,6 +55,8 @@ struct TermCore {
     struct { bool on, saw_child, alt; double t0, t_last, t_back; uint64_t fed0, fed_last; } cmd;
     struct { bool active, suspect, th_started; struct termios saved; pid_t fg, last_checked; double release_at; pthread_t th; std::atomic<int> restored, cancel; int pidfd; } fo;
     char fastcat_token[33];
+    struct { std::atomic<int> busy; pthread_t th; bool started; pid_t last; } nc;
+    std::atomic<unsigned> intr_seq;  /* counts Ctrl-C keystrokes sent to the program, so a take-over can tell it was interrupted */
     std::atomic<unsigned long long> reads;
     bool running, eof, child_done;
     int exit_status;
@@ -96,7 +99,10 @@ int tcore_rows(const TermCore *t) { return t->rows; }
 bool tcore_running(const TermCore *t) { return t->running; }
 int tcore_read_delay_us = 200;
 int tcore_io_threads = -1;
-const char *tcore_cat_dir = NULL;
+static std::atomic<bool> g_native_cat{true};
+static std::atomic<unsigned> g_native_cat_count{0};
+void tcore_set_native_cat(bool on) { g_native_cat.store(on); }
+unsigned tcore_native_cat_count() { return g_native_cat_count.load(); }
 
 uint64_t tcore_reads(const TermCore *t) { return t->reads.load(); }
 static bool g_fast_output = true;
@@ -280,6 +286,7 @@ static void wake_worker(TermCore *t) {
 
 void tcore_send(TermCore *t, const char *data, size_t len) {
     if (!len || !t->running_flag.load()) return;
+    if (memchr(data, 3, len)) t->intr_seq.fetch_add(1);
     pthread_mutex_lock(&t->outlock);
     if (t->outhead + t->outlen + len > t->outcap) {
         if (t->outhead) { memmove(t->outq, t->outq + t->outhead, t->outlen); t->outhead = 0; }
@@ -333,6 +340,197 @@ static void flush_out(TermCore *t, bool *still_pending) {
     pthread_mutex_unlock(&t->outlock);
 }
 
+
+/*
+ * Built-in fast `cat`. A tty moves about 30 MB/s, so `cat bigfile` is limited by the kernel, not by the terminal. When the
+ * foreground job of a local tab is a plain `cat FILE` that writes to this terminal, the terminal takes the rest of the
+ * file over and reads it itself:
+ *   1. stop the shell (its parent), so it cannot print the next prompt in the middle of this;
+ *   2. stop cat for an instant, read how far into the file it is, and move its file offset to the end (pidfd_getfd gives us
+ *      the same open file description), then let it go: it finishes the chunk it already holds and exits normally;
+ *   3. when cat has exited, everything it wrote is in the pty ahead of us, so write an in-band stream request after it
+ *      (the same request the terminal already understands) for the bytes from where cat stopped to the end of the file;
+ *   4. let the shell go. It reaps cat and prints its prompt after the file.
+ * Anything unusual (options, several files, a pipe or redirect, a small file, no permission for pidfd_getfd) is declined
+ * before anything is stopped, so those run through the pty as before. Ctrl-C while it waits leaves the file unfinished,
+ * as it would with a plain cat.
+ */
+enum { NC_MIN_FILE = 1 << 20, NC_MIN_REST = 256 << 10 };
+
+typedef struct { TermCore *t; pid_t cat; char path[4096]; int fdnum; unsigned intr0; } NcJob;
+
+static bool nc_read(const char *path, char *buf, size_t cap, size_t *len) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, buf, cap - 1);
+    close(fd);
+    if (n < 0) return false;
+    buf[n] = 0;
+    *len = (size_t)n;
+    return true;
+}
+
+/* state letter and parent of a process from /proc/PID/stat */
+static bool nc_stat(pid_t pid, char *state, pid_t *ppid, long *exit_code) {
+    char path[48], buf[1024];
+    size_t n;
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    if (!nc_read(path, buf, sizeof buf, &n)) return false;
+    char *rp = strrchr(buf, ')');
+    if (!rp) return false;
+    int pp = 0;
+    if (sscanf(rp + 2, "%c %d", state, &pp) != 2) return false;
+    *ppid = pp;
+    if (exit_code) {
+        *exit_code = 0;
+        const char *f = rp + 2;
+        for (int field = 3; field < 52 && f; field++) { f = strchr(f, ' '); if (f) f++; }
+        if (f) *exit_code = strtol(f, NULL, 10);
+    }
+    return true;
+}
+
+static bool nc_wait_stopped(pid_t pid) {
+    for (int i = 0; i < 100; i++) {
+        char st; pid_t pp;
+        if (nc_stat(pid, &st, &pp, NULL) && (st == 'T' || st == 't')) return true;
+        struct timespec ts = {0, 500000};
+        nanosleep(&ts, NULL);
+    }
+    return false;
+}
+
+static bool nc_candidate(TermCore *t, pid_t fg, NcJob *j) {
+    char path[96], buf[8192], comm[32];
+    size_t n;
+    snprintf(path, sizeof path, "/proc/%d/comm", (int)fg);
+    if (!nc_read(path, comm, sizeof comm, &n) || strcmp(comm, "cat\n") != 0) return false;
+    char st; pid_t pp;
+    if (!nc_stat(fg, &st, &pp, NULL) || pp != t->pty.pid) return false;
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)fg);
+    if (!nc_read(path, buf, sizeof buf, &n)) return false;
+    const char *argv0 = buf, *arg1 = argv0 + strlen(argv0) + 1;
+    if ((size_t)(arg1 - buf) >= n) return false;
+    const char *end = arg1 + strlen(arg1) + 1;
+    if (!*arg1 || arg1[0] == '-' || (size_t)(end - buf) != n) return false;
+    char slave[128];
+    struct stat ss, so, sf, sn;
+    if (ptsname_r(t->pty.fd, slave, sizeof slave) != 0 || stat(slave, &ss) != 0) return false;
+    snprintf(path, sizeof path, "/proc/%d/fd/1", (int)fg);
+    if (stat(path, &so) != 0 || !S_ISCHR(so.st_mode) || so.st_rdev != ss.st_rdev) return false;
+    char full[4096 + 64];
+    if (arg1[0] == '/') snprintf(full, sizeof full, "%s", arg1);
+    else {
+        char cwd[4096];
+        snprintf(path, sizeof path, "/proc/%d/cwd", (int)fg);
+        ssize_t l = readlink(path, cwd, sizeof cwd - 1);
+        if (l <= 0) return false;
+        cwd[l] = 0;
+        snprintf(full, sizeof full, "%s/%s", cwd, arg1);
+    }
+    if (!realpath(full, j->path) || stat(j->path, &sf) != 0 || !S_ISREG(sf.st_mode) || sf.st_size < NC_MIN_FILE) return false;
+    snprintf(path, sizeof path, "/proc/%d/fd", (int)fg);
+    DIR *d = opendir(path);
+    if (!d) return false;
+    j->fdnum = -1;
+    while (struct dirent *e = readdir(d)) {
+        int num = atoi(e->d_name);
+        if (num < 3) continue;
+        char fp[96];
+        snprintf(fp, sizeof fp, "/proc/%d/fd/%d", (int)fg, num);
+        if (stat(fp, &sn) == 0 && sn.st_dev == sf.st_dev && sn.st_ino == sf.st_ino) { j->fdnum = num; break; }
+    }
+    closedir(d);
+    j->t = t; j->cat = fg; j->intr0 = t->intr_seq.load();
+    return j->fdnum >= 0;
+}
+
+static void nc_request(TermCore *t, int slave_fd, const char *path, uint64_t off) {
+    char msg[4096 * 3 + 160];
+    size_t n = (size_t)snprintf(msg, sizeof msg, "\x1b]7777;cat;%s;", t->fastcat_token);
+    for (const unsigned char *p = (const unsigned char *)path; *p && n < sizeof msg - 80; p++) {
+        if (*p < 0x20 || *p == 0x7f || *p == '%' || *p == ';' || *p > 0x7e) n += (size_t)snprintf(msg + n, 4, "%%%02X", *p);
+        else msg[n++] = (char)*p;
+    }
+    n += (size_t)snprintf(msg + n, 80, ";%llu;0;2\a", (unsigned long long)off);
+    size_t done = 0;
+    while (done < n) {
+        ssize_t w = write(slave_fd, msg + done, n - done);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) break;
+        done += (size_t)w;
+    }
+}
+
+static void *nc_main(void *arg) {
+    NcJob *j = static_cast<NcJob*>(arg);
+    TermCore *t = j->t;
+    prctl(PR_SET_NAME, "lx-cat", 0, 0, 0);
+    int pidfd = (int)syscall(SYS_pidfd_open, j->cat, 0);
+    int dupfd = pidfd >= 0 ? (int)syscall(SYS_pidfd_getfd, pidfd, j->fdnum, 0) : -1;
+    char slave[128];
+    int sfd = dupfd >= 0 && ptsname_r(t->pty.fd, slave, sizeof slave) == 0 ? open(slave, O_WRONLY | O_NOCTTY | O_CLOEXEC) : -1;
+    pid_t shell = t->pty.pid;
+    if (sfd >= 0) {
+        bool shell_stopped = false, cat_stopped = false, handed_over = false;
+        kill(shell, SIGSTOP);
+        shell_stopped = nc_wait_stopped(shell);
+        if (shell_stopped) {
+            syscall(SYS_pidfd_send_signal, pidfd, SIGSTOP, NULL, 0);
+            cat_stopped = nc_wait_stopped(j->cat);
+        }
+        off_t pos = -1;
+        struct stat st = {};
+        if (cat_stopped) {
+            pos = lseek(dupfd, 0, SEEK_CUR);
+            if (fstat(dupfd, &st) == 0 && pos >= 0 && st.st_size - pos >= NC_MIN_REST && lseek(dupfd, 0, SEEK_END) >= 0) handed_over = true;
+        }
+        if (cat_stopped) syscall(SYS_pidfd_send_signal, pidfd, SIGCONT, NULL, 0);
+        if (handed_over) {
+            struct pollfd p = {pidfd, POLLIN, 0};
+            bool gone = false;
+            while (!t->stop.load() && !(gone = poll(&p, 1, 50) > 0)) {}
+            if (gone) {
+                char state; pid_t pp; long code = 0;
+                bool signaled = nc_stat(j->cat, &state, &pp, &code) && (code & 0x7f) != 0;  /* Ctrl-C: do not finish the file */
+                if (!signaled && t->intr_seq.load() == j->intr0) {
+                    nc_request(t, sfd, j->path, (uint64_t)pos);
+                    g_native_cat_count.fetch_add(1);
+                }
+            }
+        }
+        kill(shell, SIGCONT);
+    }
+    if (sfd >= 0) close(sfd);
+    if (dupfd >= 0) close(dupfd);
+    if (pidfd >= 0) close(pidfd);
+    free(j);
+    t->nc.busy.store(0);
+    return NULL;
+}
+
+static void nc_join(TermCore *t) {
+    if (!t->nc.started) return;
+    pthread_join(t->nc.th, NULL);
+    t->nc.started = false;
+}
+
+/* Called by the reader after a sizeable read: is the foreground job a plain `cat FILE` of a big file? */
+static void nc_probe(TermCore *t) {
+    if (!t->fastcat_token[0] || !g_native_cat.load() || t->nc.busy.load() || t->pty.fd < 0) return;
+    pid_t fg = tcgetpgrp(t->pty.fd);
+    if (fg <= 0 || fg == t->pty.pid) { t->nc.last = 0; return; }
+    if (fg == t->nc.last) return;
+    t->nc.last = fg;
+    NcJob *j = static_cast<NcJob*>(calloc(1, sizeof *j));
+    if (!j) return;
+    if (!nc_candidate(t, fg, j)) { free(j); return; }
+    nc_join(t);
+    t->nc.busy.store(1);
+    if (pthread_create(&t->nc.th, NULL, nc_main, j) != 0) { t->nc.busy.store(0); free(j); return; }
+    t->nc.started = true;
+}
+
 static void feed_sliced(TermCore *t, const uint8_t *p, size_t n, bool notify) {
     const size_t SLICE = notify ? 512 * 1024 : 64 * 1024;
     while (n) {
@@ -355,8 +553,9 @@ static void stream_file(TermCore *t, const char *path, uint64_t off, uint64_t le
     uint8_t *in = static_cast<uint8_t*>(malloc(CH));
     if (in) {
         uint64_t done = 0;
+        const unsigned intr0 = t->intr_seq.load();
         if (flags & 2) { LOCK(t); vt_set_stream_nl(t->vt, true); UNLOCK(t); }
-        while (!t->stop.load() && (len == 0 || done < len)) {
+        while (!t->stop.load() && t->intr_seq.load() == intr0 && (len == 0 || done < len)) {
             size_t want = len ? (len - done < CH ? (size_t)(len - done) : (size_t)CH) : (size_t)CH;
             ssize_t n = pread(fd, in, want, (off_t)(off + done));
             if (n <= 0) break;
@@ -407,6 +606,7 @@ static void *reader_main(void *data) {
                 pthread_cond_signal(&t->io_data);
                 pthread_mutex_unlock(&t->iom);
                 t->reads.fetch_add(1, std::memory_order_relaxed);
+                if (n >= 4096) nc_probe(t);
                 if (tcore_read_delay_us > 0 && n < 1024) { struct timespec ts = {0, (long)tcore_read_delay_us * 1000}; nanosleep(&ts, NULL); }
                 continue;
             }
@@ -525,6 +725,7 @@ static void *worker_main(void *data) {
                         }
                     }
                     t->reads.fetch_add(1, std::memory_order_relaxed);
+                    if (n >= 4096) nc_probe(t);
                     if (total >= (1u << 20)) break;
                     if (tcore_read_delay_us > 0 && n < 1024) { struct timespec ts = {0, (long)tcore_read_delay_us * 1000}; nanosleep(&ts, NULL); }
                     continue;
@@ -567,18 +768,7 @@ static bool spawn(TermCore *t) {
     LOCK(t);
     int cols = t->cols, rows = t->rows;
     UNLOCK(t);
-    char env_fc[64], env_path[4096], env_fn[4200];
-    char *extra[4] = {NULL, NULL, NULL, NULL};
-    if (t->fastcat_token[0]) {
-        snprintf(env_fc, sizeof env_fc, "LESTRIX_FASTCAT=%s", t->fastcat_token);
-        extra[0] = env_fc;
-        if (tcore_cat_dir && *tcore_cat_dir) {
-            const char *cur = getenv("PATH");
-            snprintf(env_path, sizeof env_path, "PATH=%s:%s", tcore_cat_dir, cur && *cur ? cur : "/usr/local/bin:/usr/bin:/bin");
-            extra[1] = env_path;
-            if (!strchr(tcore_cat_dir, '\'')) { snprintf(env_fn, sizeof env_fn, "BASH_FUNC_cat%%%%=() {  '%s/cat' \"$@\"\n}", tcore_cat_dir); extra[2] = env_fn; }
-        }
-    }
+    char *extra[1] = {NULL};
     if (sd_pty_spawn(&t->pty, t->argv, t->cwd, extra, cols, rows) != 0) return false;
     t->running = true;
     t->running_flag.store(1);
@@ -663,6 +853,7 @@ void tcore_close(TermCore *t) {
         t->running_flag.store(0);
         sd_pty_hangup(&t->pty);
         join_worker(t);
+        nc_join(t);
         t->running = false;
         sd_pty_close(&t->pty);
     }

@@ -318,40 +318,7 @@ static Tab *tab_add(App *a, TabKind kind, const std::string &title) {
 
 static bool g_fastcat = true;
 
-static std::string exe_dir() {
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
-    if (n <= 0) return {};
-    return lx::dirname(std::string(buf, (size_t)n));
-}
-
-static std::string find_shipped(std::initializer_list<const char *> rel) {
-    std::string dir = exe_dir();
-    if (dir.empty()) return {};
-    for (const char *r : rel) {
-        std::string p = lx::path_join(dir, r);
-        if (lx::exists(p)) return lx::canonicalize(p);
-    }
-    return {};
-}
-
-void app_fastcat_apply(App *a) {
-    static std::string cat_dir;
-    cat_dir.clear();
-    tcore_cat_dir = nullptr;
-    if (!a->fast_cat || !g_fastcat) return;
-    std::string lxcat = find_shipped({"lxcat", "../build/lxcat"});
-    if (lxcat.empty()) return;
-    std::string dir = lx::path_join(lx::cache_dir(), "lestrix", "bin");
-    lx::mkdir_p(dir, 0700);
-    std::string link = lx::path_join(dir, "cat");
-    if (lx::read_link(link) != lxcat) {
-        unlink(link.c_str());
-        if (symlink(lxcat.c_str(), link.c_str()) != 0) return;
-    }
-    cat_dir = dir;
-    tcore_cat_dir = cat_dir.c_str();
-}
+void app_fastcat_apply(App *a) { tcore_set_native_cat(a->fast_cat && g_fastcat); }
 
 static TermCore *make_term(App *a, Tab *t, const std::vector<std::string> &args, const char *cwd, bool fastcat) {
     TermHooks h{};
@@ -559,7 +526,7 @@ static void open_bar_menu(App *a, int which, float x, float y) {
         for (size_t i = 0; i < std::size(SB_PRESETS); i++) add(SB_PRESETS[i].label, nullptr, A_SB + (int)i, MI_CHECK | (a->scrollback == SB_PRESETS[i].lines ? MI_CHECKED : 0));
         add("Spill old scrollback to disk", nullptr, A_SPILL, MI_CHECK | (a->sb_spill ? MI_CHECKED : 0));
         sep();
-        add("Fast cat in local tabs (lxcat)", nullptr, A_FASTCAT, MI_CHECK | (a->fast_cat ? MI_CHECKED : 0));
+        add("Fast cat in local tabs", nullptr, A_FASTCAT, MI_CHECK | (a->fast_cat ? MI_CHECKED : 0));
         add("Show performance overlay", nullptr, A_HUD, MI_CHECK | (a->hud ? MI_CHECKED : 0));
         add("Show hosts from ~/.ssh/config", nullptr, A_SSHCFG, MI_CHECK | (a->show_ssh_config ? MI_CHECKED : 0));
         add("Open a local shell on startup", nullptr, A_STARTUP, MI_CHECK | (a->startup_shell ? MI_CHECKED : 0));
@@ -1530,7 +1497,7 @@ static const char *HELP_TEXT =
     "  --io-threads N        2: a reader and a writer thread per tab besides the parser; 0: one thread (default: 2 from 4 cores up)\n"
     "  --parse-threads N     helper threads that build big batches of plain text in parallel (default: half the cores, up to 8; 0 = off)\n"
     "  --compress-threads N  threads that compress old scrollback (default: a quarter of the cores, 2 to 8)\n"
-    "  --no-fastcat          do not let programs in a local tab use `lxcat` to print big files at memory speed\n"
+    "  --no-fastcat          do not take over `cat FILE` in a local tab to print big files at memory speed\n"
     "  --theme NAME          Xylonic Dark, Xylonic Light, Graphite, Nord, Gruvbox or Solarized Dark\n"
     "  -e COMMAND ...        run COMMAND in a new tab (works as x-terminal-emulator)\n\n" APP_CREDIT;
 

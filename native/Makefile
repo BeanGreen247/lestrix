@@ -8,7 +8,7 @@ CXXFLAGS  += $(GCC_TUNE)
 CXXFLAGS  += -std=gnu++20 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-deprecated-declarations -Wno-missing-field-initializers -fvisibility=hidden -fno-rtti -pthread
 BUILD   := build
 
-.PHONY: bench-file bench-terminals all test test-fast test-shadow test-lxcat test-gui perf-gate test-lz test-vt-tsan test-vt test-store test-xfer test-ftp bench app install uninstall clean
+.PHONY: bench-file bench-terminals all test test-fast test-shadow test-native-cat test-gui perf-gate test-lz test-vt-tsan test-vt test-store test-xfer test-ftp bench app install uninstall clean
 all: app
 
 $(BUILD):
@@ -31,7 +31,7 @@ test-vt: $(BUILD)/test_vt $(BUILD)/libvt.so
 	@PY=$$(for p in ../.venv/bin/python python3; do $$p -c "import pyte" 2>/dev/null && echo $$p && break; done); \
 	  if [ -n "$$PY" ]; then $$PY tests/diff_pyte.py 1500; else echo "(pyte not installed: skipping the differential test)"; fi
 
-test: test-vt test-fast test-shadow test-lxcat test-lz test-vt-tsan test-store test-xfer test-ftp perf-gate
+test: test-vt test-fast test-shadow test-native-cat test-lz test-vt-tsan test-store test-xfer test-ftp perf-gate
 
 bench: $(BUILD)/bench_vt
 	$(BUILD)/bench_vt
@@ -59,10 +59,7 @@ APP_SRC := $(UI_SRC) $(CORE_SRC)
 $(BUILD)/lestrix: $(APP_SRC) $(wildcard src/*.h src/ui/*.h) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(GUI_CFLAGS) $(CURL_CFLAGS) -o $@ $(APP_SRC) $(GUI_LIBS) $(CURL_LIBS) -lutil -lm
 
-app: $(BUILD)/lestrix $(BUILD)/lxcat
-
-$(BUILD)/lxcat: tools/lxcat.cpp | $(BUILD)
-	$(CXX) -O3 -std=gnu++20 -Wall -o $@ $<
+app: $(BUILD)/lestrix
 
 $(BUILD)/test_ftp: tests/test_ftp.cpp src/xfer.cpp src/store.cpp src/json.cpp src/inventory.cpp src/util.cpp src/xfer.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(CURL_CFLAGS) -fsanitize=address,undefined -g -o $@ tests/test_ftp.cpp src/xfer.cpp src/store.cpp src/json.cpp src/inventory.cpp src/util.cpp $(CURL_LIBS)
@@ -74,10 +71,9 @@ PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 DATADIR := $(PREFIX)/share
 
-install: $(BUILD)/lestrix $(BUILD)/lxcat
+install: $(BUILD)/lestrix
 	install -d -m 755 $(BINDIR) $(DATADIR)/applications $(DATADIR)/icons/hicolor/256x256/apps
 	install -m 755 $(BUILD)/lestrix $(BINDIR)/lestrix
-	install -m 755 $(BUILD)/lxcat $(BINDIR)/lxcat
 	install -m 644 data/lestrix.png $(DATADIR)/icons/hicolor/256x256/apps/lestrix.png
 	sed 's|@BINDIR@|$(BINDIR)|g' data/lestrix.desktop.in > $(DATADIR)/applications/lestrix.desktop
 	sed 's|@BINDIR@|$(BINDIR)|g' data/lestrix-lite.desktop.in > $(DATADIR)/applications/lestrix-lite.desktop
@@ -134,8 +130,11 @@ test-shadow: $(BUILD)/dump_vt_shadow $(BUILD)/dump_vt_plain
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/dump_vt_plain 300 > $(BUILD)/plain.out
 	cmp $(BUILD)/shadow.out $(BUILD)/plain.out && echo "shadow rows: 300 random streams identical"
 
-test-lxcat: $(BUILD)/lxcat
-	python3 tests/test_lxcat.py $(BUILD)/lxcat
+$(BUILD)/test_native_cat: tests/test_native_cat.cpp src/ui/tcore.cpp src/vt.cpp src/lz.cpp src/pty.cpp src/util.cpp src/ui/tcore.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -g -fsanitize=address,undefined -o $@ tests/test_native_cat.cpp src/ui/tcore.cpp src/vt.cpp src/lz.cpp src/pty.cpp src/util.cpp -lutil
+
+test-native-cat: $(BUILD)/test_native_cat
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/test_native_cat
 
 bench-file: $(BUILD)/gen_random
 	$(BUILD)/gen_random /tmp/lestrix-bench-1g.txt 1024

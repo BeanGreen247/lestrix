@@ -27,6 +27,9 @@ static char **build_env(char *const extra[]) {
     for (size_t i = 0; i < n; i++) {
         const char *e = environ[i];
         if (!strncmp(e, "TERM=", 5) || !strncmp(e, "COLORTERM=", 10)) continue;
+        /* left behind by a Lestrix older than 0.4.0 that started this one from one of its own tabs: its `cat` wrapper and token
+         * would print nothing here */
+        if (!strncmp(e, "LESTRIX_FASTCAT=", 16) || !strncmp(e, "BASH_FUNC_cat%%", 14)) continue;
         bool shadowed = false;
         for (size_t x = 0; extra && extra[x] && !shadowed; x++) {
             const char *eq = strchr(extra[x], '=');

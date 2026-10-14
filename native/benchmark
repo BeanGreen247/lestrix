@@ -27,9 +27,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 dir=${XDG_CACHE_HOME:-$HOME/.cache}/lestrix-bench; results=$here/bench/results
 [ -w "$here/bench" ] || results=${XDG_STATE_HOME:-$HOME/.local/state}/lestrix/bench-results
 lx=${LESTRIX_BIN:-$here/build/lestrix}; [ -x "$lx" ] || lx=$(command -v lestrix)
-lxcat_bin=$here/build/lxcat; [ -x "$lxcat_bin" ] || lxcat_bin=$(dirname "$lx")/lxcat; [ -x "$lxcat_bin" ] || lxcat_bin=$(command -v lxcat)
 openmode=""
-terms="lestrix lestrix-lxcat alacritty kitty xterm gnome xfce4 mate"; sizes="128 256 512 768 1024 2048"
+terms="lestrix alacritty kitty xterm gnome xfce4 mate"; sizes="128 256 512 768 1024 2048"
 workloads=1; bigfiles=1; refterm=1; refmb=1024; summary_only=0; flags=""
 while [ $# -gt 0 ]; do
   case $1 in
@@ -191,7 +190,6 @@ run="$here/bench/run.sh"
 launch() {
   export LESTRIX_BENCH_OUT=$results LESTRIX_BENCH_T0=$(date +%s.%N)
   case $1 in
-    lestrix-lxcat) LESTRIX_BENCH_LXCAT="$lxcat_bin" XDG_CONFIG_HOME=${TMPDIR:-/tmp}/lestrix-bench-cfg exec "$lx" $flags -e "$run" lestrix-lxcat "${specs[@]}" ;;
     lestrix)   XDG_CONFIG_HOME=${TMPDIR:-/tmp}/lestrix-bench-cfg exec "$lx" --no-fastcat $flags -e "$run" lestrix "${specs[@]}" ;;
     alacritty) exec alacritty -o window.dimensions.columns=200 -o window.dimensions.lines=50 -e "$run" alacritty "${specs[@]}" ;;
     kitty)     exec kitty -o initial_window_width=200c -o initial_window_height=50c "$run" kitty "${specs[@]}" ;;
@@ -201,7 +199,7 @@ launch() {
     mate)      exec mate-terminal --geometry=200x50 -x "$run" mate "${specs[@]}" ;;
   esac
 }
-have() { case $1 in lestrix|lestrix-lxcat) return 0 ;; gnome) command -v gnome-terminal >/dev/null ;; xfce4) command -v xfce4-terminal >/dev/null ;; mate) command -v mate-terminal >/dev/null ;; *) command -v "$1" >/dev/null ;; esac; }
+have() { case $1 in lestrix) return 0 ;; gnome) command -v gnome-terminal >/dev/null ;; xfce4) command -v xfce4-terminal >/dev/null ;; mate) command -v mate-terminal >/dev/null ;; *) command -v "$1" >/dev/null ;; esac; }
 for t in $terms; do
   have "$t" || { echo "skip $t (not installed)"; continue; }
   echo "== $t"

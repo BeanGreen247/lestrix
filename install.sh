@@ -118,5 +118,5 @@ fi
 ui_step "Done" \
   "Start Lestrix from your application menu (System) or run:  lestrix" \
   "Remove it any time with:  ./install.sh --uninstall" \
-  "'lxcat' prints big files at memory speed in a Lestrix tab; 'cat' uses it automatically (View > Fast cat)."
+  "'cat FILE' of a big file prints at memory speed in a Lestrix tab: the terminal reads the file itself (View > Fast cat)."
 case ":$PATH:" in *":$PREFIX/bin:"*) ;; *) ui_note "Note: add $PREFIX/bin to your PATH to run 'lestrix' from a shell." ;; esac
