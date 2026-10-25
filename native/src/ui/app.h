@@ -24,7 +24,7 @@
 #include "ui.h"
 #include "uitheme.h"
 
-#define APP_VERSION "0.4.0"
+#define APP_VERSION "0.4.1"
 #define APP_CREDIT "Copyright (c) 2026 Thomas Mozdren (BeanGreen247)\nhttps://github.com/BeanGreen247/lestrix\n"
 
 struct App;
