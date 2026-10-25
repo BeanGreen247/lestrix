@@ -122,6 +122,7 @@ struct App {
     bool blink_on = true;
     double last_blink = 0;
     double last_active = 0;  /* last key, mouse event or terminal output */
+    double last_key = 0;     /* last key press or text input: the echo that follows is drawn without waiting out the frame gap */
 };
 
 extern App *g_app;
