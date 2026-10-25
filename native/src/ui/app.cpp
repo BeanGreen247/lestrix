@@ -1095,6 +1095,8 @@ static double frame_gap(bool flooding) {
     if (flooding && g_frame_cost * 3.0 > gap) gap = g_frame_cost * 3.0;
     return gap;
 }
+/* the key press itself already caused a frame; the echo arrives a fraction of a millisecond later and must not wait a whole frame gap behind it */
+static double typing_gap(const App *a, double gap) { return a->now - a->last_key < 0.05 ? 0.0 : gap; }
 static void hud_tick(App *a);
 
 static void draw_hud(App *a) {
@@ -1328,6 +1330,7 @@ static void cell_at(App *a, double x, double y, int *col, int *row) {
 static void handle_event(App *a, SDL_Event *e) {
     ui_event(a->ui, e);
     if (e->type != EV_WAKE && e->type != SDL_WINDOWEVENT) a->last_active = a->now;
+    if (e->type == SDL_KEYDOWN || e->type == SDL_TEXTINPUT) a->last_key = now_s();
     Tab *t = app_cur_tab(a);
     TermCore *term = t ? t->term : NULL;
     bool kbd_ui = dlg_active(a) || ui_keyboard_taken(a->ui);
@@ -1748,7 +1751,7 @@ int main(int argc, char **argv) {
         {
             Tab *wt = app_cur_tab(a);
             uint64_t wfed = wt && wt->term ? tcore_bytes_fed(wt->term) : 0;
-            double gap = frame_gap(wfed - last_draw_bytes >= 256 * 1024);
+            double gap = typing_gap(a, frame_gap(wfed - last_draw_bytes >= 256 * 1024));
             if (ui_animating(a->ui)) wait = 4;
             else if (a->dirty) { double left = last_draw + gap - a->now; wait = left > 0 ? (int)(left * 1000.0) + 1 : 0; }
         }
@@ -1788,7 +1791,7 @@ int main(int argc, char **argv) {
         else if (a->now - a->last_blink > 0.53) { a->last_blink = a->now; a->blink_on = !a->blink_on; if (app_cur_tab(a) && app_cur_tab(a)->term) app_redraw(a); }
         Tab *ct = app_cur_tab(a);
         uint64_t fed = ct && ct->term ? tcore_bytes_fed(ct->term) : 0;
-        double min_gap = frame_gap(fed - last_draw_bytes >= 256 * 1024);
+        double min_gap = typing_gap(a, frame_gap(fed - last_draw_bytes >= 256 * 1024));
         if ((a->dirty || ui_animating(a->ui)) && a->now - last_draw >= min_gap) {
             last_draw = a->now;
             last_draw_bytes = fed;

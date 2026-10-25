@@ -108,6 +108,13 @@ unsigned tcore_native_cat_count() { return g_native_cat_count.load(); }
 uint64_t tcore_reads(const TermCore *t) { return t->reads.load(); }
 static bool g_fast_output = true;
 
+/* LX_RAWLOG=file appends every byte read from a pty, to replay a display bug through the engine tests */
+static void rawlog(const void *p, size_t n) {
+    static int fd = -2;
+    if (fd == -2) { const char *path = getenv("LX_RAWLOG"); fd = path && *path ? open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600) : -1; }
+    if (fd >= 0) { ssize_t r = write(fd, p, n); (void)r; }
+}
+
 void tcore_set_fast_output(bool on) { g_fast_output = on; }
 
 static bool fo_comm_ok(pid_t pgrp) {
@@ -740,6 +747,7 @@ static void *reader_main(void *data) {
             if (stop) return NULL;
             ssize_t n = read(t->pty.fd, t->iob[slot].data, 65536);
             if (n > 0) {
+                rawlog(t->iob[slot].data, (size_t)n);
                 pthread_mutex_lock(&t->iom);
                 t->iob[slot].n = (size_t)n; t->io_count++;
                 pthread_cond_signal(&t->io_data);
@@ -849,6 +857,7 @@ static void *worker_main(void *data) {
             for (;;) {
                 ssize_t n = read(t->pty.fd, buf, 65536);
                 if (n > 0) {
+                    rawlog(buf, (size_t)n);
                     if (t->fastcat_token[0]) feed_output(t, buf, (size_t)n);
                     else feed_sliced(t, buf, (size_t)n, false);
                     total += (size_t)n;

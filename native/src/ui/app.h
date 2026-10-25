@@ -24,7 +24,7 @@
 #include "ui.h"
 #include "uitheme.h"
 
-#define APP_VERSION "0.4.0"
+#define APP_VERSION "0.4.1"
 #define APP_CREDIT "Copyright (c) 2026 Thomas Mozdren (BeanGreen247)\nhttps://github.com/BeanGreen247/lestrix\n"
 
 struct App;
@@ -122,6 +122,7 @@ struct App {
     bool blink_on = true;
     double last_blink = 0;
     double last_active = 0;  /* last key, mouse event or terminal output */
+    double last_key = 0;     /* last key press or text input: the echo that follows is drawn without waiting out the frame gap */
 };
 
 extern App *g_app;
