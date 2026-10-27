@@ -23,6 +23,7 @@
 
 #include "../bench.h"
 #include "app.h"
+#include "../trace.h"
 #include "appicon.h"
 #include "fleetwm.h"
 #include "gl.h"
@@ -1759,8 +1760,10 @@ int main(int argc, char **argv) {
         if (wait > 20 && cmd_pending(a)) wait = 20;
         if (SDL_WaitEventTimeout(&e, wait)) { do handle_event(a, &e); while (SDL_PollEvent(&e)); }
         if (g_print_stats) { g_print_stats = 0; fprintf(stderr, "%s\n", cache_stats_text(a).c_str()); }
+        lx::trace("loop wake");
         a->now = now_s();
         pump_all(a);
+        lx::trace("pumped");
         cmd_poll_all(a);
         {
             std::string shot_name;
@@ -1775,7 +1778,9 @@ int main(int argc, char **argv) {
         }
         if (run_cmd && !flood_sent && a->now - t0 > 1.0 && app_cur_tab(a)) { tcore_send_str(app_cur_tab(a)->term, run_cmd); flood_sent = true; }
         if (flood && flood_sent && app_cur_tab(a) && tcore_screen_contains(app_cur_tab(a)->term, "FLOOD_DONE_42")) {
+            lx::trace("marker seen");
             printf("flood finished in %.2fs\n", a->now - flood_t);
+            lx::trace_dump();
             if (getenv("LESTRIX_THREADS")) print_task_cpu();
             break;
         }
@@ -1797,9 +1802,12 @@ int main(int argc, char **argv) {
             last_draw_bytes = fed;
             a->dirty = false;
             const double frame_t0 = now_s();
+            lx::trace("frame begin");
             r_begin(a->r, a->W, a->H, a->colors.bg0);
             build_frame(a);
+            lx::trace("frame built");
             r_end(a->r);
+            lx::trace("frame r_end");
             a->frames++;
             { static bool first = true; if (first) { first = false; tmark("first frame drawn"); } }
             if (!script_shot.empty()) {
@@ -1812,6 +1820,7 @@ int main(int argc, char **argv) {
                 a->running = false;
             }
             SDL_GL_SwapWindow(a->win);
+            lx::trace("frame swapped");
             { double cost = now_s() - frame_t0; g_frame_cost = g_frame_cost == 0 ? cost : g_frame_cost * 0.9 + cost * 0.1; }
         }
     }

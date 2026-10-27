@@ -4,6 +4,7 @@
  */
 
 #include "tcore.h"
+#include "../trace.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -310,7 +311,7 @@ void tcore_send(TermCore *t, const char *data, size_t len) {
     wake_worker(t);
 }
 
-void tcore_send_str(TermCore *t, const char *s) { tcore_send(t, s, strlen(s)); }
+void tcore_send_str(TermCore *t, const char *s) { lx::trace("send_str", (long)strlen(s)); tcore_send(t, s, strlen(s)); }
 
 static void vt_write_cb(const uint8_t *d, size_t n, void *user) { tcore_send(static_cast<TermCore*>(user), (const char *)d, n); }
 
@@ -493,6 +494,7 @@ static bool nc_find(TermCore *t, pid_t fg, NcJob *j) {
 }
 
 static void nc_request(TermCore *t, int slave_fd, const char *path, uint64_t off, unsigned flags) {
+    lx::trace("nc request");
     char msg[4096 * 3 + 160];
     size_t n = (size_t)snprintf(msg, sizeof msg, "\x1b]7777;cat;%s;", t->fastcat_token);
     for (const unsigned char *p = (const unsigned char *)path; *p && n < sizeof msg - 80; p++) {
@@ -515,9 +517,11 @@ static void nc_file_job(NcJob *j, int pidfd, int dupfd, int sfd) {
     bool shell_stopped = false, cat_stopped = false, handed_over = false;
     kill(shell, SIGSTOP);
     shell_stopped = nc_wait_stopped(shell);
+    lx::trace("nc shell stopped");
     if (shell_stopped) {
         syscall(SYS_pidfd_send_signal, pidfd, SIGSTOP, NULL, 0);
         cat_stopped = nc_wait_stopped(j->cat);
+        lx::trace("nc cat stopped");
     }
     off_t pos = -1;
     struct stat st = {};
@@ -526,10 +530,12 @@ static void nc_file_job(NcJob *j, int pidfd, int dupfd, int sfd) {
         if (fstat(dupfd, &st) == 0 && pos >= 0 && st.st_size - pos >= NC_MIN_REST && lseek(dupfd, 0, SEEK_END) >= 0) handed_over = true;
     }
     if (cat_stopped) syscall(SYS_pidfd_send_signal, pidfd, SIGCONT, NULL, 0);
+    lx::trace("nc cat continued", handed_over);
     if (handed_over) {
         struct pollfd p = {pidfd, POLLIN, 0};
         bool gone = false;
         while (!t->stop.load() && !(gone = poll(&p, 1, 50) > 0)) {}
+        lx::trace("nc cat gone", gone);
         if (gone) {
             char state; pid_t pp; long code = 0;
             bool signaled = nc_stat(j->cat, &state, &pp, NULL, &code) && (code & 0x7f) != 0;  /* Ctrl-C: do not finish the file */
@@ -613,6 +619,7 @@ static void *nc_main(void *arg) {
     NcJob *j = static_cast<NcJob*>(arg);
     TermCore *t = j->t;
     prctl(PR_SET_NAME, "lx-cat", 0, 0, 0);
+    lx::trace("nc job start");
     int pidfd = (int)syscall(SYS_pidfd_open, j->cat, 0);
     int dupfd = pidfd >= 0 ? (int)syscall(SYS_pidfd_getfd, pidfd, j->fdnum, 0) : -1;
     char slave[128];
@@ -625,6 +632,7 @@ static void *nc_main(void *arg) {
     if (dupfd >= 0) close(dupfd);
     if (pidfd >= 0) close(pidfd);
     free(j);
+    lx::trace("nc job end");
     t->nc.busy.store(0);
     return NULL;
 }
@@ -644,7 +652,9 @@ static void nc_probe(TermCore *t) {
     t->nc.last = fg;
     NcJob *j = static_cast<NcJob*>(calloc(1, sizeof *j));
     if (!j) return;
+    lx::trace("probe: foreground job");
     if (!nc_find(t, fg, j)) { free(j); return; }
+    lx::trace("probe: cat found");
     nc_join(t);
     t->nc.busy.store(1);
     if (pthread_create(&t->nc.th, NULL, nc_main, j) != 0) { t->nc.busy.store(0); free(j); return; }
@@ -655,9 +665,11 @@ static void feed_sliced(TermCore *t, const uint8_t *p, size_t n, bool notify) {
     const size_t SLICE = notify ? 512 * 1024 : 64 * 1024;
     while (n) {
         size_t k = n < SLICE ? n : SLICE;
+        lx::trace("feed slice", (long)k);
         LOCK(t);
         vt_feed(t->vt, p, k);
         UNLOCK(t);
+        lx::trace("feed slice done");
         p += k; n -= k;
         if (notify) { t->bytes_fed.fetch_add(k); t->act_flag.store(1); wake_ui(t); }
         for (int spin = 0; t->ui_waiting.load(std::memory_order_relaxed) > 0 && spin < 2000; spin++) sched_yield();
@@ -690,6 +702,7 @@ static void stream_pipe(TermCore *t) {
 }
 
 static void stream_file(TermCore *t, const char *path, uint64_t off, uint64_t len, unsigned flags) {
+    lx::trace("stream_file");
     if (flags & NC_FLAG_PIPE) { stream_pipe(t); return; }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
     if (fd < 0) return;
@@ -747,6 +760,7 @@ static void *reader_main(void *data) {
             if (stop) return NULL;
             ssize_t n = read(t->pty.fd, t->iob[slot].data, 65536);
             if (n > 0) {
+                lx::trace("pty read", (long)n);
                 rawlog(t->iob[slot].data, (size_t)n);
                 pthread_mutex_lock(&t->iom);
                 t->iob[slot].n = (size_t)n; t->io_count++;
@@ -857,6 +871,7 @@ static void *worker_main(void *data) {
             for (;;) {
                 ssize_t n = read(t->pty.fd, buf, 65536);
                 if (n > 0) {
+                    lx::trace("pty read", (long)n);
                     rawlog(buf, (size_t)n);
                     if (t->fastcat_token[0]) feed_output(t, buf, (size_t)n);
                     else feed_sliced(t, buf, (size_t)n, false);
