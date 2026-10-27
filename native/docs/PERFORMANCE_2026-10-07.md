@@ -198,3 +198,70 @@ Question: should `--lite` use fewer resources than the normal window at the same
 - Flood after the change (6 interleaved runs per variant): normal 6.40-6.82 s (before 6.22-6.77), lite 6.28-6.63 s (before 6.91-7.18): no regression; compositor CPU the same or lower.
 - Checks: `make test` and `xvfb-run -a make test-gui` pass.
 - Not done: the stats text is still rebuilt every tick (five `/proc` reads); the tick could back off when nothing changed.
+
+## Profile and baseline of 0.4.1, no code change (2026-10-27, i5-8500 2 cores, Xvfb 1024x768 + llvmpipe, GCC 14.2)
+
+Commands (scratchpad scripts, not in the repo): `run.sh BIN {empty|seq|log|redraw|colour} FILE` runs `lestrix --local --flood FILE` and prints flood time, user+sys CPU from `times`, wall; `run.sh BIN idle 20` prints CPU, wake-ups/s, RSS, PSS after 6 s. Files from `bench/gen_workloads.py`. `make test` passed before any measurement.
+
+| Workload (5 runs) | flood time | CPU user+sys |
+|---|---|---|
+| empty file (start-up only) | 0.01 s | 0.17-0.185 s |
+| seq, 31 MB | 0.17-0.25 s | 0.34-0.37 s |
+| log, 107 MB | 0.15-0.20 s | 0.31-0.41 s |
+| redraw, 14 MB | 0.05-0.06 s | 0.22-0.23 s |
+| colour, 40 MB | 0.15-0.22 s | 0.30-0.39 s |
+
+Idle, 20 s, 3 runs: 6.2-7.3 ms CPU, 9.2-9.6 wake-ups/s (half of them llvmpipe threads, software GL only), PSS 69.4 MB (anon 45, file 22, shmem 2), RSS 135 MB. In the main thread: one 3 s idle-bar tick (6 failed theme `stat`s, 5 `/proc` reads, one frame). Engine bench: 1502 / 899 / 743 / 380 MB/s (no scrollback / 10,000 lines / unlimited / colour).
+
+Callgrind, `--run "seq 1 1500000"`, `--separate-threads=yes`, 4.58 G Ir total. 2.9 G is llvmpipe JIT (not ours). Main thread 734 M: dynamic relocation of 105 libraries 108 M (gallium, LLVM; driver-bound), `write_ppm` of the `--shot` 127 M (harness artifact). Parse thread 950 M for 1.5 M lines, about 630 Ir per 8-byte line: `feed_serial` 202, `hist_add` 119, `hist_push` 57, `clear_row` 57, `pack_oldest` 55, `region_up` 53, `do_linefeed` 35, memmove 35. Short rows (< 32 cells) take the generic `hist_add` path; compact bookkeeping for them was already measured at -20% and rejected (round of 2026-10-08).
+
+Result: no new hot spot outside the already-tuned serial path and the driver start-up, so nothing was changed and no speed claim is made. Not measured: real-GPU frame cost, region_up as a ring offset (candidate, at most 8% of the parse thread's instructions, memory-bound so likely less).
+
+## region_up row-order window (2026-10-27, same machine)
+
+Change: a full-screen scroll slides a window over a 2*rows array (`Scr.ordbuf`) instead of moving the row-order entries; the window is moved back once per screenful. Partial scroll regions keep the old loop.
+
+- Engine bench (`tests/bench_vt`, 17 interleaved runs, medians, MB/s): no scrollback 1492 -> 1601 (+7%), 10,000-line scrollback 892 -> 936 (+5%), colour-heavy 383 -> 387 (no regression; the earlier 369 was noise, spread 277-417 on both). An earlier 9-run set gave 1480 -> 1563 and 841 -> 951.
+- GUI flood (Xvfb + llvmpipe, 5 interleaved runs, flood time median / CPU median): seq 0.19 -> 0.22 s / 0.37 -> 0.38 s (ranges 0.18-0.23 and 0.20-0.23, overlapping), log 0.14 -> 0.14 s / 0.30 -> 0.31 s, colour 0.12 -> 0.12 s / 0.32 -> 0.31 s. No end-to-end gain; the parse thread is not the limit of the GUI flood. The redraw workload did not finish in the harness (both binaries), so it is not measured.
+- Checks: full `make test` passes; the pyte differential gives the same 57 mismatching seeds (of 1500) on the 0.4.1 baseline and on the change, so they are pyte differences, not this change. Mutation check: forgetting to move the window back and an off-by-one in the 2*rows bound fail `test-vt`; using the window for a region one row shorter than the screen was NOT caught, so `test_scroll_window_slide` was added to `tests/test_vt.cpp` and now fails on that mutation.
+- Result: a measured engine gain, no measured GUI gain, so no speed claim for the app. Keep or reject is the owner's decision; no README progression row until then.
+
+## Remaining candidates after the 2026-10-27 round (none measured, none started)
+
+- Idle stats tick: back off when nothing changed (stats text is rebuilt every 3 s from five `/proc` reads and six failed theme `stat`s). Main thread uses 4.7 ms CPU per 20 s, so the gain is small.
+- GUI flood is not parse-bound (engine +7% gave no flood change): the next lever is the render and upload path or the main thread, not `vt.cpp`. Needs a profile of the flood on the main and llvmpipe threads first.
+- Redraw workload: fix the harness (it never finishes on either binary) before judging it.
+- Real-GPU frame cost: all numbers are Xvfb + llvmpipe; unmeasured on hardware GL.
+- Closed, do not retry without new evidence: compact bookkeeping for short rows (-20%, 2026-10-08), `-fno-plt`, `-march=native`, LTO, PGO, BOLT.
+
+## Redraw harness and render-path profile (2026-10-27, no code change)
+
+- Redraw flood "never finishes": cause found. `bench/gen_workloads.py redraw` ends the file mid-row with no newline, so the harness's `echo FLOOD_DONE_42` lands on the last screen row and is overwritten or wrapped, and `--flood` never sees the marker. Fix for the harness only: append `\r\n` to a copy of the file (the generator is left alone because the file bytes are the shared input of the terminal comparison). With the copy: redraw 14 MB, 7 interleaved runs, flood time median 0.04 s (base, range 0.04-0.06) vs 0.05 s (new, 0.05-0.07), CPU 0.23 vs 0.21 s: no difference between 0.4.1 and the region_up window change.
+- Render-path profile: `perf` is blocked here (`perf_event_paranoid` = 3, lowering it needs root). Callgrind (`--separate-threads=yes`, `seq 1 1500000`, `--shot`) gave 831 M Ir in total: main thread 577 M, of which dynamic linking 86 M, `memset` 45 M and `fwrite` 66 M (the `--shot` PPM write, a harness artifact), D-Bus and fontconfig start-up about 60 M; a font-config helper thread 140 M; the parse thread only 72 M (`feed_serial` 23 M, `hist_add` 14 M); llvmpipe 42 M. No render or upload function reaches the top of any thread. Caveat: valgrind slows every thread, so far fewer frames are drawn than in a real flood, so this shows where the instructions go in start-up and parsing, not the per-frame cost of a real flood.
+- Result: no hot spot found in the render path with the tools available; the 31 MB flood takes 0.19 s end to end (about 160 MB/s) against 1600 MB/s for the engine alone, and the profile does not say where the rest goes. Needs a wall-clock view (per-thread timestamps or `strace -c -f -T` of the pty read and swap calls), not an instruction count. Not done.
+- `strace -f -c` of the seq flood (0.44 s under strace): futex 63% of syscall time (1173 calls, threads blocked waiting), wait4 11%, poll 3.7%, write 3.7%, read 2%. These are blocking times summed over all threads, so they show idle waiting, not cost; no syscall stands out as work. Per-thread timestamps (frame start, upload, swap, parse hand-off) would be needed to find where the 0.19 s goes. Not done.
+
+## Where the flood time goes: LX_TRACE (2026-10-27)
+
+Tool: `src/trace.h`, `LX_TRACE=1 lestrix --local --flood FILE` records timestamped events from all threads (send, native-cat job, feed slices, pty reads, loop wake, frame begin/built/r_end/swapped, marker seen) and prints them sorted to stderr when the flood finishes. Off by default: one relaxed load and a branch per call site. Cost check, seq flood, 6 interleaved runs: without the tracer 0.20 s (0.18-0.33) / CPU 0.35 s, tracer built in but off 0.20 s (0.18-0.21) / 0.36 s: no difference. `make test` passes.
+
+seq flood, 31 MB (about 3.9 M lines of 8 bytes), one traced run, ms after the command was sent:
+
+| step | at | what |
+|---|---|---|
+| command sent | 0 | `cat FILE; echo ...` typed into the pty |
+| native-cat job starts | 50 | shell has forked cat, the probe found it |
+| native-cat request | 78 | shell and cat stopped, cat's file offset moved to the end, cat gone, `OSC 7777` sent |
+| first feed slice | 78 | reader thread starts feeding 512 KB slices |
+| last feed slice done | 241 | 58 slices, 154.5 ms of it inside `vt_feed` |
+| marker seen | 241.5 | 0.08 ms after the last slice |
+
+- Parse-bound, not render-bound: 155 of the 163 ms of feeding is the engine itself. 31 MB in 155 ms is 200 MB/s because these are 8-byte lines (about 630 instructions per line); the 1600 MB/s of the engine bench is for 70-byte lines. The two numbers were never comparable, so the "160 vs 1600 MB/s gap" was not a gap.
+- Fixed take-over cost: 78 ms from sending the command to the first byte fed (50 ms until the job starts, 28 ms for the stop, offset move and exit of cat). It is paid once per `cat`, so it matters for small files and not for large ones.
+- Frames during the flood: 12 swaps; build 0.2-27 ms (27 ms is the first frame, glyph atlas warm-up), mid-flood 0.2-4 ms plus 1.5-7 ms in `r_end` and swap; they overlap the feeding on other threads and do not delay the marker.
+- Open (not measured): what the 50 ms before the job starts is (shell fork/exec of cat versus the 3-frames-per-loop probe interval), and the line-rate cost `hist_add` + `hist_push` + `pack_oldest` + `clear_row` for short lines, already the subject of rejected work (2026-10-08).
+
+## LP_NUM_THREADS and the cat take-over, measured (2026-10-27, 2 cores)
+
+- `LP_NUM_THREADS` (llvmpipe worker threads; default = 2 here), 5 interleaved runs per cell, flood time median / CPU median: seq 0.23 / 0.37 s (default), 0.19 / 0.37 (1 thread), 0.20 / 0.38 (2 threads); colour 0.16 / 0.33, 0.14 / 0.31, 0.14 / 0.32; redraw 0.05 / 0.21, 0.05 / 0.20, 0.05 / 0.22. Ranges overlap in every row (the default's range is the widest, 0.19-0.25 on seq), so no measured win: rejected, nothing changed. Not measured: idle CPU and wake-ups with a single thread.
+- Take-over, 3 traced runs, ms after the command was sent: foreground job seen by the probe 9.5-15.4 (the shell forks and execs cat and cat's first 4096+ byte write arrives), shell and cat stopped within 1 ms, then 11-30 ms until cat is gone (after SIGCONT it finishes writing its in-flight chunk through the pty and exits), request sent 27-40 ms, marker 210-260 ms. The earlier "50 ms until the job starts" was inflated by the busy first frames of a traced run; the real fixed cost is 27-40 ms, of which the stop dance is under 1 ms (the 0.5 ms `nanosleep` polling in `nc_wait_stopped` is not a cost). Nothing in it can be cut safely: the first part is the shell's own fork and exec, the second is cat draining data it already read. Flood time is 80% feeding the engine.

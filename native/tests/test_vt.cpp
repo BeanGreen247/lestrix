@@ -102,6 +102,27 @@ static void test_scroll_region(void) {
     vt_free(t);
 }
 
+static void test_scroll_window_slide(void) {
+    /* full-screen scrolls slide a window over the row order; run past several screenfuls with partial regions in between */
+    Vt *t = vt_new(6, 5, 50);
+    char ln[16];
+    int n = 0;
+    for (int round = 0; round < 4; round++) {
+        for (int i = 0; i < 13; i++) { snprintf(ln, sizeof ln, "L%d\r\n", n++); feed(t, ln); }
+        snprintf(ln, sizeof ln, "L%d", n++); feed(t, ln);
+        /* last five lines are n-5 .. n-1 */
+        for (int r = 0; r < 5; r++) { char want[16]; snprintf(want, sizeof want, "L%d", n - 5 + r); ROW(t, r, want); }
+        feed(t, "\x1b[2;5r\x1b[5;1H\n\x1b[r");   /* region one row shorter than the screen, top > 0 */
+        { char a[16], b[16], c[16]; snprintf(a, sizeof a, "L%d", n - 5); snprintf(b, sizeof b, "L%d", n - 3); snprintf(c, sizeof c, "L%d", n - 2);
+          ROW(t, 0, a); ROW(t, 1, b); ROW(t, 2, c); ROW(t, 4, ""); }
+        feed(t, "\x1b[1;4r\x1b[4;1H\n\x1b[r");   /* and one ending above the last row */
+        { char a[16], c[16]; snprintf(a, sizeof a, "L%d", n - 3); snprintf(c, sizeof c, "L%d", n - 2);
+          ROW(t, 0, a); ROW(t, 1, c); ROW(t, 3, ""); }
+        feed(t, "\x1b[5;1H\r\n");
+    }
+    vt_free(t);
+}
+
 static void test_save_restore(void) {
     Vt *t = vt_new(10, 4, 0);
     feed(t, "\x1b[2;5H\x1b[31m\x1b" "7\x1b[H\x1b[0m\x1b" "8");
@@ -476,7 +497,7 @@ int main(void) {
     test_history_segments();
     test_stream_requests();
     test_basic_and_wrap(); test_scrollback_ring(); test_insert_delete_lines(); test_edit_chars_at_pending_wrap();
-    test_scroll_region(); test_save_restore(); test_alt_screen(); test_colours(); test_wide_and_combining();
+    test_scroll_region(); test_scroll_window_slide(); test_save_restore(); test_alt_screen(); test_colours(); test_wide_and_combining();
     test_graphics_charset(); test_replies_and_events(); test_modes(); test_resize(); test_utf8_split_and_invalid();
     test_dirty_and_cache(); test_compact_history_and_styles(); test_scroll_keeps_caches_attached();
     test_history_blocks_roundtrip(); test_history_limit_and_runtime_change(); test_history_spill_to_disk();
