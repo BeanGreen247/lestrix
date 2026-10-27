@@ -45,7 +45,8 @@ enum { CS_US = 0, CS_GRAPHICS = 1 };
 typedef struct {
     VtCell *cells;
     VtLineMeta *meta;
-    int *order;
+    int *order;      /* window of rows entries into ordbuf (2*rows ints); a full-screen scroll slides it by one */
+    int *ordbuf;
     uint8_t *sh;
 } Scr;
 
@@ -311,7 +312,8 @@ static unsigned comb_index(Vt *t, uint32_t cp) {
 static void scr_alloc(Scr *s, int cols, int rows) {
     s->cells = static_cast<VtCell*>(calloc((size_t)cols * (size_t)rows, sizeof(VtCell)));
     s->meta = static_cast<VtLineMeta*>(calloc((size_t)rows, sizeof(VtLineMeta)));
-    s->order = static_cast<int*>(malloc((size_t)rows * sizeof(int)));
+    s->ordbuf = static_cast<int*>(malloc((size_t)rows * 2 * sizeof(int)));
+    s->order = s->ordbuf;
     s->sh = static_cast<uint8_t*>(malloc((size_t)cols * (size_t)rows));
     for (int i = 0; i < rows; i++) { s->order[i] = i; s->meta[i].dirty = 1; }
 }
@@ -326,7 +328,7 @@ static void scr_release_caches(Vt *t, Scr *s, int rows) {
 
 static void scr_free(Vt *t, Scr *s, int rows) {
     scr_release_caches(t, s, rows);
-    free(s->cells); free(s->meta); free(s->order); free(s->sh);
+    free(s->cells); free(s->meta); free(s->ordbuf); free(s->sh);
     memset(s, 0, sizeof *s);
 }
 
@@ -1146,9 +1148,16 @@ static void region_up(Vt *t, int top, int bottom, int n) {
     if (n <= 0) return;
     int *ord = t->cur->order;
     if (n == 1) {
+        Scr *sc = t->cur;
         int first = ord[top];
-        for (int i = top; i < bottom; i++) ord[i] = ord[i + 1];
-        ord[bottom] = first;
+        if (span == t->rows) {
+            /* whole screen: slide the window instead of moving the entries, move them back once per screenful */
+            if (ord + t->rows < sc->ordbuf + 2 * (size_t)t->rows) { ord[t->rows] = first; sc->order = ord + 1; }
+            else { memmove(sc->ordbuf, ord + 1, (size_t)(t->rows - 1) * sizeof(int)); sc->ordbuf[t->rows - 1] = first; sc->order = sc->ordbuf; }
+        } else {
+            for (int i = top; i < bottom; i++) ord[i] = ord[i + 1];
+            ord[bottom] = first;
+        }
         clear_row(t, bottom);
         return;
     }
