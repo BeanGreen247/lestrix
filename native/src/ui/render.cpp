@@ -5,12 +5,16 @@
 
 #include "render.h"
 
+#include <math.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "gl.h"
 #include "soft.h"
+
+#include <vector>
 
 typedef struct { float x, y, u, v; uint32_t rgba; float lx, ly, sw, sh, ar, ab; } V2;
 #define MAXQ 16384
@@ -27,6 +31,26 @@ struct Renderer {
     int clip_on, cx, cy, cw, ch;
     SoftTarget st;   /* software rendering target, set by r_set_target before each frame */
     SoftClip sclip;
+    struct SoftState *ss;
+};
+
+/* Software rendering keeps the pixels of the previous frame and repaints only what changed. The window is cut into
+ * tiles; every instance mixes a hash of itself (and its clip) into the tiles it touches, in draw order, so a tile whose
+ * hash is the same as last frame would be painted identically and is skipped. Painted tiles of a row are merged into
+ * runs, cleared to the background and redrawn from the instances that touch that row. */
+enum { TILE = 32 };
+struct SoftState {
+    std::vector<RInst> inst;
+    std::vector<uint16_t> clipid;
+    std::vector<SoftClip> clips;
+    uint16_t cur_clip = 0;
+    std::vector<uint64_t> prev, cur;
+    std::vector<uint8_t> dirty;
+    std::vector<std::vector<uint32_t>> bins;
+    std::vector<RDamage> damage;
+    uint32_t bg = 0, prev_bg = 0, prev_gen = 0;
+    SoftTarget prev_t{};
+    bool invalid = true;
 };
 
 #define SDF_BODY \
@@ -129,7 +153,7 @@ Renderer *r_new(Atlas *a) {
     Renderer *r = static_cast<Renderer*>(calloc(1, sizeof *r));
     if (!r) return NULL;
     r->atlas = a;
-    if (sd_soft) return r;
+    if (sd_soft) { r->ss = new SoftState(); return r; }
     GLuint vs, fs;
     if (sd_gl_kind == GLK_ES2) { vs = compile_src(GL_VERTEX_SHADER, "", VS2); fs = compile_src(GL_FRAGMENT_SHADER, "", FS2); }
     else { vs = compile_src(GL_VERTEX_SHADER, glsl_head(), VS3); fs = compile_src(GL_FRAGMENT_SHADER, glsl_head(), FS3); }
@@ -187,6 +211,7 @@ Renderer *r_new(Atlas *a) {
 
 void r_free(Renderer *r) {
     if (!r) return;
+    delete r->ss;
     free(r->buf);
     free(r->v2);
     free(r);
@@ -196,7 +221,13 @@ Atlas *r_atlas(Renderer *r) { return r->atlas; }
 
 void r_begin(Renderer *r, int w, int h, uint32_t clear_rgba) {
     r->w = w; r->h = h; r->n = 0; r->clip_on = 0;
-    if (sd_soft) { r->sclip.on = 0; if (r->st.px) soft_clear(&r->st, clear_rgba); return; }
+    if (sd_soft) {
+        SoftState *s = r->ss;
+        r->sclip.on = 0;
+        s->inst.clear(); s->clipid.clear(); s->clips.assign(1, SoftClip{0, 0, 0, 0, 0}); s->cur_clip = 0;
+        s->bg = clear_rgba;
+        return;
+    }
     glViewport(0, 0, w, h);
     glDisable(GL_SCISSOR_TEST);
     glClearColor((clear_rgba & 255) / 255.f, ((clear_rgba >> 8) & 255) / 255.f, ((clear_rgba >> 16) & 255) / 255.f, 1.f);
@@ -242,8 +273,10 @@ void r_set_target(Renderer *r, uint32_t *px, int w, int h, int pitch_px, int rs,
 
 void r_flush(Renderer *r) {
     if (!r->n) return;
-    if (sd_soft) {
-        if (r->st.px) soft_draw(&r->st, &r->sclip, r->buf, r->n, atlas_cpu(r->atlas), atlas_size(r->atlas), atlas_color_cpu(r->atlas), atlas_color_size(r->atlas));
+    if (sd_soft) {   /* drawing is deferred to r_end, where the whole frame is known */
+        SoftState *s = r->ss;
+        s->inst.insert(s->inst.end(), r->buf, r->buf + r->n);
+        s->clipid.insert(s->clipid.end(), r->n, s->cur_clip);
         r->n = 0;
         return;
     }
@@ -269,17 +302,137 @@ void r_flush(Renderer *r) {
     r->n = 0;
 }
 
-void r_end(Renderer *r) { r_flush(r); }
+static inline uint64_t mix64(uint64_t h, uint64_t v) { h ^= v; h *= 0x9E3779B97F4A7C15ull; return h ^ (h >> 29); }
+
+static uint64_t inst_hash(const RInst &q, const SoftClip &c) {
+    uint64_t w[4];
+    memcpy(w, &q, sizeof w);   /* RInst is 32 bytes */
+    uint64_t h = 0x243F6A8885A308D3ull;
+    for (int i = 0; i < 4; i++) h = mix64(h, w[i]);
+    if (c.on) h = mix64(mix64(h, (uint64_t)(uint32_t)c.x << 32 | (uint32_t)c.y), (uint64_t)(uint32_t)c.w << 32 | (uint32_t)c.h);
+    return h;
+}
+
+static void soft_finish(Renderer *r) {
+    SoftState *s = r->ss;
+    const SoftTarget &t = r->st;
+    s->damage.clear();
+    if (!t.px || t.w <= 0 || t.h <= 0) return;
+    const int tw = (t.w + TILE - 1) / TILE, th = (t.h + TILE - 1) / TILE;
+    const uint32_t gen = atlas_generation(r->atlas);
+    bool full = s->invalid || s->prev.size() != (size_t)tw * th || s->prev_t.px != t.px || s->prev_t.w != t.w || s->prev_t.h != t.h ||
+                s->prev_t.pitch != t.pitch || s->prev_t.rs != t.rs || s->prev_t.gs != t.gs || s->prev_t.bs != t.bs || s->bg != s->prev_bg || gen != s->prev_gen;
+    const uint64_t seed = mix64(0x13198A2E03707344ull, s->bg);
+    s->cur.assign((size_t)tw * th, seed);
+    const size_t n = s->inst.size();
+    for (size_t i = 0; i < n; i++) {   /* pass 1: hash every tile */
+        const RInst &q = s->inst[i];
+        const SoftClip &c = s->clips[s->clipid[i]];
+        float fx0 = q.x, fy0 = q.y, fx1 = q.x + q.w, fy1 = q.y + q.h;
+        if (c.on) { if (fx0 < c.x) fx0 = (float)c.x; if (fy0 < c.y) fy0 = (float)c.y; if (fx1 > c.x + c.w) fx1 = (float)(c.x + c.w); if (fy1 > c.y + c.h) fy1 = (float)(c.y + c.h); }
+        if (fx0 < 0) fx0 = 0;
+        if (fy0 < 0) fy0 = 0;
+        if (fx1 > (float)t.w) fx1 = (float)t.w;
+        if (fy1 > (float)t.h) fy1 = (float)t.h;
+        if (!(fx1 > fx0) || !(fy1 > fy0)) continue;
+        int tx0 = (int)fx0 / TILE, ty0 = (int)fy0 / TILE, tx1 = ((int)ceilf(fx1) - 1) / TILE, ty1 = ((int)ceilf(fy1) - 1) / TILE;
+        if (tx1 >= tw) tx1 = tw - 1;
+        if (ty1 >= th) ty1 = th - 1;
+        uint64_t ih = inst_hash(q, c);
+        for (int ty = ty0; ty <= ty1; ty++) {
+            uint64_t *row = &s->cur[(size_t)ty * tw];
+            for (int tx = tx0; tx <= tx1; tx++) row[tx] = mix64(row[tx], ih);
+        }
+    }
+    s->dirty.assign((size_t)tw * th, 1);
+    size_t ndirty = (size_t)tw * th;
+    if (!full) {
+        ndirty = 0;
+        for (size_t k = 0; k < s->dirty.size(); k++) { s->dirty[k] = s->cur[k] != s->prev[k]; ndirty += s->dirty[k]; }
+    }
+    if (ndirty) {
+        const uint8_t *amono = atlas_cpu(r->atlas);
+        const int asz = atlas_size(r->atlas), csz = atlas_color_size(r->atlas);
+        const uint32_t *acol = atlas_color_cpu(r->atlas);
+        s->bins.resize((size_t)th);
+        for (int ty = 0; ty < th; ty++) s->bins[ty].clear();
+        std::vector<char> rowdirty((size_t)th, 0);
+        for (int ty = 0; ty < th; ty++) for (int tx = 0; tx < tw; tx++) if (s->dirty[(size_t)ty * tw + tx]) { rowdirty[ty] = 1; break; }
+        for (size_t i = 0; i < n; i++) {   /* pass 2: instances per tile row, in draw order, only rows that repaint */
+            const RInst &q = s->inst[i];
+            int ty0 = (int)floorf(q.y) / TILE, ty1 = (int)ceilf(q.y + q.h) / TILE;
+            if (q.y < 0) ty0 = 0;
+            if (ty0 < 0) ty0 = 0;
+            if (ty1 >= th) ty1 = th - 1;
+            for (int ty = ty0; ty <= ty1; ty++) if (rowdirty[ty]) s->bins[ty].push_back((uint32_t)i);
+        }
+        for (int ty = 0; ty < th; ty++) {
+            if (!rowdirty[ty]) continue;
+            for (int tx = 0; tx < tw;) {
+                if (!s->dirty[(size_t)ty * tw + tx]) { tx++; continue; }
+                int tx1 = tx;
+                while (tx1 + 1 < tw && s->dirty[(size_t)ty * tw + tx1 + 1]) tx1++;
+                int x0 = tx * TILE, x1 = (tx1 + 1) * TILE < t.w ? (tx1 + 1) * TILE : t.w;
+                int y0 = ty * TILE, y1 = (ty + 1) * TILE < t.h ? (ty + 1) * TILE : t.h;
+                soft_clear_rect(&t, x0, y0, x1, y1, s->bg);
+                for (uint32_t i : s->bins[ty]) {
+                    SoftClip c = s->clips[s->clipid[i]];
+                    int cx0 = x0, cy0 = y0, cx1 = x1, cy1 = y1;
+                    if (c.on) { if (c.x > cx0) cx0 = c.x; if (c.y > cy0) cy0 = c.y; if (c.x + c.w < cx1) cx1 = c.x + c.w; if (c.y + c.h < cy1) cy1 = c.y + c.h; }
+                    if (cx1 <= cx0 || cy1 <= cy0) continue;
+                    SoftClip run{1, cx0, cy0, cx1 - cx0, cy1 - cy0};
+                    soft_draw(&t, &run, &s->inst[i], 1, amono, asz, acol, csz);
+                }
+                s->damage.push_back(RDamage{x0, y0, x1 - x0, y1 - y0});
+                tx = tx1 + 1;
+            }
+        }
+    }
+    static const bool verify = getenv("LESTRIX_SOFT_VERIFY") != NULL;
+    if (verify) {   /* test aid: paint the whole frame from scratch and compare with the incrementally painted one */
+        std::vector<uint32_t> ref((size_t)t.w * t.h);
+        SoftTarget rt = t;
+        rt.px = ref.data(); rt.pitch = t.w;
+        soft_clear(&rt, s->bg);
+        for (size_t i = 0; i < n; i++) soft_draw(&rt, &s->clips[s->clipid[i]], &s->inst[i], 1, atlas_cpu(r->atlas), atlas_size(r->atlas), atlas_color_cpu(r->atlas), atlas_color_size(r->atlas));
+        for (int y = 0; y < t.h; y++)
+            if (memcmp(ref.data() + (size_t)y * t.w, t.px + (size_t)y * t.pitch, (size_t)t.w * 4)) {
+                int x = 0;
+                while (ref[(size_t)y * t.w + x] == t.px[(size_t)y * t.pitch + x]) x++;
+                fprintf(stderr, "soft damage mismatch: frame differs from a full repaint at %d,%d (full=%d dirty tiles=%zu)\n", x, y, (int)full, ndirty);
+                if (!strcmp(getenv("LESTRIX_SOFT_VERIFY"), "fatal")) _exit(3);   /* make test-gui fails on a mismatch */
+                break;
+            }
+    }
+    s->prev.swap(s->cur);
+    s->prev_t = t; s->prev_bg = s->bg; s->prev_gen = gen; s->invalid = false;
+}
+
+const RDamage *r_damage(const Renderer *r, size_t *n) {
+    *n = r->ss ? r->ss->damage.size() : 0;
+    return r->ss && !r->ss->damage.empty() ? r->ss->damage.data() : NULL;
+}
+
+void r_soft_invalidate(Renderer *r) { if (r->ss) r->ss->invalid = true; }
+
+void r_end(Renderer *r) {
+    r_flush(r);
+    if (sd_soft) soft_finish(r);
+}
 
 void r_clip(Renderer *r, int x, int y, int w, int h) {
     r_flush(r);
     r->clip_on = 1;
-    if (sd_soft) { r->sclip = SoftClip{1, x, y, w < 0 ? 0 : w, h < 0 ? 0 : h}; return; }
+    if (sd_soft) { r->sclip = SoftClip{1, x, y, w < 0 ? 0 : w, h < 0 ? 0 : h}; r->ss->clips.push_back(r->sclip); r->ss->cur_clip = (uint16_t)(r->ss->clips.size() - 1); return; }
     glEnable(GL_SCISSOR_TEST);
     glScissor(x, r->h - (y + h), w < 0 ? 0 : w, h < 0 ? 0 : h);
 }
 
-void r_clip_off(Renderer *r) { r_flush(r); if (sd_soft) r->sclip.on = 0; else glDisable(GL_SCISSOR_TEST); r->clip_on = 0; }
+void r_clip_off(Renderer *r) {
+    r_flush(r);
+    if (sd_soft) { r->sclip.on = 0; r->ss->cur_clip = 0; } else glDisable(GL_SCISSOR_TEST);
+    r->clip_on = 0;
+}
 
 static void grow(Renderer *r, size_t extra) {
     if (r->n + extra <= r->cap) return;

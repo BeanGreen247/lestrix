@@ -87,11 +87,17 @@ static void draw_rrect(const SoftTarget *t, const Fmt &f, const RInst &in, Rect 
 
 }  // namespace
 
-void soft_clear(const SoftTarget *t, uint32_t rgba) {
+void soft_clear_rect(const SoftTarget *t, int x0, int y0, int x1, int y1, uint32_t rgba) {
     Fmt f{t->rs, t->gs, t->bs};
     uint32_t c = pack(f, rgba & 255, (rgba >> 8) & 255, (rgba >> 16) & 255) | t->amask;
-    for (int y = 0; y < t->h; y++) fill_span(t->px + (size_t)y * t->pitch, t->w, c);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > t->w) x1 = t->w;
+    if (y1 > t->h) y1 = t->h;
+    for (int y = y0; y < y1; y++) fill_span(t->px + (size_t)y * t->pitch + x0, x1 - x0, c);
 }
+
+void soft_clear(const SoftTarget *t, uint32_t rgba) { soft_clear_rect(t, 0, 0, t->w, t->h, rgba); }
 
 void soft_draw(const SoftTarget *t, const SoftClip *clip, const RInst *in, size_t n, const uint8_t *atlas, int asize,
                const uint32_t *catlas, int csize) {

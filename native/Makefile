@@ -119,7 +119,7 @@ perf-gate: $(BUILD)/perf_gate
 	$(BUILD)/perf_gate
 
 test-gui: $(BUILD)/lestrix
-	@set -e; for mode in cpu gpu; do export LESTRIX_RENDER=$$mode; d=$$(mktemp -d); mkdir -p $$d/lestrix; \
+	@set -e; for mode in cpu gpu; do export LESTRIX_RENDER=$$mode LESTRIX_SOFT_VERIFY=fatal; d=$$(mktemp -d); mkdir -p $$d/lestrix; \
 	 for s in "w:0.5;s:$$d/a.ppm" "w:0.5;c:28,15;w:0.3;s:$$d/b.ppm" "w:0.5;c:303,56;w:0.4;t:name;k:escape;w:0.2;s:$$d/c.ppm" "w:0.5;d:800,600;w:0.6;c:900,46;w:0.3;d:900,46;w:0.6;s:$$d/e.ppm"; do \
 	   XDG_CONFIG_HOME=$$d timeout 30 $(BUILD)/lestrix --script "$$s" || { echo "test-gui: failed on $$s"; exit 1; }; \
 	 done; \

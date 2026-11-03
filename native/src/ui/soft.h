@@ -21,6 +21,7 @@ typedef struct {
 typedef struct { int on, x, y, w, h; } SoftClip;   /* top-left origin, pixels */
 
 void soft_clear(const SoftTarget *t, uint32_t rgba);
+void soft_clear_rect(const SoftTarget *t, int x0, int y0, int x1, int y1, uint32_t rgba);   /* half-open, clipped to the target */
 void soft_draw(const SoftTarget *t, const SoftClip *clip, const RInst *in, size_t n,
                const uint8_t *atlas, int asize, const uint32_t *catlas, int csize);
 #endif

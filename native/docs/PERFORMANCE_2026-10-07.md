@@ -305,3 +305,19 @@ Results (`flood_bench.sh`: lestrix in a window, `sleep 1.5; seq 1 3000000; touch
 Also: first frame 83 ms vs 180 ms, RSS 33 vs 137 MB, PSS 13 vs 74 MB, idle 10 vs 40 ms CPU per 6 s. Profile of the CPU renderer on the same flood: `seq` 44%, Lestrix main thread 39% (`soft_draw` 6%, `soft_clear` 3.8%, rest syscalls and X), `lx-io` 17%; the rasteriser is about a tenth of all samples, so the generator and the pty now dominate.
 
 Open: damage tracking (the whole frame is cleared and redrawn, and `SDL_UpdateWindowSurface` copies it all; a changed-rows rectangle list would cut `soft_clear`, the conversion blit and the X upload), row-parallel rasterising for 4K windows, Wayland and 24-bit X not measured, no real-GPU comparison.
+
+### CPU renderer: changed-tiles repaint (2026-11-03, later)
+
+Profile before: with one line rewritten in place (awk printing `\rcount N` 3 million times) the whole frame was cleared and redrawn every time, `soft_draw` 3.1% and `soft_clear` 2.2% of all samples plus the SDL conversion and upload of the whole window (about 12% in the flood profile). Change (`render.cpp`, `SoftState`): the frame is kept as an instance list (drawing deferred to `r_end`), the window is cut into 32x32 tiles, every instance mixes a hash of itself and its clip into the tiles it touches in draw order, and only tiles whose hash differs from the last frame are cleared and repainted (merged into runs per tile row, instances binned per row). The pixels of the previous frame persist in the surface (or the 32-bit back buffer). Full repaint is forced on first frame, size or surface change, new clear colour, atlas generation change and window expose/resize events. `app.cpp` presents only the repainted rectangles (`SDL_UpdateWindowSurfaceRects`; the back-buffer blit is restricted to them) and presents nothing for an unchanged frame.
+
+Correctness: `LESTRIX_SOFT_VERIFY=1` repaints every frame from scratch into a scratch buffer and compares it with the incrementally painted frame (`fatal` exits 3; `make test-gui` runs the CPU renderer with it). Zero mismatches over the GUI scripts and three floods (`seq`, in-place status line, `ls -la` dump); a mutated build that never repaints reports 22 mismatches, so the check bites.
+
+Results (A/B, `bench.sh` in `~/perf-data/lestrix-2026-11-03/`, 5 interleaved runs, CPU renderer both):
+
+| workload | before: wall / Lestrix CPU | after: wall / Lestrix CPU |
+|---|---|---|
+| in-place status line, 3M updates | 11.27 10.43 10.98 10.57 10.62 s (median 10.62) / 3230 2940 3150 3000 3030 ms (median 3030) | 8.56 9.28 8.72 8.75 8.85 s (median 8.75) / 1480 1570 1530 1490 1580 ms (median 1530) |
+| idle, 6 s | 30 ms | 0 ms |
+| `seq` flood, 3M lines | median 470 ms CPU (noisy 440-880) | median 540 ms (470-600): no change, every tile of the pane changes each frame |
+
+perf (499 Hz, same workload): Lestrix main thread 1302 samples before, 753 after (-42%); `soft_draw` falls out of the top symbols. Note the first version of the status workload was wrong (a literal `\r` made awk wrap and scroll the whole pane, so 65% of tiles were dirty); the awk program now lives in a file. Open: parallel rasterising for 4K windows, Wayland and 24-bit X untested, real GPU untested.

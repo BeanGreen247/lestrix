@@ -1340,6 +1340,9 @@ static void handle_event(App *a, SDL_Event *e) {
     switch (e->type) {
     case SDL_QUIT: a->running = false; break;
     case SDL_WINDOWEVENT:
+        if (a->soft && (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e->window.event == SDL_WINDOWEVENT_RESIZED || e->window.event == SDL_WINDOWEVENT_EXPOSED ||
+                        e->window.event == SDL_WINDOWEVENT_SHOWN || e->window.event == SDL_WINDOWEVENT_RESTORED || e->window.event == SDL_WINDOWEVENT_MAXIMIZED))
+            r_soft_invalidate(a->r);   /* the window surface may have lost its contents: repaint and present everything */
         if (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e->window.event == SDL_WINDOWEVENT_RESIZED) {
             if (a->soft) { SDL_Surface *s = SDL_GetWindowSurface(a->win); if (s) { a->W = s->w; a->H = s->h; } }
             else SDL_GL_GetDrawableSize(a->win, &a->W, &a->H);
@@ -1903,9 +1906,17 @@ int main(int argc, char **argv) {
                 write_ppm(a, shot);
                 a->running = false;
             }
-            if (a->soft) {
-                if (a->back) { SDL_Surface *ws = SDL_GetWindowSurface(a->win); if (ws) SDL_BlitSurface(a->back, NULL, ws, NULL); }
-                SDL_UpdateWindowSurface(a->win);
+            if (a->soft) {   /* present only the rectangles the renderer repainted; an unchanged frame presents nothing */
+                size_t nd = 0;
+                const RDamage *dm = r_damage(a->r, &nd);
+                if (nd) {
+                    static std::vector<SDL_Rect> rects;
+                    rects.resize(nd);
+                    for (size_t i = 0; i < nd; i++) rects[i] = SDL_Rect{dm[i].x, dm[i].y, dm[i].w, dm[i].h};
+                    SDL_Surface *ws = a->back ? SDL_GetWindowSurface(a->win) : nullptr;
+                    if (ws) for (const SDL_Rect &rc : rects) { SDL_Rect s = rc, d = rc; SDL_BlitSurface(a->back, &s, ws, &d); }
+                    SDL_UpdateWindowSurfaceRects(a->win, rects.data(), (int)nd);
+                }
             } else SDL_GL_SwapWindow(a->win);
             lx::trace("frame swapped");
             { double cost = now_s() - frame_t0; g_frame_cost = g_frame_cost == 0 ? cost : g_frame_cost * 0.9 + cost * 0.1; }
