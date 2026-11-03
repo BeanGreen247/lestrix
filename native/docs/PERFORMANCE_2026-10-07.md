@@ -321,3 +321,21 @@ Results (A/B, `bench.sh` in `~/perf-data/lestrix-2026-11-03/`, 5 interleaved run
 | `seq` flood, 3M lines | median 470 ms CPU (noisy 440-880) | median 540 ms (470-600): no change, every tile of the pane changes each frame |
 
 perf (499 Hz, same workload): Lestrix main thread 1302 samples before, 753 after (-42%); `soft_draw` falls out of the top symbols. Note the first version of the status workload was wrong (a literal `\r` made awk wrap and scroll the whole pane, so 65% of tiles were dirty); the awk program now lives in a file. Open: parallel rasterising for 4K windows, Wayland and 24-bit X untested, real GPU untested.
+
+### UI wake-up storm (2026-11-03, from `status2_after.data`)
+
+Profile (perf, `--fp`; flat and with `strace -c -f`): in the in-place status-line workload 63% of the UI thread's samples were inside system calls, 31% of it in syscall entry/exit alone (`syscall_return_via_sysret`, `entry_SYSRETQ_unsafe_stack`, `entry_SYSCALL_64`, plus mitigation work such as `clear_bhb_loop` on this VM). `strace -c` counted 82,269 `recvmsg` calls, 81,451 of them failing with EAGAIN, in 9 s; the stack (`strace -k`) was Xlib's `XEventsQueued` from SDL's event pump. Cause: the reader thread wakes the UI for every 0.2 ms of output (`tcore.cpp` `wake_ui`), up to 5000 wake-ups a second; while a frame was already due the UI thread woke, ran its whole loop (pump, timers, event poll with the X connection check) and went back to sleep until the next wake.
+
+Change (`app.cpp`): `frame_pending` is set while the UI thread sleeps with `a->dirty` set and cleared as soon as it wakes; `app_wake()` returns immediately while it is set. Output is written before `app_wake()` runs and the flag is cleared before the frame is built, so a skipped wake cannot leave output undrawn (the frame, due within one frame gap, re-reads everything).
+
+Results (A/B, `bench.sh`, CPU renderer both, 5 and 6 interleaved runs):
+
+| workload | before | after |
+|---|---|---|
+| in-place status line, 3M updates | 8.38 8.39 8.72 9.15 8.78 s; Lestrix CPU 1470 1450 1490 1610 1540 ms | 8.08 7.66 8.16 7.86 7.59 s; 440 400 430 410 410 ms |
+| `seq` flood, 3M lines | 2.10 2.14 2.01 1.94 1.83 1.06 s; 560 520 510 480 510 360 ms | 2.03 1.16 1.66 0.99 1.41 1.53 s; 300 250 270 250 270 290 ms |
+| idle, 6 s | 0 ms | 10 ms (noise) |
+
+perf after: UI thread 13.2% of all samples -> 2.5%; `recvmsg` calls 82,269 -> 8,827 and futex 227 -> 30 in 9 s. Echo latency (strace, echo read on the pty to the next X request from the UI thread, typed `q z x y k` in an idle shell, 4 runs each): before 0.8-12.8 ms, median about 0.9 ms; after 0.4-5.4 ms, median about 0.9 ms (strace overhead included in both): no regression. `make test`, `make test-gui` (both renderers) and `LESTRIX_SOFT_VERIFY` runs on a `seq` and a status-line workload pass.
+
+Left in the profile: `awk` and the pty are now 90% of the status workload; the reader thread does 20k `read` plus 20k `clock_nanosleep` (the 200 us read delay, tuned earlier) in 9 s; SDL's `XSync` after each present (a server round trip per frame) is the remaining UI-thread syscall cost; Xlib polls inside it.

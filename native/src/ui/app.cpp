@@ -37,8 +37,14 @@
 App *g_app;
 static Uint32 EV_WAKE;
 static std::atomic<int> wake_pending;
+/* Set while the UI thread sleeps with a frame already due: it re-reads all pending output when it wakes for that frame, so
+ * a wake-up per slice of output (up to 5000 a second during a flood) would only make it spin through its loop and poll the
+ * X connection for nothing. Output is written before app_wake() runs and the flag is cleared before the frame is built,
+ * so a wake that is skipped can never leave output undrawn. */
+static std::atomic<int> frame_pending;
 
 void app_wake(void) {
+    if (frame_pending.load(std::memory_order_acquire)) return;
     int exp = 0;
     if (wake_pending.compare_exchange_strong(exp, 1)) {
         SDL_Event e;
@@ -1844,7 +1850,10 @@ int main(int argc, char **argv) {
         }
         if (flood && flood_sent && wait > 2) wait = 2;
         if (wait > 20 && cmd_pending(a)) wait = 20;
-        if (SDL_WaitEventTimeout(&e, wait)) { do handle_event(a, &e); while (SDL_PollEvent(&e)); }
+        frame_pending.store(a->dirty ? 1 : 0, std::memory_order_release);
+        bool got = SDL_WaitEventTimeout(&e, wait);
+        frame_pending.store(0, std::memory_order_release);
+        if (got) { do handle_event(a, &e); while (SDL_PollEvent(&e)); }
         if (g_print_stats) { g_print_stats = 0; fprintf(stderr, "%s\n", cache_stats_text(a).c_str()); }
         lx::trace("loop wake");
         a->now = now_s();
