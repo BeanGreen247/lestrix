@@ -289,7 +289,7 @@ i5-8500 here: L1d 32 KB per core, L2 4 MB per core, L3 16 MB shared (lscpu; `per
 
 ## CPU renderer for machines without a GPU (2026-11-03)
 
-Profile first (perf-profile, `--fp`, 499 Hz, VM with no GPU, `seq 1 3000000` in a tab, data kept in the session scratchpad, opened in Hotspot): llvmpipe-0 33% + llvmpipe-1 32% (of which 53% JIT shader code, 13% libgallium), `seq` 20%, Lestrix's own threads 15%, own code about 3%. Kernel symbols resolved after `kptr_restrict=0`. Conclusion: on a GPU-less VM the frame cost is software OpenGL, not the engine.
+Profile first (perf-profile, `--fp`, 499 Hz, VM with no GPU, `seq 1 3000000` in a tab, recordings in the claude-memory-bank repo, `perf-data/lestrix-2026-11-03/recordings/`, opened in Hotspot): llvmpipe-0 33% + llvmpipe-1 32% (of which 53% JIT shader code, 13% libgallium), `seq` 20%, Lestrix's own threads 15%, own code about 3%. Kernel symbols resolved after `kptr_restrict=0`. Conclusion: on a GPU-less VM the frame cost is software OpenGL, not the engine.
 
 Change: `src/ui/soft.cpp` rasterises the same RInst stream on the CPU (rects, SDF rounded/bordered rects, mono glyphs from an in-memory R8 atlas, colour glyphs from an RGBA atlas, scissor, `r_clip`); `atlas.cpp` keeps CPU copies of the atlases when `sd_soft`; `render.cpp` skips shaders and GL state; `app.cpp` creates a plain window (SDL framebuffer acceleration hint off, otherwise SDL presents the surface through an OpenGL texture and llvmpipe is back: seen in the first measurement, CPU 1380 ms before the hint, 2000+ ms after it with a 16-bit surface rejected and GL used again, 680 ms with the 32-bit back buffer). The X display here is 16-bit (SDL window surface R mask f800), so frames are drawn into a 32-bit back buffer and SDL converts on `SDL_BlitSurface`.
 
@@ -312,7 +312,7 @@ Profile before: with one line rewritten in place (awk printing `\rcount N` 3 mil
 
 Correctness: `LESTRIX_SOFT_VERIFY=1` repaints every frame from scratch into a scratch buffer and compares it with the incrementally painted frame (`fatal` exits 3; `make test-gui` runs the CPU renderer with it). Zero mismatches over the GUI scripts and three floods (`seq`, in-place status line, `ls -la` dump); a mutated build that never repaints reports 22 mismatches, so the check bites.
 
-Results (A/B, `bench.sh` in `~/perf-data/lestrix-2026-11-03/`, 5 interleaved runs, CPU renderer both):
+Results (A/B, `bench.sh` in the claude-memory-bank repo, `perf-data/lestrix-2026-11-03/scripts/`, 5 interleaved runs, CPU renderer both):
 
 | workload | before: wall / Lestrix CPU | after: wall / Lestrix CPU |
 |---|---|---|
@@ -323,6 +323,8 @@ Results (A/B, `bench.sh` in `~/perf-data/lestrix-2026-11-03/`, 5 interleaved run
 perf (499 Hz, same workload): Lestrix main thread 1302 samples before, 753 after (-42%); `soft_draw` falls out of the top symbols. Note the first version of the status workload was wrong (a literal `\r` made awk wrap and scroll the whole pane, so 65% of tiles were dirty); the awk program now lives in a file. Open: parallel rasterising for 4K windows, Wayland and 24-bit X untested, real GPU untested.
 
 ### UI wake-up storm (2026-11-03, from `status2_after.data`)
+
+Recordings, scripts, binaries and `strace` evidence for this round: `perf-data/lestrix-2026-11-03/` in https://github.com/BeanGreen247/claude-memory-bank (its README says which recording resolves which symbols). Open with `hotspot <file>`.
 
 Profile (perf, `--fp`; flat and with `strace -c -f`): in the in-place status-line workload 63% of the UI thread's samples were inside system calls, 31% of it in syscall entry/exit alone (`syscall_return_via_sysret`, `entry_SYSRETQ_unsafe_stack`, `entry_SYSCALL_64`, plus mitigation work such as `clear_bhb_loop` on this VM). `strace -c` counted 82,269 `recvmsg` calls, 81,451 of them failing with EAGAIN, in 9 s; the stack (`strace -k`) was Xlib's `XEventsQueued` from SDL's event pump. Cause: the reader thread wakes the UI for every 0.2 ms of output (`tcore.cpp` `wake_ui`), up to 5000 wake-ups a second; while a frame was already due the UI thread woke, ran its whole loop (pump, timers, event poll with the X connection check) and went back to sleep until the next wake.
 
