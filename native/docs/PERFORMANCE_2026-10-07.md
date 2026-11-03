@@ -265,3 +265,24 @@ seq flood, 31 MB (about 3.9 M lines of 8 bytes), one traced run, ms after the co
 
 - `LP_NUM_THREADS` (llvmpipe worker threads; default = 2 here), 5 interleaved runs per cell, flood time median / CPU median: seq 0.23 / 0.37 s (default), 0.19 / 0.37 (1 thread), 0.20 / 0.38 (2 threads); colour 0.16 / 0.33, 0.14 / 0.31, 0.14 / 0.32; redraw 0.05 / 0.21, 0.05 / 0.20, 0.05 / 0.22. Ranges overlap in every row (the default's range is the widest, 0.19-0.25 on seq), so no measured win: rejected, nothing changed. Not measured: idle CPU and wake-ups with a single thread.
 - Take-over, 3 traced runs, ms after the command was sent: foreground job seen by the probe 9.5-15.4 (the shell forks and execs cat and cat's first 4096+ byte write arrives), shell and cat stopped within 1 ms, then 11-30 ms until cat is gone (after SIGCONT it finishes writing its in-flight chunk through the pty and exits), request sent 27-40 ms, marker 210-260 ms. The earlier "50 ms until the job starts" was inflated by the busy first frames of a traced run; the real fixed cost is 27-40 ms, of which the stop dance is under 1 ms (the 0.5 ms `nanosleep` polling in `nc_wait_stopped` is not a cost). Nothing in it can be cut safely: the first part is the shell's own fork and exec, the second is cat draining data it already read. Flood time is 80% feeding the engine.
+
+## Round 2026-11-03: flags, allocator, colour emoji
+
+Engine benchmark (`BENCH_MB=8`, 2 cores, i5-8500, GCC 14.2, 9 interleaved runs, medians; rows: no scrollback / 10k scrollback / unlimited / colour):
+
+- Flag bundle `-fno-math-errno -fno-semantic-interposition -fno-stack-protector -fno-asynchronous-unwind-tables -Wl,-O1,--as-needed,--hash-style=gnu,-z,pack-relative-relocs`: 1657 vs 1645, 935 vs 935, 780 vs 604, 434 vs 409 MB/s. Rows 1-2 identical; rows 3-4 move but their base ranges (401-924, 381-447) contain the result. Rejected, not kept (no consistent win).
+- `-fno-trapping-math -fno-exceptions -fno-threadsafe-statics -falign-functions=32`: inside noise on every row. Rejected.
+- jemalloc via `LD_PRELOAD`: 1628 / 864 / 658 / 387 against base 1627 / 889 / 556 / 398. Rejected.
+- Unlimited-scrollback row is bimodal (about 430 or 880 MB/s) run to run. With the app's own `mallopt` values (arena 2, mmap 64 KB, trim 256 KB) median 613; trim 16 MB 643; trim 64 MB 747; ranges 443-894 overlap. Raising the trim threshold costs idle RSS for no consistent gain: rejected.
+- Closed list unchanged: `-fno-plt`, `-march=native`, LTO, PGO, BOLT, `-O2`.
+
+Colour emoji (feature, not a speed change): colour bitmap fonts (CBDT, Noto Color Emoji) were rejected by `open_face` as not scalable. Now the strike nearest the font size is selected, box-scaled to the cell height (at most two cells wide) and uploaded to a second RGBA atlas (1024 x 1024, created on the first emoji glyph, not on ES2). Instances carry a colour flag in `pad` byte 2; the fragment shader branches on it before the mono path. Code points from U+1F000 prefer Noto Color Emoji; BMP symbols (U+2764 etc.) keep text presentation. Without a colour atlas (ES2) the glyph degrades to alpha x luma coverage tinted by the text colour. Non-emoji text only gains one flat varying and one predictable branch; the glyph cache hit path is untouched. Test: `make test-font`. Not measured: frame cost on a real GPU.
+
+### Cache levels (2026-11-03)
+
+i5-8500 here: L1d 32 KB per core, L2 4 MB per core, L3 16 MB shared (lscpu; `perf_event_paranoid` is 3, so no hardware counters; numbers are cachegrind/callgrind simulation with 32 KB 8-way L1 and 8 MB LL, 1 MB benchmark input).
+
+- Engine total: D1 miss rate 2.5% (reads 2.0%, writes 3.1%), last-level miss rate 0.3%. The parser is already cache-resident; there is no large L1 gap to close.
+- Largest simulated write-miss sources: `clear_row` memset 340K of 650K D1 write misses (cold row memory, inherent to recycling rows), `sd_lz_compress` read misses 190K (streaming the input once, inherent).
+- Tried: shrinking the LZ hash table (zeroed on every call, 32 KB = the whole L1d) from 13 to 12, 11, 10 bits: compressor 9.9 / 10.0 / 10.1 / 10.1 GB/s per core, packed size identical in the benchmark output. Inside noise: rejected, `lz.cpp` unchanged.
+- The unlimited-scrollback row is bimodal because of thread placement, not cache size: pinned to one core (`taskset -c 0`) 390-453 MB/s (parser and compress worker time-share), on both cores 477-884 MB/s. Pinning the worker to a second core in the app was not done (core count varies, other loads share the cores); the open question is whether a soft affinity hint helps on 2-core machines.

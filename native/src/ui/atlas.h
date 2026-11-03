@@ -14,6 +14,7 @@ typedef struct {
     int16_t left, top;
     float adv;
     bool blank;
+    bool color;   /* x,y address the colour (RGBA) atlas */
 } AtlasGlyph;
 
 typedef struct Atlas Atlas;
@@ -26,6 +27,8 @@ int atlas_ascii_filled(const Atlas *a);
 Atlas *atlas_new(int size);
 void atlas_free(Atlas *a);
 unsigned atlas_texture(const Atlas *a);
+unsigned atlas_color_texture(const Atlas *a);
+int atlas_color_size(const Atlas *a);
 int atlas_size(const Atlas *a);
 uint32_t atlas_generation(const Atlas *a);
 void atlas_white(const Atlas *a, uint16_t *x, uint16_t *y);

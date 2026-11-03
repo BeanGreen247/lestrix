@@ -18,7 +18,7 @@ struct Renderer {
     Atlas *atlas;
     GLuint prog, vao, vbo, ibo;
     V2 *v2;
-    GLint u_res, u_atlas;
+    GLint u_res, u_atlas, u_color;
     RInst *buf;
     size_t n, cap;
     size_t vbo_cap;
@@ -44,22 +44,24 @@ static const char *VS3 =
     "layout(location=2) in vec4 a_col;\n"
     "layout(location=3) in vec4 a_aux;\n"
     "uniform vec2 u_res;\n"
-    "out vec2 v_uv; out vec4 v_col; out vec2 v_local; out vec2 v_size; out vec2 v_aux;\n"
+    "out vec2 v_uv; out vec4 v_col; out vec2 v_local; out vec2 v_size; out vec2 v_aux; flat out float v_clr;\n"
     "void main() {\n"
     "  vec2 c = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
     "  vec2 p = a_rect.xy + c * a_rect.zw;\n"
     "  gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, 0.0, 1.0);\n"
     "  v_uv = mix(a_uv.xy, a_uv.zw, c);\n"
     "  v_col = a_col;\n"
-    "  v_local = c * a_rect.zw; v_size = a_rect.zw; v_aux = a_aux.xy * 255.0;\n"
+    "  v_local = c * a_rect.zw; v_size = a_rect.zw; v_aux = a_aux.xy * 255.0; v_clr = a_aux.z;\n"
     "}\n";
 
 static const char *FS3 =
-    "in vec2 v_uv; in vec4 v_col; in vec2 v_local; in vec2 v_size; in vec2 v_aux;\n"
+    "in vec2 v_uv; in vec4 v_col; in vec2 v_local; in vec2 v_size; in vec2 v_aux; flat in float v_clr;\n"
     "uniform sampler2D u_atlas;\n"
+    "uniform sampler2D u_color;\n"
     "out vec4 o;\n"
     "#define TEX texture\n"
     "void main() {\n"
+    "  if (v_clr > 0.5) { vec4 t = texture(u_color, v_uv); o = vec4(t.rgb, t.a * v_col.a); return; }\n"
     SDF_BODY
     "  o = vec4(v_col.rgb, v_col.a * a);\n"
     "}\n";
@@ -143,6 +145,7 @@ Renderer *r_new(Atlas *a) {
     if (!ok) { free(r); return NULL; }
     r->u_res = gl.GetUniformLocation(r->prog, "u_res");
     r->u_atlas = gl.GetUniformLocation(r->prog, "u_atlas");
+    r->u_color = gl.GetUniformLocation(r->prog, "u_color");
     gl.GenBuffers(1, &r->vbo);
     if (sd_gl_kind == GLK_ES2) {
         uint16_t *idx = static_cast<uint16_t*>(malloc((size_t)MAXQ * 6 * sizeof *idx));
@@ -235,6 +238,12 @@ void r_flush(Renderer *r) {
     gl.ActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, atlas_texture(r->atlas));
     gl.Uniform1i(r->u_atlas, 0);
+    if (sd_gl_kind != GLK_ES2 && atlas_color_texture(r->atlas)) {
+        gl.ActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, atlas_color_texture(r->atlas));
+        gl.Uniform1i(r->u_color, 1);
+        gl.ActiveTexture(GL_TEXTURE0);
+    }
     if (sd_gl_kind == GLK_ES2) { flush_es2(r); r->n = 0; return; }
     gl.BindVertexArray(r->vao);
     gl.BindBuffer(GL_ARRAY_BUFFER, r->vbo);
@@ -293,10 +302,10 @@ void r_make_rect(Renderer *r, RInst *o, float x, float y, float w, float h, uint
 }
 
 void r_make_glyph(Renderer *r, RInst *o, const AtlasGlyph *g, float pen_x, float baseline_y, uint32_t rgba) {
-    float inv = 65535.f / (float)atlas_size(r->atlas);
+    float inv = 65535.f / (float)(g->color ? atlas_color_size(r->atlas) : atlas_size(r->atlas));
     *o = (RInst){pen_x + g->left, baseline_y - g->top, (float)g->w, (float)g->h,
                  (uint16_t)(g->x * inv + 0.5f), (uint16_t)(g->y * inv + 0.5f),
-                 (uint16_t)((g->x + g->w) * inv + 0.5f), (uint16_t)((g->y + g->h) * inv + 0.5f), rgba, 0};
+                 (uint16_t)((g->x + g->w) * inv + 0.5f), (uint16_t)((g->y + g->h) * inv + 0.5f), rgba, g->color ? 255u << 16 : 0u};
 }
 
 void r_rrect(Renderer *r, float x, float y, float w, float h, uint32_t rgba, int radius, int border) {

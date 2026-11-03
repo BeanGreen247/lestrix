@@ -17,6 +17,7 @@ typedef struct {
     int w, h;
     int left, top;
     float adv;
+    bool color;   /* buf is straight-alpha RGBA, 4 bytes per pixel */
 } GlyphBmp;
 
 Font *font_open(const char *family, double px, bool mono);
@@ -27,6 +28,7 @@ int font_cell_w(const Font *f);
 int font_cell_h(const Font *f);
 int font_ascent(const Font *f);
 bool font_glyph(Font *f, uint32_t cp, int style, GlyphBmp *out);
+bool font_glyph_color(Font *f, uint32_t cp, int style, GlyphBmp *out, bool allow_color);
 float font_advance(Font *f, uint32_t cp, int style);
 char *font_pick_family(const char *const *wanted);
 void font_prewarm(void);

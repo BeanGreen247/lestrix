@@ -8,7 +8,7 @@ CXXFLAGS  += $(GCC_TUNE)
 CXXFLAGS  += -std=gnu++20 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-deprecated-declarations -Wno-missing-field-initializers -fvisibility=hidden -fno-rtti -pthread
 BUILD   := build
 
-.PHONY: bench-file bench-terminals all test test-fast test-shadow test-native-cat test-gui perf-gate test-lz test-vt-tsan test-vt test-store test-xfer test-ftp bench app install uninstall clean
+.PHONY: test-font bench-file bench-terminals all test test-fast test-shadow test-native-cat test-gui perf-gate test-lz test-vt-tsan test-vt test-store test-xfer test-ftp bench app install uninstall clean
 all: app
 
 $(BUILD):
@@ -31,7 +31,7 @@ test-vt: $(BUILD)/test_vt $(BUILD)/libvt.so
 	@PY=$$(for p in ../.venv/bin/python python3; do $$p -c "import pyte" 2>/dev/null && echo $$p && break; done); \
 	  if [ -n "$$PY" ]; then $$PY tests/diff_pyte.py 1500; else echo "(pyte not installed: skipping the differential test)"; fi
 
-test: test-vt test-fast test-shadow test-native-cat test-lz test-vt-tsan test-store test-xfer test-ftp perf-gate
+test: test-font test-vt test-fast test-shadow test-native-cat test-lz test-vt-tsan test-store test-xfer test-ftp perf-gate
 
 bench: $(BUILD)/bench_vt
 	$(BUILD)/bench_vt
@@ -49,6 +49,12 @@ $(BUILD)/test_xfer: tests/test_xfer.cpp src/xfer.cpp src/store.cpp src/json.cpp 
 
 test-xfer: $(BUILD)/test_xfer
 	$(BUILD)/test_xfer
+
+$(BUILD)/test_font: tests/test_font.cpp src/ui/font.cpp src/ui/font.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags freetype2 fontconfig) -fsanitize=address,undefined -g -o $@ tests/test_font.cpp src/ui/font.cpp $(shell pkg-config --libs freetype2 fontconfig) -lm
+
+test-font: $(BUILD)/test_font
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/test_font
 
 GUI_CFLAGS := $(shell pkg-config --cflags sdl2 freetype2 fontconfig)
 GUI_LIBS   := $(shell pkg-config --libs sdl2 freetype2 fontconfig)
