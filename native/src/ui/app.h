@@ -62,6 +62,8 @@ public:
 struct App {
     SDL_Window *win = nullptr;
     SDL_GLContext gl = nullptr;
+    bool soft = false;   /* CPU rendering into the window surface, no GL context */
+    SDL_Surface *back = nullptr;   /* 32-bit back buffer when the window surface is not 32-bit (16-bit X displays) */
     Renderer *r = nullptr;
     Atlas *atlas = nullptr;
     Ui *ui = nullptr;

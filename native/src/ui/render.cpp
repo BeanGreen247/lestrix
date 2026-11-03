@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "gl.h"
+#include "soft.h"
 
 typedef struct { float x, y, u, v; uint32_t rgba; float lx, ly, sw, sh, ar, ab; } V2;
 #define MAXQ 16384
@@ -24,6 +25,8 @@ struct Renderer {
     size_t vbo_cap;
     int w, h;
     int clip_on, cx, cy, cw, ch;
+    SoftTarget st;   /* software rendering target, set by r_set_target before each frame */
+    SoftClip sclip;
 };
 
 #define SDF_BODY \
@@ -126,6 +129,7 @@ Renderer *r_new(Atlas *a) {
     Renderer *r = static_cast<Renderer*>(calloc(1, sizeof *r));
     if (!r) return NULL;
     r->atlas = a;
+    if (sd_soft) return r;
     GLuint vs, fs;
     if (sd_gl_kind == GLK_ES2) { vs = compile_src(GL_VERTEX_SHADER, "", VS2); fs = compile_src(GL_FRAGMENT_SHADER, "", FS2); }
     else { vs = compile_src(GL_VERTEX_SHADER, glsl_head(), VS3); fs = compile_src(GL_FRAGMENT_SHADER, glsl_head(), FS3); }
@@ -192,6 +196,7 @@ Atlas *r_atlas(Renderer *r) { return r->atlas; }
 
 void r_begin(Renderer *r, int w, int h, uint32_t clear_rgba) {
     r->w = w; r->h = h; r->n = 0; r->clip_on = 0;
+    if (sd_soft) { r->sclip.on = 0; if (r->st.px) soft_clear(&r->st, clear_rgba); return; }
     glViewport(0, 0, w, h);
     glDisable(GL_SCISSOR_TEST);
     glClearColor((clear_rgba & 255) / 255.f, ((clear_rgba >> 8) & 255) / 255.f, ((clear_rgba >> 16) & 255) / 255.f, 1.f);
@@ -231,8 +236,17 @@ static void flush_es2(Renderer *r) {
     }
 }
 
+void r_set_target(Renderer *r, uint32_t *px, int w, int h, int pitch_px, int rs, int gs, int bs, uint32_t amask) {
+    r->st = SoftTarget{px, w, h, pitch_px, rs, gs, bs, amask};
+}
+
 void r_flush(Renderer *r) {
     if (!r->n) return;
+    if (sd_soft) {
+        if (r->st.px) soft_draw(&r->st, &r->sclip, r->buf, r->n, atlas_cpu(r->atlas), atlas_size(r->atlas), atlas_color_cpu(r->atlas), atlas_color_size(r->atlas));
+        r->n = 0;
+        return;
+    }
     gl.UseProgram(r->prog);
     gl.Uniform2f(r->u_res, (float)r->w, (float)r->h);
     gl.ActiveTexture(GL_TEXTURE0);
@@ -259,12 +273,13 @@ void r_end(Renderer *r) { r_flush(r); }
 
 void r_clip(Renderer *r, int x, int y, int w, int h) {
     r_flush(r);
+    r->clip_on = 1;
+    if (sd_soft) { r->sclip = SoftClip{1, x, y, w < 0 ? 0 : w, h < 0 ? 0 : h}; return; }
     glEnable(GL_SCISSOR_TEST);
     glScissor(x, r->h - (y + h), w < 0 ? 0 : w, h < 0 ? 0 : h);
-    r->clip_on = 1;
 }
 
-void r_clip_off(Renderer *r) { r_flush(r); glDisable(GL_SCISSOR_TEST); r->clip_on = 0; }
+void r_clip_off(Renderer *r) { r_flush(r); if (sd_soft) r->sclip.on = 0; else glDisable(GL_SCISSOR_TEST); r->clip_on = 0; }
 
 static void grow(Renderer *r, size_t extra) {
     if (r->n + extra <= r->cap) return;

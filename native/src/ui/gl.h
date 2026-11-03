@@ -10,6 +10,7 @@
 
 typedef enum { GLK_CORE = 0, GLK_ES3 = 1, GLK_ES2 = 2 } GlKind;
 extern GlKind sd_gl_kind;
+extern bool sd_soft;   /* CPU rendering: no GL context, the atlas lives in memory and soft.cpp rasterises */
 
 typedef struct {
     void (APIENTRY *Viewport)(GLint, GLint, GLsizei, GLsizei);

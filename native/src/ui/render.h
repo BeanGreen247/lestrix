@@ -16,6 +16,8 @@ typedef struct Renderer Renderer;
 Renderer *r_new(Atlas *a);
 void r_free(Renderer *r);
 Atlas *r_atlas(Renderer *r);
+/* software rendering: the 32-bit surface the next frame is drawn into (pitch in pixels, channel shifts, non-colour bits) */
+void r_set_target(Renderer *r, uint32_t *px, int w, int h, int pitch_px, int rs, int gs, int bs, uint32_t amask);
 void r_begin(Renderer *r, int w, int h, uint32_t clear_rgba);
 void r_end(Renderer *r);
 void r_flush(Renderer *r);

@@ -286,3 +286,22 @@ i5-8500 here: L1d 32 KB per core, L2 4 MB per core, L3 16 MB shared (lscpu; `per
 - Largest simulated write-miss sources: `clear_row` memset 340K of 650K D1 write misses (cold row memory, inherent to recycling rows), `sd_lz_compress` read misses 190K (streaming the input once, inherent).
 - Tried: shrinking the LZ hash table (zeroed on every call, 32 KB = the whole L1d) from 13 to 12, 11, 10 bits: compressor 9.9 / 10.0 / 10.1 / 10.1 GB/s per core, packed size identical in the benchmark output. Inside noise: rejected, `lz.cpp` unchanged.
 - The unlimited-scrollback row is bimodal because of thread placement, not cache size: pinned to one core (`taskset -c 0`) 390-453 MB/s (parser and compress worker time-share), on both cores 477-884 MB/s. Pinning the worker to a second core in the app was not done (core count varies, other loads share the cores); the open question is whether a soft affinity hint helps on 2-core machines.
+
+## CPU renderer for machines without a GPU (2026-11-03)
+
+Profile first (perf-profile, `--fp`, 499 Hz, VM with no GPU, `seq 1 3000000` in a tab, data kept in the session scratchpad, opened in Hotspot): llvmpipe-0 33% + llvmpipe-1 32% (of which 53% JIT shader code, 13% libgallium), `seq` 20%, Lestrix's own threads 15%, own code about 3%. Kernel symbols resolved after `kptr_restrict=0`. Conclusion: on a GPU-less VM the frame cost is software OpenGL, not the engine.
+
+Change: `src/ui/soft.cpp` rasterises the same RInst stream on the CPU (rects, SDF rounded/bordered rects, mono glyphs from an in-memory R8 atlas, colour glyphs from an RGBA atlas, scissor, `r_clip`); `atlas.cpp` keeps CPU copies of the atlases when `sd_soft`; `render.cpp` skips shaders and GL state; `app.cpp` creates a plain window (SDL framebuffer acceleration hint off, otherwise SDL presents the surface through an OpenGL texture and llvmpipe is back: seen in the first measurement, CPU 1380 ms before the hint, 2000+ ms after it with a 16-bit surface rejected and GL used again, 680 ms with the 32-bit back buffer). The X display here is 16-bit (SDL window surface R mask f800), so frames are drawn into a 32-bit back buffer and SDL converts on `SDL_BlitSurface`.
+
+Selection: `--render auto|cpu|gpu` / `LESTRIX_RENDER`; auto = CPU when there is no readable `/dev/dri/renderD*` and no `/dev/nvidiactl`; GL init failure falls back to CPU.
+
+Results (`flood_bench.sh`: lestrix in a window, `sleep 1.5; seq 1 3000000; touch done`; wall time from 1.4 s after start to `done`, lestrix utime+stime in that span; 5 interleaved runs):
+
+| | wall s | Lestrix CPU ms |
+|---|---|---|
+| OpenGL (llvmpipe) | 3.80 3.43 3.60 3.27 3.47 (median 3.47) | 2270 2050 2190 1990 2150 (median 2150) |
+| CPU renderer | 2.21 2.31 2.01 2.25 2.33 (median 2.25) | 680 730 600 710 740 (median 710) |
+
+Also: first frame 83 ms vs 180 ms, RSS 33 vs 137 MB, PSS 13 vs 74 MB, idle 10 vs 40 ms CPU per 6 s. Profile of the CPU renderer on the same flood: `seq` 44%, Lestrix main thread 39% (`soft_draw` 6%, `soft_clear` 3.8%, rest syscalls and X), `lx-io` 17%; the rasteriser is about a tenth of all samples, so the generator and the pty now dominate.
+
+Open: damage tracking (the whole frame is cleared and redrawn, and `SDL_UpdateWindowSurface` copies it all; a changed-rows rectangle list would cut `soft_clear`, the conversion blit and the X upload), row-parallel rasterising for 4K windows, Wayland and 24-bit X not measured, no real-GPU comparison.

@@ -28,6 +28,8 @@ Atlas *atlas_new(int size);
 void atlas_free(Atlas *a);
 unsigned atlas_texture(const Atlas *a);
 unsigned atlas_color_texture(const Atlas *a);
+const uint8_t *atlas_cpu(const Atlas *a);          /* software rendering: the 8-bit atlas in memory */
+const uint32_t *atlas_color_cpu(const Atlas *a);   /* RGBA colour atlas in memory, NULL until the first colour glyph */
 int atlas_color_size(const Atlas *a);
 int atlas_size(const Atlas *a);
 uint32_t atlas_generation(const Atlas *a);
