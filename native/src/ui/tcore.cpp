@@ -99,7 +99,7 @@ void tcore_unlock(TermCore *t) { UNLOCK(t); }
 int tcore_cols(const TermCore *t) { return t->cols; }
 int tcore_rows(const TermCore *t) { return t->rows; }
 bool tcore_running(const TermCore *t) { return t->running; }
-int tcore_read_delay_us = 200;
+int tcore_read_delay_us = 400;
 int tcore_io_threads = -1;
 static std::atomic<bool> g_native_cat{true};
 static std::atomic<unsigned> g_native_cat_count{0};
