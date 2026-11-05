@@ -6,6 +6,7 @@
 #include "gl.h"
 
 GlKind sd_gl_kind = GLK_CORE;
+bool sd_soft = false;
 SdGL gl;
 
 int sd_gl_load(GlKind kind) {

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
 #include <malloc.h>
@@ -36,8 +37,14 @@
 App *g_app;
 static Uint32 EV_WAKE;
 static std::atomic<int> wake_pending;
+/* Set while the UI thread sleeps with a frame already due: it re-reads all pending output when it wakes for that frame, so
+ * a wake-up per slice of output (up to 5000 a second during a flood) would only make it spin through its loop and poll the
+ * X connection for nothing. Output is written before app_wake() runs and the flag is cleared before the frame is built,
+ * so a wake that is skipped can never leave output undrawn. */
+static std::atomic<int> frame_pending;
 
 void app_wake(void) {
+    if (frame_pending.load(std::memory_order_acquire)) return;
     int exp = 0;
     if (wake_pending.compare_exchange_strong(exp, 1)) {
         SDL_Event e;
@@ -1086,6 +1093,7 @@ static void draw_content(App *a) {
 }
 
 static double g_max_fps = 60, g_io_fps = 24;
+static const char *g_render_mode = nullptr;
 static int g_parse_threads = -1, g_compress_threads = -1, g_render_threads = -1;
 static double frame_gap(bool flooding) {
     double f = g_max_fps, io = g_io_fps;
@@ -1338,8 +1346,12 @@ static void handle_event(App *a, SDL_Event *e) {
     switch (e->type) {
     case SDL_QUIT: a->running = false; break;
     case SDL_WINDOWEVENT:
+        if (a->soft && (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e->window.event == SDL_WINDOWEVENT_RESIZED || e->window.event == SDL_WINDOWEVENT_EXPOSED ||
+                        e->window.event == SDL_WINDOWEVENT_SHOWN || e->window.event == SDL_WINDOWEVENT_RESTORED || e->window.event == SDL_WINDOWEVENT_MAXIMIZED))
+            r_soft_invalidate(a->r);   /* the window surface may have lost its contents: repaint and present everything */
         if (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e->window.event == SDL_WINDOWEVENT_RESIZED) {
-            SDL_GL_GetDrawableSize(a->win, &a->W, &a->H);
+            if (a->soft) { SDL_Surface *s = SDL_GetWindowSurface(a->win); if (s) { a->W = s->w; a->H = s->h; } }
+            else SDL_GL_GetDrawableSize(a->win, &a->W, &a->H);
             app_redraw(a);
         } else if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED || e->window.event == SDL_WINDOWEVENT_FOCUS_LOST || e->window.event == SDL_WINDOWEVENT_EXPOSED) app_redraw(a);
         break;
@@ -1417,6 +1429,19 @@ static void handle_event(App *a, SDL_Event *e) {
 
 
 static void write_ppm(App *a, const char *path) {
+    if (a->soft) {
+        SDL_Surface *s = a->back ? a->back : SDL_GetWindowSurface(a->win);
+        FILE *fp = s ? fopen(path, "wb") : NULL;
+        if (!fp) return;
+        fprintf(fp, "P6\n%d %d\n255\n", s->w, s->h);
+        int rs = __builtin_ctz(s->format->Rmask), gs = __builtin_ctz(s->format->Gmask), bs = __builtin_ctz(s->format->Bmask);
+        for (int y = 0; y < s->h; y++) {
+            const uint32_t *row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(s->pixels) + (size_t)y * s->pitch);
+            for (int x = 0; x < s->w; x++) { uint8_t c[3] = {(uint8_t)(row[x] >> rs), (uint8_t)(row[x] >> gs), (uint8_t)(row[x] >> bs)}; fwrite(c, 1, 3, fp); }
+        }
+        fclose(fp);
+        return;
+    }
     uint8_t *px = static_cast<uint8_t*>(malloc((size_t)a->W * a->H * 4));
     glReadPixels(0, 0, a->W, a->H, GL_RGBA, GL_UNSIGNED_BYTE, px);
     FILE *fp = fopen(path, "wb");
@@ -1426,6 +1451,66 @@ static void write_ppm(App *a, const char *path) {
         fclose(fp);
     }
     free(px);
+}
+
+/* CPU rendering: a plain window whose surface the rasteriser (soft.cpp) draws into. For machines with no GPU, where GL
+ * would be llvmpipe (Mesa's software OpenGL) competing with the terminal for the same few cores. */
+static bool soft_init(App *a) {
+    if (a->gl) { SDL_GL_DeleteContext(a->gl); a->gl = NULL; }
+    if (a->win) { SDL_DestroyWindow(a->win); a->win = NULL; }
+    sd_soft = true;
+    SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");   /* SDL would otherwise present the surface through an OpenGL texture: llvmpipe again */
+    int win_w = 1440, win_h = 780;
+    { SDL_Rect db; if (SDL_GetDisplayBounds(0, &db) == 0) { if (win_w > db.w * 95 / 100) win_w = db.w * 95 / 100; if (win_h > db.h * 90 / 100) win_h = db.h * 90 / 100; } }
+    a->win = SDL_CreateWindow("Lestrix", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!a->win) return false;
+    SDL_Surface *ic = SDL_CreateRGBSurfaceWithFormatFrom((void *)APP_ICON_RGBA, 64, 64, 32, 64 * 4, SDL_PIXELFORMAT_RGBA32);
+    if (ic) { SDL_SetWindowIcon(a->win, ic); SDL_FreeSurface(ic); }
+    tmark("window created");
+    SDL_Surface *s = SDL_GetWindowSurface(a->win);
+    if (!s) return false;
+    int ww, wh;
+    SDL_GetWindowSize(a->win, &ww, &wh);
+    a->W = s->w; a->H = s->h;
+    a->scale = ww ? (float)a->W / (float)ww : 1.f;
+    a->soft = true;
+    a->atlas = atlas_new(a->scale > 1.5f ? 4096 : 2048);
+    a->r = a->atlas ? r_new(a->atlas) : NULL;
+    if (!a->r) { if (a->atlas) atlas_free(a->atlas); a->atlas = NULL; return false; }
+    snprintf(a->gl_desc, sizeof a->gl_desc, "CPU renderer");
+    return true;
+}
+
+/* Point the renderer at the window surface for this frame (the surface changes when the window is resized). */
+static bool soft_begin(App *a) {
+    SDL_Surface *s = SDL_GetWindowSurface(a->win);
+    if (!s) return false;
+    a->W = s->w; a->H = s->h;
+    if (s->format->BytesPerPixel != 4) {   /* e.g. a 16-bit X display: draw into a 32-bit buffer and let SDL convert on present */
+        if (a->back && (a->back->w != s->w || a->back->h != s->h)) { SDL_FreeSurface(a->back); a->back = nullptr; }
+        if (!a->back) a->back = SDL_CreateRGBSurfaceWithFormat(0, s->w, s->h, 32, SDL_PIXELFORMAT_RGB888);
+        if (!a->back) return false;
+        s = a->back;
+    } else if (a->back) { SDL_FreeSurface(a->back); a->back = nullptr; }
+    uint32_t amask = ~(s->format->Rmask | s->format->Gmask | s->format->Bmask);
+    r_set_target(a->r, static_cast<uint32_t*>(s->pixels), s->w, s->h, s->pitch / 4, __builtin_ctz(s->format->Rmask), __builtin_ctz(s->format->Gmask), __builtin_ctz(s->format->Bmask), amask);
+    return true;
+}
+
+/* Is there a way for GL to reach a GPU? Mesa uses a DRM render node; NVIDIA's driver has its own device. Without either
+ * OpenGL would be llvmpipe, which is far slower than drawing the terminal on the CPU directly. */
+static bool have_gpu() {
+    if (access("/dev/nvidiactl", F_OK) == 0) return true;
+    DIR *d = opendir("/dev/dri");
+    if (!d) return false;
+    bool ok = false;
+    while (struct dirent *e = readdir(d))
+        if (!strncmp(e->d_name, "renderD", 7)) {
+            std::string p = std::string("/dev/dri/") + e->d_name;
+            if (access(p.c_str(), R_OK | W_OK) == 0) { ok = true; break; }
+        }
+    closedir(d);
+    return ok;
 }
 
 static bool gl_init(App *a, GlKind kind) {
@@ -1595,6 +1680,7 @@ static const char *HELP_TEXT =
     "  --working-directory   start the local shell in DIR\n"
     "  --benchmark           measure this machine's terminal throughput and exit\n"
     "  --connect NAME        open the saved connection NAME on startup\n"
+    "  --render MODE         auto (default), cpu or gpu: auto draws on the CPU when the machine has no GPU (no DRM render node), which beats Mesa's software OpenGL; also LESTRIX_RENDER\n"
     "  --max-fps N           cap drawing at N frames per second (default 60; 0 = no cap, vsync off)\n"
     "  --io-fps N            cap drawing at N fps while a big dump pours in, so reading output gets the CPU\n"
     "                        (default 24; lower is faster for output; 0 = no extra cap)\n"
@@ -1624,6 +1710,7 @@ int main(int argc, char **argv) {
         if (arg == "--version") { printf("Lestrix %s\n" APP_CREDIT, APP_VERSION); return 0; }
         if (arg == "--benchmark") return sd_benchmark(stdout, 8.0);
         if (arg == "--max-fps" && more) { g_max_fps = atof(argv[++i]); continue; }
+        if (arg == "--render" && more) { g_render_mode = argv[++i]; continue; }
         if (arg == "--read-delay" && more) { tcore_read_delay_us = atoi(argv[++i]); continue; }
         if (arg == "--no-fastcat") { g_fastcat = false; continue; }
         if (arg == "--render-threads" && more) { g_render_threads = atoi(argv[++i]); continue; }
@@ -1669,9 +1756,14 @@ int main(int argc, char **argv) {
         const char *force = getenv("LESTRIX_GL");
         if (force) { first = !strcmp(force, "es3") ? 1 : !strcmp(force, "es2") ? 2 : 0; n = first + 1; }
         bool ok = false;
-        for (int i = first; i < n && !ok; i++) ok = gl_init(a, order[i]);
-        if (!ok) { fprintf(stderr, "Lestrix needs OpenGL 3.3, OpenGL ES 3.0 or OpenGL ES 2.0\n"); prewarm.join(); return 1; }
-        if (getenv("LESTRIX_TIMING")) fprintf(stderr, "OpenGL: %s (%s)\n", a->gl_desc, sd_gl_kind == GLK_CORE ? "desktop core" : sd_gl_kind == GLK_ES3 ? "ES 3.0" : "ES 2.0");
+        const char *rmode = g_render_mode ? g_render_mode : getenv("LESTRIX_RENDER");   /* auto (default), cpu, gpu */
+        bool cpu = rmode && !strcmp(rmode, "cpu");
+        if (!cpu && (!rmode || !strcmp(rmode, "auto"))) cpu = !have_gpu();
+        if (cpu) ok = soft_init(a);
+        if (!ok) { sd_soft = false; for (int i = first; i < n && !ok; i++) ok = gl_init(a, order[i]); }
+        if (!ok && !cpu) ok = soft_init(a);   /* no usable GL at all: draw on the CPU instead of giving up */
+        if (!ok) { fprintf(stderr, "Lestrix could not start a renderer (needs OpenGL 3.3, ES 3.0 or ES 2.0, or the CPU renderer)\n"); prewarm.join(); return 1; }
+        if (getenv("LESTRIX_TIMING")) fprintf(stderr, "Renderer: %s (%s)\n", a->gl_desc, a->soft ? "CPU" : sd_gl_kind == GLK_CORE ? "desktop core" : sd_gl_kind == GLK_ES3 ? "ES 3.0" : "ES 2.0");
     }
     tmark("GL functions loaded");
     prewarm.join();
@@ -1758,7 +1850,10 @@ int main(int argc, char **argv) {
         }
         if (flood && flood_sent && wait > 2) wait = 2;
         if (wait > 20 && cmd_pending(a)) wait = 20;
-        if (SDL_WaitEventTimeout(&e, wait)) { do handle_event(a, &e); while (SDL_PollEvent(&e)); }
+        frame_pending.store(a->dirty ? 1 : 0, std::memory_order_release);
+        bool got = SDL_WaitEventTimeout(&e, wait);
+        frame_pending.store(0, std::memory_order_release);
+        if (got) { do handle_event(a, &e); while (SDL_PollEvent(&e)); }
         if (g_print_stats) { g_print_stats = 0; fprintf(stderr, "%s\n", cache_stats_text(a).c_str()); }
         lx::trace("loop wake");
         a->now = now_s();
@@ -1803,6 +1898,7 @@ int main(int argc, char **argv) {
             a->dirty = false;
             const double frame_t0 = now_s();
             lx::trace("frame begin");
+            if (a->soft) soft_begin(a);
             r_begin(a->r, a->W, a->H, a->colors.bg0);
             build_frame(a);
             lx::trace("frame built");
@@ -1819,7 +1915,18 @@ int main(int argc, char **argv) {
                 write_ppm(a, shot);
                 a->running = false;
             }
-            SDL_GL_SwapWindow(a->win);
+            if (a->soft) {   /* present only the rectangles the renderer repainted; an unchanged frame presents nothing */
+                size_t nd = 0;
+                const RDamage *dm = r_damage(a->r, &nd);
+                if (nd) {
+                    static std::vector<SDL_Rect> rects;
+                    rects.resize(nd);
+                    for (size_t i = 0; i < nd; i++) rects[i] = SDL_Rect{dm[i].x, dm[i].y, dm[i].w, dm[i].h};
+                    SDL_Surface *ws = a->back ? SDL_GetWindowSurface(a->win) : nullptr;
+                    if (ws) for (const SDL_Rect &rc : rects) { SDL_Rect s = rc, d = rc; SDL_BlitSurface(a->back, &s, ws, &d); }
+                    SDL_UpdateWindowSurfaceRects(a->win, rects.data(), (int)nd);
+                }
+            } else SDL_GL_SwapWindow(a->win);
             lx::trace("frame swapped");
             { double cost = now_s() - frame_t0; g_frame_cost = g_frame_cost == 0 ? cost : g_frame_cost * 0.9 + cost * 0.1; }
         }

@@ -265,3 +265,93 @@ seq flood, 31 MB (about 3.9 M lines of 8 bytes), one traced run, ms after the co
 
 - `LP_NUM_THREADS` (llvmpipe worker threads; default = 2 here), 5 interleaved runs per cell, flood time median / CPU median: seq 0.23 / 0.37 s (default), 0.19 / 0.37 (1 thread), 0.20 / 0.38 (2 threads); colour 0.16 / 0.33, 0.14 / 0.31, 0.14 / 0.32; redraw 0.05 / 0.21, 0.05 / 0.20, 0.05 / 0.22. Ranges overlap in every row (the default's range is the widest, 0.19-0.25 on seq), so no measured win: rejected, nothing changed. Not measured: idle CPU and wake-ups with a single thread.
 - Take-over, 3 traced runs, ms after the command was sent: foreground job seen by the probe 9.5-15.4 (the shell forks and execs cat and cat's first 4096+ byte write arrives), shell and cat stopped within 1 ms, then 11-30 ms until cat is gone (after SIGCONT it finishes writing its in-flight chunk through the pty and exits), request sent 27-40 ms, marker 210-260 ms. The earlier "50 ms until the job starts" was inflated by the busy first frames of a traced run; the real fixed cost is 27-40 ms, of which the stop dance is under 1 ms (the 0.5 ms `nanosleep` polling in `nc_wait_stopped` is not a cost). Nothing in it can be cut safely: the first part is the shell's own fork and exec, the second is cat draining data it already read. Flood time is 80% feeding the engine.
+
+## Round 2026-11-03: flags, allocator, colour emoji
+
+Engine benchmark (`BENCH_MB=8`, 2 cores, i5-8500, GCC 14.2, 9 interleaved runs, medians; rows: no scrollback / 10k scrollback / unlimited / colour):
+
+- Flag bundle `-fno-math-errno -fno-semantic-interposition -fno-stack-protector -fno-asynchronous-unwind-tables -Wl,-O1,--as-needed,--hash-style=gnu,-z,pack-relative-relocs`: 1657 vs 1645, 935 vs 935, 780 vs 604, 434 vs 409 MB/s. Rows 1-2 identical; rows 3-4 move but their base ranges (401-924, 381-447) contain the result. Rejected, not kept (no consistent win).
+- `-fno-trapping-math -fno-exceptions -fno-threadsafe-statics -falign-functions=32`: inside noise on every row. Rejected.
+- jemalloc via `LD_PRELOAD`: 1628 / 864 / 658 / 387 against base 1627 / 889 / 556 / 398. Rejected.
+- Unlimited-scrollback row is bimodal (about 430 or 880 MB/s) run to run. With the app's own `mallopt` values (arena 2, mmap 64 KB, trim 256 KB) median 613; trim 16 MB 643; trim 64 MB 747; ranges 443-894 overlap. Raising the trim threshold costs idle RSS for no consistent gain: rejected.
+- Closed list unchanged: `-fno-plt`, `-march=native`, LTO, PGO, BOLT, `-O2`.
+
+Colour emoji (feature, not a speed change): colour bitmap fonts (CBDT, Noto Color Emoji) were rejected by `open_face` as not scalable. Now the strike nearest the font size is selected, box-scaled to the cell height (at most two cells wide) and uploaded to a second RGBA atlas (1024 x 1024, created on the first emoji glyph, not on ES2). Instances carry a colour flag in `pad` byte 2; the fragment shader branches on it before the mono path. Code points from U+1F000 prefer Noto Color Emoji; BMP symbols (U+2764 etc.) keep text presentation. Without a colour atlas (ES2) the glyph degrades to alpha x luma coverage tinted by the text colour. Non-emoji text only gains one flat varying and one predictable branch; the glyph cache hit path is untouched. Test: `make test-font`. Not measured: frame cost on a real GPU.
+
+### Cache levels (2026-11-03)
+
+i5-8500 here: L1d 32 KB per core, L2 4 MB per core, L3 16 MB shared (lscpu; `perf_event_paranoid` is 3, so no hardware counters; numbers are cachegrind/callgrind simulation with 32 KB 8-way L1 and 8 MB LL, 1 MB benchmark input).
+
+- Engine total: D1 miss rate 2.5% (reads 2.0%, writes 3.1%), last-level miss rate 0.3%. The parser is already cache-resident; there is no large L1 gap to close.
+- Largest simulated write-miss sources: `clear_row` memset 340K of 650K D1 write misses (cold row memory, inherent to recycling rows), `sd_lz_compress` read misses 190K (streaming the input once, inherent).
+- Tried: shrinking the LZ hash table (zeroed on every call, 32 KB = the whole L1d) from 13 to 12, 11, 10 bits: compressor 9.9 / 10.0 / 10.1 / 10.1 GB/s per core, packed size identical in the benchmark output. Inside noise: rejected, `lz.cpp` unchanged.
+- The unlimited-scrollback row is bimodal because of thread placement, not cache size: pinned to one core (`taskset -c 0`) 390-453 MB/s (parser and compress worker time-share), on both cores 477-884 MB/s. Pinning the worker to a second core in the app was not done (core count varies, other loads share the cores); the open question is whether a soft affinity hint helps on 2-core machines.
+
+## CPU renderer for machines without a GPU (2026-11-03)
+
+Profile first (perf-profile, `--fp`, 499 Hz, VM with no GPU, `seq 1 3000000` in a tab, recordings in the claude-memory-bank repo, `perf-data/lestrix-2026-11-03/recordings/`, opened in Hotspot): llvmpipe-0 33% + llvmpipe-1 32% (of which 53% JIT shader code, 13% libgallium), `seq` 20%, Lestrix's own threads 15%, own code about 3%. Kernel symbols resolved after `kptr_restrict=0`. Conclusion: on a GPU-less VM the frame cost is software OpenGL, not the engine.
+
+Change: `src/ui/soft.cpp` rasterises the same RInst stream on the CPU (rects, SDF rounded/bordered rects, mono glyphs from an in-memory R8 atlas, colour glyphs from an RGBA atlas, scissor, `r_clip`); `atlas.cpp` keeps CPU copies of the atlases when `sd_soft`; `render.cpp` skips shaders and GL state; `app.cpp` creates a plain window (SDL framebuffer acceleration hint off, otherwise SDL presents the surface through an OpenGL texture and llvmpipe is back: seen in the first measurement, CPU 1380 ms before the hint, 2000+ ms after it with a 16-bit surface rejected and GL used again, 680 ms with the 32-bit back buffer). The X display here is 16-bit (SDL window surface R mask f800), so frames are drawn into a 32-bit back buffer and SDL converts on `SDL_BlitSurface`.
+
+Selection: `--render auto|cpu|gpu` / `LESTRIX_RENDER`; auto = CPU when there is no readable `/dev/dri/renderD*` and no `/dev/nvidiactl`; GL init failure falls back to CPU.
+
+Results (`flood_bench.sh`: lestrix in a window, `sleep 1.5; seq 1 3000000; touch done`; wall time from 1.4 s after start to `done`, lestrix utime+stime in that span; 5 interleaved runs):
+
+| | wall s | Lestrix CPU ms |
+|---|---|---|
+| OpenGL (llvmpipe) | 3.80 3.43 3.60 3.27 3.47 (median 3.47) | 2270 2050 2190 1990 2150 (median 2150) |
+| CPU renderer | 2.21 2.31 2.01 2.25 2.33 (median 2.25) | 680 730 600 710 740 (median 710) |
+
+Also: first frame 83 ms vs 180 ms, RSS 33 vs 137 MB, PSS 13 vs 74 MB, idle 10 vs 40 ms CPU per 6 s. Profile of the CPU renderer on the same flood: `seq` 44%, Lestrix main thread 39% (`soft_draw` 6%, `soft_clear` 3.8%, rest syscalls and X), `lx-io` 17%; the rasteriser is about a tenth of all samples, so the generator and the pty now dominate.
+
+Open: damage tracking (the whole frame is cleared and redrawn, and `SDL_UpdateWindowSurface` copies it all; a changed-rows rectangle list would cut `soft_clear`, the conversion blit and the X upload), row-parallel rasterising for 4K windows, Wayland and 24-bit X not measured, no real-GPU comparison.
+
+### CPU renderer: changed-tiles repaint (2026-11-03, later)
+
+Profile before: with one line rewritten in place (awk printing `\rcount N` 3 million times) the whole frame was cleared and redrawn every time, `soft_draw` 3.1% and `soft_clear` 2.2% of all samples plus the SDL conversion and upload of the whole window (about 12% in the flood profile). Change (`render.cpp`, `SoftState`): the frame is kept as an instance list (drawing deferred to `r_end`), the window is cut into 32x32 tiles, every instance mixes a hash of itself and its clip into the tiles it touches in draw order, and only tiles whose hash differs from the last frame are cleared and repainted (merged into runs per tile row, instances binned per row). The pixels of the previous frame persist in the surface (or the 32-bit back buffer). Full repaint is forced on first frame, size or surface change, new clear colour, atlas generation change and window expose/resize events. `app.cpp` presents only the repainted rectangles (`SDL_UpdateWindowSurfaceRects`; the back-buffer blit is restricted to them) and presents nothing for an unchanged frame.
+
+Correctness: `LESTRIX_SOFT_VERIFY=1` repaints every frame from scratch into a scratch buffer and compares it with the incrementally painted frame (`fatal` exits 3; `make test-gui` runs the CPU renderer with it). Zero mismatches over the GUI scripts and three floods (`seq`, in-place status line, `ls -la` dump); a mutated build that never repaints reports 22 mismatches, so the check bites.
+
+Results (A/B, `bench.sh` in the claude-memory-bank repo, `perf-data/lestrix-2026-11-03/scripts/`, 5 interleaved runs, CPU renderer both):
+
+| workload | before: wall / Lestrix CPU | after: wall / Lestrix CPU |
+|---|---|---|
+| in-place status line, 3M updates | 11.27 10.43 10.98 10.57 10.62 s (median 10.62) / 3230 2940 3150 3000 3030 ms (median 3030) | 8.56 9.28 8.72 8.75 8.85 s (median 8.75) / 1480 1570 1530 1490 1580 ms (median 1530) |
+| idle, 6 s | 30 ms | 0 ms |
+| `seq` flood, 3M lines | median 470 ms CPU (noisy 440-880) | median 540 ms (470-600): no change, every tile of the pane changes each frame |
+
+perf (499 Hz, same workload): Lestrix main thread 1302 samples before, 753 after (-42%); `soft_draw` falls out of the top symbols. Note the first version of the status workload was wrong (a literal `\r` made awk wrap and scroll the whole pane, so 65% of tiles were dirty); the awk program now lives in a file. Open: parallel rasterising for 4K windows, Wayland and 24-bit X untested, real GPU untested.
+
+### UI wake-up storm (2026-11-03, from `status2_after.data`)
+
+Recordings, scripts, binaries and `strace` evidence for this round: `perf-data/lestrix-2026-11-03/` in https://github.com/BeanGreen247/claude-memory-bank (its README says which recording resolves which symbols). Open with `hotspot <file>`.
+
+Profile (perf, `--fp`; flat and with `strace -c -f`): in the in-place status-line workload 63% of the UI thread's samples were inside system calls, 31% of it in syscall entry/exit alone (`syscall_return_via_sysret`, `entry_SYSRETQ_unsafe_stack`, `entry_SYSCALL_64`, plus mitigation work such as `clear_bhb_loop` on this VM). `strace -c` counted 82,269 `recvmsg` calls, 81,451 of them failing with EAGAIN, in 9 s; the stack (`strace -k`) was Xlib's `XEventsQueued` from SDL's event pump. Cause: the reader thread wakes the UI for every 0.2 ms of output (`tcore.cpp` `wake_ui`), up to 5000 wake-ups a second; while a frame was already due the UI thread woke, ran its whole loop (pump, timers, event poll with the X connection check) and went back to sleep until the next wake.
+
+Change (`app.cpp`): `frame_pending` is set while the UI thread sleeps with `a->dirty` set and cleared as soon as it wakes; `app_wake()` returns immediately while it is set. Output is written before `app_wake()` runs and the flag is cleared before the frame is built, so a skipped wake cannot leave output undrawn (the frame, due within one frame gap, re-reads everything).
+
+Results (A/B, `bench.sh`, CPU renderer both, 5 and 6 interleaved runs):
+
+| workload | before | after |
+|---|---|---|
+| in-place status line, 3M updates | 8.38 8.39 8.72 9.15 8.78 s; Lestrix CPU 1470 1450 1490 1610 1540 ms | 8.08 7.66 8.16 7.86 7.59 s; 440 400 430 410 410 ms |
+| `seq` flood, 3M lines | 2.10 2.14 2.01 1.94 1.83 1.06 s; 560 520 510 480 510 360 ms | 2.03 1.16 1.66 0.99 1.41 1.53 s; 300 250 270 250 270 290 ms |
+| idle, 6 s | 0 ms | 10 ms (noise) |
+
+perf after: UI thread 13.2% of all samples -> 2.5%; `recvmsg` calls 82,269 -> 8,827 and futex 227 -> 30 in 9 s. Echo latency (strace, echo read on the pty to the next X request from the UI thread, typed `q z x y k` in an idle shell, 4 runs each): before 0.8-12.8 ms, median about 0.9 ms; after 0.4-5.4 ms, median about 0.9 ms (strace overhead included in both): no regression. `make test`, `make test-gui` (both renderers) and `LESTRIX_SOFT_VERIFY` runs on a `seq` and a status-line workload pass.
+
+Left in the profile: `awk` and the pty are now 90% of the status workload; the reader thread does 20k `read` plus 20k `clock_nanosleep` (the 200 us read delay, tuned earlier) in 9 s; SDL's `XSync` after each present (a server round trip per frame) is the remaining UI-thread syscall cost; Xlib polls inside it.
+
+## Read delay 200 -> 400 us (2026-11-05)
+
+Re-sweep with the CPU renderer and `seq`/status workloads (3 interleaved runs each, `--read-delay` N): status-line CPU 0 us 2890-3110 ms, 50 us 660-720, 100 us 470-490, 200 us 370-400, 400 us 300-330, 800 us 240-260; wall time flat from 50 us (7.1-7.8 s, awk-bound); flood CPU flat from 100 us (250-290 ms). Default raised to 400 us (the 2026-10 paste sweep had 200 and 400 on the same plateau, 18.1 s vs 18.2 s; 1000 us was worse at 21.3 s). Release build A/B, 3 interleaved runs: status CPU 380-400 -> 270-300 ms (-27%), wall 7.5 s unchanged, flood CPU 250-270 -> 240-260 ms. The delay is only slept after a read under 1 KB and delays the next read, never the one already delivered. Not measured: key-to-pixel latency. `make test` passes. Raw data: claude-memory-bank `perf-data/lestrix-2026-11-05/`.
+
+## Key-to-pixel latency (2026-11-05)
+
+Method: `k2p.c` sends one `x` with XTest to the focused window and polls `XGetImage` on the echo region until the pixels change (no compositor, so this is the moment the present reached the X server; it excludes the display scan-out and input device time). Idle `sh`, 1440x780 window, 2-vCPU VM, 30 keys per run, only keys sent after 150 ms of stable pixels. Scripts: claude-memory-bank `perf-data/lestrix-2026-11-05/scripts/` (`k2p.c`, `run_k2p.sh`).
+
+CPU renderer, default read delay 400 us: median 0.8-0.9 ms, p90 0.9-1.2 ms, max 2.2 ms (4 runs). OpenGL (llvmpipe): median 9.3-10.2 ms, p90 11-19 ms, max 27.7 ms (two 60 fps frames at worst). Read-delay sweep, CPU renderer, 2 runs each, median: 0 us 0.5, 200 us 0.7, 400 us 0.9, 1000 us 1.5 ms. The delay adds about its own length to an idle echo, so 200 -> 400 us costs 0.2 ms. Not measured: latency while a flood is running, GPU hardware.
+
+Latency under load (same method, CPU renderer, cursor hidden so the cursor jumping to the status row cannot trigger the detector; load writes one status row with save/restore cursor). Idle: median 0.9 ms, p90 1.0. Light load (shell loop, 2 ms between writes): median 0.6-0.7, p90 1.0-1.2, max 2.2. Saturating load (awk, no pacing, one core busy): median 1.2-1.7 ms, p90 9-31 ms, max 35-101 ms, read delay 200 vs 400 us not distinguishable (3 runs of 40 each, p90 10-25 vs 18-31). Probable cause, not verified: the echo queues behind up to a full pty buffer of pending output, plus 2 vCPUs shared by awk, Lestrix, Xorg and the probe. Not fixable by ordering: the echo is data in the same byte stream.
+
+Replay of recorded full-screen sessions (vim with syntax, 300 page-downs, `script` recording x10 = 11 MB; `top -d 0.01`, 19.7 MB; `cat` of the file into Lestrix, 3 runs each): vim 0.26-0.37 s wall, 60-80 ms CPU (CPU renderer) vs 0.42-0.47 s, 140-150 ms (OpenGL); top 0.42-0.47 s, 90-120 ms vs 0.52-0.58 s, 170-200 ms. Profile (`top` replay): `feed_serial` 4.2%, `hist_push` 2.0%, `soft_draw` 1.7%, `csi_dispatch` 1.1% of samples, nothing else of Lestrix above 1%. Startup: window mapped 83-96 ms (CPU renderer), 119-150 ms (OpenGL); startup CPU 50-60 ms vs 160-170 ms; RSS 32 MB vs 133 MB. Memory with scrollback: 3M-line flood (22.9 MB) 38 MB RSS, 300k coloured lines (18.7 MB) 35 MB. The `XSync` per present was not changed: SDL-internal, under 1% of samples in every profile above.

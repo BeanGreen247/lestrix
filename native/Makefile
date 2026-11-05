@@ -8,7 +8,7 @@ CXXFLAGS  += $(GCC_TUNE)
 CXXFLAGS  += -std=gnu++20 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-deprecated-declarations -Wno-missing-field-initializers -fvisibility=hidden -fno-rtti -pthread
 BUILD   := build
 
-.PHONY: bench-file bench-terminals all test test-fast test-shadow test-native-cat test-gui perf-gate test-lz test-vt-tsan test-vt test-store test-xfer test-ftp bench app install uninstall clean
+.PHONY: test-soft test-font bench-file bench-terminals all test test-fast test-shadow test-native-cat test-gui perf-gate test-lz test-vt-tsan test-vt test-store test-xfer test-ftp bench app install uninstall clean
 all: app
 
 $(BUILD):
@@ -31,7 +31,7 @@ test-vt: $(BUILD)/test_vt $(BUILD)/libvt.so
 	@PY=$$(for p in ../.venv/bin/python python3; do $$p -c "import pyte" 2>/dev/null && echo $$p && break; done); \
 	  if [ -n "$$PY" ]; then $$PY tests/diff_pyte.py 1500; else echo "(pyte not installed: skipping the differential test)"; fi
 
-test: test-vt test-fast test-shadow test-native-cat test-lz test-vt-tsan test-store test-xfer test-ftp perf-gate
+test: test-soft test-font test-vt test-fast test-shadow test-native-cat test-lz test-vt-tsan test-store test-xfer test-ftp perf-gate
 
 bench: $(BUILD)/bench_vt
 	$(BUILD)/bench_vt
@@ -50,10 +50,22 @@ $(BUILD)/test_xfer: tests/test_xfer.cpp src/xfer.cpp src/store.cpp src/json.cpp 
 test-xfer: $(BUILD)/test_xfer
 	$(BUILD)/test_xfer
 
+$(BUILD)/test_soft: tests/test_soft.cpp src/ui/soft.cpp src/ui/soft.h src/ui/render.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -g -o $@ tests/test_soft.cpp src/ui/soft.cpp -lm
+
+test-soft: $(BUILD)/test_soft
+	$(BUILD)/test_soft
+
+$(BUILD)/test_font: tests/test_font.cpp src/ui/font.cpp src/ui/font.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags freetype2 fontconfig) -fsanitize=address,undefined -g -o $@ tests/test_font.cpp src/ui/font.cpp $(shell pkg-config --libs freetype2 fontconfig) -lm
+
+test-font: $(BUILD)/test_font
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/test_font
+
 GUI_CFLAGS := $(shell pkg-config --cflags sdl2 freetype2 fontconfig)
 GUI_LIBS   := $(shell pkg-config --libs sdl2 freetype2 fontconfig)
 UI_SRC := src/ui/app.cpp src/ui/dialogs.cpp src/ui/filespane.cpp src/ui/jobs.cpp src/ui/ui.cpp src/ui/gl.cpp src/ui/font.cpp src/ui/atlas.cpp src/ui/workpool.cpp \
-          src/ui/render.cpp src/ui/tcore.cpp src/ui/termview.cpp src/ui/uitheme.cpp src/ui/fleetwm.cpp
+          src/ui/render.cpp src/ui/soft.cpp src/ui/tcore.cpp src/ui/termview.cpp src/ui/uitheme.cpp src/ui/fleetwm.cpp
 CORE_SRC := src/bench.cpp src/vt.cpp src/lz.cpp src/pty.cpp src/store.cpp src/json.cpp src/inventory.cpp src/util.cpp src/xfer.cpp
 APP_SRC := $(UI_SRC) $(CORE_SRC)
 $(BUILD)/lestrix: $(APP_SRC) $(wildcard src/*.h src/ui/*.h) | $(BUILD)
@@ -107,13 +119,13 @@ perf-gate: $(BUILD)/perf_gate
 	$(BUILD)/perf_gate
 
 test-gui: $(BUILD)/lestrix
-	@set -e; d=$$(mktemp -d); mkdir -p $$d/lestrix; \
+	@set -e; for mode in cpu gpu; do export LESTRIX_RENDER=$$mode LESTRIX_SOFT_VERIFY=fatal; d=$$(mktemp -d); mkdir -p $$d/lestrix; \
 	 for s in "w:0.5;s:$$d/a.ppm" "w:0.5;c:28,15;w:0.3;s:$$d/b.ppm" "w:0.5;c:303,56;w:0.4;t:name;k:escape;w:0.2;s:$$d/c.ppm" "w:0.5;d:800,600;w:0.6;c:900,46;w:0.3;d:900,46;w:0.6;s:$$d/e.ppm"; do \
 	   XDG_CONFIG_HOME=$$d timeout 30 $(BUILD)/lestrix --script "$$s" || { echo "test-gui: failed on $$s"; exit 1; }; \
 	 done; \
 	 XDG_CONFIG_HOME=$$d timeout 30 $(BUILD)/lestrix --basic --script "w:0.5;t:echo basic;k:return;w:0.3;s:$$d/d.ppm" || { echo "test-gui: --basic failed"; exit 1; }; \
 	 for f in a b c d e; do test -s $$d/$$f.ppm || { echo "test-gui: no frame $$f"; exit 1; }; done; \
-	 rm -rf $$d; echo "test-gui: ok"
+	 rm -rf $$d; echo "test-gui ($$mode renderer): ok"; done
 
 $(BUILD)/test_fast_paths: tests/test_fast_paths.cpp src/vt.cpp src/lz.cpp src/vt.h | $(BUILD)
 	$(CXX) -std=gnu++20 -O3 -g -pthread -fsanitize=address,undefined -o $@ tests/test_fast_paths.cpp src/vt.cpp src/lz.cpp
