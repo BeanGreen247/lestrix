@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <vector>
 
 #include "../src/ui/soft.h"
@@ -109,6 +110,19 @@ int main() {
     draw(&r, 1);
     CHECK(px(12, 12) == 0);                        /* 1 px border: the middle stays empty */
     CHECK(px(12, 4) != 0 && px(4, 12) != 0 && px(12, 19) != 0 && px(19, 12) != 0);
+
+    /* a rounded rect narrower than twice its edge band has no interior span: it used to loop forever (pegged the UI thread) */
+    alarm(5);
+    clear(RGBA(0, 0, 0, 255));
+    r = rect(4, 4, 6, 12, RGBA(255, 255, 255, 255), 2);   /* radius 2, band 3, width 6: interior span is empty */
+    draw(&r, 1);
+    CHECK(px(6, 10) == rgb(255, 255, 255) && px(3, 10) == 0 && px(10, 10) == 0);
+    r = rect(4, 4, 7, 12, RGBA(255, 255, 255, 255), 2);   /* width 7: one-pixel interior span */
+    draw(&r, 1);
+    clear(RGBA(0, 0, 0, 255));
+    r = rect(4, 4, 6, 12, RGBA(255, 255, 255, 255), 2 | 1 << 8);   /* with a 1 px border */
+    draw(&r, 1);
+    alarm(0);
 
     /* channel order follows the target's shifts */
     SoftTarget bgr{fb, W, H, W, 0, 8, 16, 0xff000000u};

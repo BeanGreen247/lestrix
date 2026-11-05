@@ -58,8 +58,7 @@ static void draw_rrect(const SoftTarget *t, const Fmt &f, const RInst &in, Rect 
             xa = (int)ceilf(in.x + band - 0.5f); xb = (int)ceilf(in.x + in.w - band - 0.5f);
             if (xa < r.x0) xa = r.x0;
             if (xb > r.x1) xb = r.x1;
-            if (xb < xa) xb = xa;
-            ia = 1;
+            ia = xb > xa;   /* an empty interior span must not be "skipped": x = xb - 1 would step back onto xa forever */
         }
         for (int x = r.x0; x < r.x1; x++) {
             if (ia && x == xa) {
