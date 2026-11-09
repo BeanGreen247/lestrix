@@ -23,7 +23,7 @@ static const uint32_t POOL[] = {0xe9, 0xfc, 0x3b1, 0x416, 0x2500, 0x2588, 0x6f22
 
 static size_t make(uint8_t *b, size_t cap) {
     size_t n = 0;
-    while (n + 16 < cap) {
+    while (n + 40 < cap) {
         unsigned k = rnd() % 100;
         if (k < 40) b[n++] = (uint8_t)(0x20 + rnd() % 95);
         else if (k < 80) n += enc(POOL[rnd() % (sizeof POOL / sizeof *POOL)], b + n);
@@ -34,7 +34,12 @@ static size_t make(uint8_t *b, size_t cap) {
         else if (k < 94) { b[n++] = 0xe4; b[n++] = (uint8_t)(0xb8); }
         else if (k < 95) { b[n++] = 0xc0; b[n++] = 0x80; }
         else if (k < 96) { b[n++] = 0xed; b[n++] = 0xa0; b[n++] = 0x80; }
-        else if (k < 98) n += (size_t)snprintf((char *)b + n, 16, "\x1b[%dm", (int)(rnd() % 8) + 30);
+        else if (k < 98) {
+            if (rnd() & 1) n += (size_t)snprintf((char *)b + n, 16, "\x1b[%dm", (int)(rnd() % 8) + 30);
+            else if (rnd() & 1) n += (size_t)snprintf((char *)b + n, 24, "\x1b[%d8;%d;%dm", 3 + (int)(rnd() % 2), 5, (int)(rnd() % 300));
+            else if (rnd() & 1) n += (size_t)snprintf((char *)b + n, 32, "\x1b[%d8;2;%d;%d;%dm", 3 + (int)(rnd() % 2), (int)(rnd() % 300), (int)(rnd() % 256), (int)(rnd() % 256));
+            else n += (size_t)snprintf((char *)b + n, 16, "\x1b[%d;%d%dm", (int)(rnd() % 3), (int)(rnd() % 10), (int)(rnd() % 10));   /* the two-parameter SGR fast path and its near misses */
+        }
         else n += (size_t)snprintf((char *)b + n, 16, "\x1b[%d;%dH", (int)(rnd() % 20) + 1, (int)(rnd() % 90) + 1);
     }
     return n;
@@ -52,6 +57,8 @@ static int same(Vt *a, Vt *b) {
         if (getenv("FP_DEBUG") && la != lb) { fprintf(stderr, "idx %d len %d/%d hist %d\n", idx, la, lb, ha); }
         for (int x = 0; x < m; x++) {
             VtCell xa = x < la ? ca[x] : (VtCell){0, 0}, xb = x < lb ? cb[x] : (VtCell){0, 0};
+            const VtStyle *sa = vt_style(a, VT_CELL_STYLE(xa)), *sb = vt_style(b, VT_CELL_STYLE(xb));
+            if (sa->fg != sb->fg || sa->bg != sb->bg || sa->attrs != sb->attrs || sa->ul != sb->ul) { if (getenv("FP_DEBUG")) fprintf(stderr, "idx %d x %d: style differs %x/%x %x/%x\n", idx, x, sa->fg, sb->fg, sa->bg, sb->bg); return 0; }
             if (xa.cp != xb.cp || (xa.sf & 0xff) != (xb.sf & 0xff)) { if (getenv("FP_DEBUG")) fprintf(stderr, "idx %d x %d: cp %x/%x sf %x/%x len %d/%d hist %d\n", idx, x, xa.cp, xb.cp, xa.sf, xb.sf, la, lb, ha); return 0; }
         }
     }
@@ -118,7 +125,8 @@ int main(void) {
             size_t chunk = 1 + rnd() % 700;
             if (chunk > n - i) chunk = n - i;
             vt_set_fast_paths(true);  vt_feed(fast, buf + i, chunk);
-            vt_set_fast_paths(false); vt_feed(slow, buf + i, chunk);
+            vt_set_fast_paths(false);
+            for (size_t j = 0; j < chunk; j++) vt_feed(slow, buf + i + j, 1);   /* one byte at a time: no sequence is ever whole in the buffer, so the escape fast paths cannot run */
             i += chunk;
         }
         vt_set_fast_paths(true);

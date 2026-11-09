@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#34e0b0"/><stop offset="1" stop-color="#0a5f78"/></linearGradient></defs>
+<rect x="8" y="8" width="240" height="240" rx="58" fill="url(#bg)"/>
+<g fill="none" stroke="#fff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"><path d="M36 100 L58 128 L36 156"/><path d="M204 164 H232"/></g>
+<g transform="translate(128,134) scale(.8) translate(-128,-130)">
+<g id="h"><polygon points="150,74 176,40 190,96" fill="#e9f4f1"/><polygon points="174,44 180,20 182,48" fill="#10303a"/><polygon points="128,66 150,74 144,108 128,112" fill="#f6fbfa"/><polygon points="150,74 190,96 176,128 144,108" fill="#d5ebe5"/><polygon points="190,96 204,140 184,176 176,128" fill="#bfe0d8"/><polygon points="204,140 218,172 184,176" fill="#a6cfc5"/><polygon points="128,112 144,108 128,150" fill="#e2f2ee"/><polygon points="144,108 176,128 150,160 128,150" fill="#cfe7e1"/><polygon points="176,128 184,176 150,186 150,160" fill="#b6d9d0"/><polygon points="128,150 150,160 150,186 128,198" fill="#a8cfc5"/><ellipse cx="152" cy="119" rx="14" ry="9.5" transform="rotate(-14 152 119)" fill="#0d2a33"/><ellipse cx="153" cy="119" rx="8" ry="7" fill="#3bf0b8"/><rect x="151.5" y="112" width="3" height="14" rx="1.5" fill="#0d2a33"/></g>
+<g transform="translate(256,0) scale(-1,1)"><use href="#h"/></g>
+<polygon points="119,150 137,150 128,163" fill="#10303a"/></g></svg>

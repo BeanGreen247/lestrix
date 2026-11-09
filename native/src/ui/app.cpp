@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -183,6 +184,10 @@ static void settings_load(App *a) {
     a->sb_disk_mb = (size_t)s.get_int("ui", "scrollback_disk_mb", 4096);
     a->sb_spill = s.get_bool("ui", "scrollback_spill", true);
     a->fast_cat = s.get_bool("ui", "fast_cat", true);
+    a->notify = s.get_bool("ui", "notifications", true);
+    if (s.has("ui", "ligatures")) a->lig_mode = s.get_bool("ui", "ligatures", false) ? 1 : 0;
+    a->notify_secs = s.get_int("ui", "notify_after_s", 10);
+    if (a->notify_secs < 1 || a->notify_secs > 86400) a->notify_secs = 10;
     a->hud = s.get_bool("ui", "performance_overlay", true);
     a->follow_fleet = s.get_bool("ui", "follow_fleetwm", true);
     a->rounded = s.get_bool("ui", "rounded_corners", true);
@@ -215,6 +220,9 @@ void app_settings_save(App *a) {
     if (!a->lite) s.set_bool("ui", "performance_overlay", a->hud);
     if (!a->lite) s.set_bool("ui", "sidebar_pinned", a->pinned);
     s.set_bool("ui", "fast_cat", a->fast_cat);
+    s.set_bool("ui", "notifications", a->notify);
+    if (a->lig_mode >= 0) s.set_bool("ui", "ligatures", a->lig_mode > 0);
+    s.set_int("ui", "notify_after_s", a->notify_secs);
     if (!a->lite) s.set_bool("ui", "sidebar_shown", a->dock_shown);
     if (!a->lite) s.set_int("ui", "sidebar_page", a->side_page);
     s.set_bool("ui", "follow_fleetwm", a->follow_fleet);
@@ -226,7 +234,7 @@ void app_settings_save(App *a) {
 
 static void mark_terms_dirty(App *a) {
     for (auto &tb : a->tabs)
-        if (tb->term) { tcore_lock(tb->term); vt_mark_all_dirty(tcore_vt(tb->term)); tcore_unlock(tb->term); }
+        for (TermCore *tc : tab_terms(tb.get())) { tcore_lock(tc); vt_mark_all_dirty(tcore_vt(tc)); tcore_unlock(tc); }
 }
 
 void app_apply_theme(App *a, const UiTheme *t) {
@@ -271,11 +279,46 @@ static std::string pick_font_family() {
     return out;
 }
 
+static bool g_font_lig = false;   /* the current terminal font has ligature features (checked once per font) */
+
+bool app_ligatures_on(const App *a) { return a->lig_mode < 0 ? g_font_lig : a->lig_mode > 0; }
+
+void app_ligatures_apply(App *a) {
+    g_font_lig = a->lig_mode != 0 && a->term_font && font_has_ligatures(a->term_font);
+    tv_set_ligatures(a->lig_mode < 0 ? g_font_lig : a->lig_mode > 0);
+}
+
 void app_apply_font(App *a) {
     Font *nf = font_open(a->font_family.empty() ? "monospace" : a->font_family.c_str(), a->font_size * 96.0 / 72.0 * a->scale, true);
     if (!nf) return;
     if (a->term_font) font_close(a->term_font);
     a->term_font = nf;
+    app_ligatures_apply(a);
+    mark_terms_dirty(a);
+    app_redraw(a);
+}
+
+/* The window moved to a monitor with another scale, or the compositor changed its fractional scale: re-derive the pixel scale from
+ * drawable/window size, reopen the fonts for it and let the next frame lay everything out again. */
+static void app_rescale(App *a) {
+    if (a->soft || !a->win) return;
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(a->win, &ww, &wh);
+    if (ww <= 0) return;
+    float ns = (float)a->W / (float)ww;
+    if (ns < 0.5f || ns > 8.f || fabsf(ns - a->scale) < 0.01f) return;
+    a->scale = ns;
+    Font *uf = font_open("sans", 13 * ns, false);
+    Font *um = font_open("monospace", 12 * ns, true);
+    Font *tf = font_open(a->font_family.empty() ? "monospace" : a->font_family.c_str(), a->font_size * 96.0 / 72.0 * ns, true);
+    if (!uf || !um || !tf) { if (uf) font_close(uf); if (um) font_close(um); if (tf) font_close(tf); return; }
+    ui_set_scale(a->ui, ns, uf, um);
+    if (a->ui_font) font_close(a->ui_font);
+    if (a->ui_mono) font_close(a->ui_mono);
+    if (a->term_font) font_close(a->term_font);
+    if (a->big_font) { font_close(a->big_font); a->big_font = nullptr; }   /* reopened lazily by the start page */
+    a->ui_font = uf; a->ui_mono = um; a->term_font = tf;
+    app_ligatures_apply(a);
     mark_terms_dirty(a);
     app_redraw(a);
 }
@@ -288,6 +331,7 @@ static int tab_index(App *a, const Tab *t) {
 }
 
 static void ended_prompt(App *a, Tab *t);
+static Pane *g_div_drag = nullptr, *g_drag_pane = nullptr;   /* divider being dragged, pane a mouse drag started in */
 
 static void select_tab(App *a, int i) {
     if (i < 0 || i >= (int)a->tabs.size()) return;
@@ -300,30 +344,130 @@ static void select_tab(App *a, int i) {
 }
 
 static void hook_wake(void *) { app_wake(); }
-static void hook_activity(void *u) { Tab *t = static_cast<Tab *>(u); if (t->files) t->files->note_activity(); if (app_cur_tab(t->app) != t && t->state == ST_IDLE) t->state = ST_ACTIVITY; }
-static void hook_bell(void *u) { Tab *t = static_cast<Tab *>(u); if (app_cur_tab(t->app) != t && (t->state == ST_IDLE || t->state == ST_ACTIVITY)) t->state = ST_BELL; }
-static void hook_exited(void *u, int) {
-    Tab *t = static_cast<Tab *>(u);
+static Tab *hk(void *u) { return static_cast<Pane *>(u)->tab; }
+static void hook_activity(void *u) { Tab *t = hk(u); if (t->files) t->files->note_activity(); if (app_cur_tab(t->app) != t && t->state == ST_IDLE) t->state = ST_ACTIVITY; }
+static void hook_bell(void *u) { Tab *t = hk(u); if (app_cur_tab(t->app) != t && (t->state == ST_IDLE || t->state == ST_ACTIVITY)) t->state = ST_BELL; }
+/* Desktop notification through `notify-send`, run without a shell (every text is one argv entry after "--"), detached, rate limited. */
+static void notify_clean(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    const unsigned char *q = (const unsigned char *)in;
+    for (; *q && o + 1 < cap; q++) {
+        if (*q < 0x20 || *q == 0x7f) { if (o && out[o - 1] != ' ') out[o++] = ' '; }
+        else out[o++] = (char)*q;
+    }
+    if (*q) {   /* cut by the cap: do not leave half of a UTF-8 sequence */
+        while (o > 0 && ((unsigned char)out[o - 1] & 0xC0) == 0x80) o--;
+        if (o > 0 && (unsigned char)out[o - 1] >= 0xC0) o--;
+    }
+    while (o && out[o - 1] == ' ') o--;
+    out[o] = 0;
+}
+
+static void notify_send(App *a, const char *title_raw, const char *body_raw) {
+    if (!a->notify) return;
+    double now = now_s();
+    if (a->notify_last > 0 && now - a->notify_last < 2.0) return;
+    char title[96], body[320];
+    notify_clean(title_raw ? title_raw : "", title, sizeof title);
+    notify_clean(body_raw ? body_raw : "", body, sizeof body);
+    if (!title[0] && !body[0]) return;
+    if (!title[0]) snprintf(title, sizeof title, "Lestrix");
+    a->notify_last = now;
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        if (fork() != 0) _exit(0);
+        int fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) { dup2(fd, 0); dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
+        execlp("notify-send", "notify-send", "-a", "Lestrix", "-i", "lestrix", "--", title, body, (char *)nullptr);
+        _exit(127);
+    }
+    if (pid > 0) waitpid(pid, nullptr, 0);
+}
+
+static bool tab_out_of_sight(Pane *p) {
+    Tab *t = p->tab;
+    return !(SDL_GetWindowFlags(t->app->win) & SDL_WINDOW_INPUT_FOCUS) || app_cur_tab(t->app) != t;
+}
+
+static void hook_notify(void *u, const char *title, const char *body) {
+    Pane *p = static_cast<Pane *>(u);
+    if (tab_out_of_sight(p)) notify_send(p->tab->app, title, body);
+}
+
+static void hook_cmd_end(void *u, int code, double secs) {
+    Pane *p = static_cast<Pane *>(u);
+    App *a = p->tab->app;
+    if (!a->notify || secs < a->notify_secs || !tab_out_of_sight(p)) return;
+    char body[160];
+    if (code < 0) snprintf(body, sizeof body, "Command finished after %d s", (int)secs);
+    else if (code == 0) snprintf(body, sizeof body, "Command finished after %d s", (int)secs);
+    else snprintf(body, sizeof body, "Command failed (exit %d) after %d s", code, (int)secs);
+    notify_send(a, p->tab->title.c_str(), body);
+}
+
+static void tab_session_ended(Tab *t) {
     t->state = ST_ENDED; t->asked = false;
     if (t->app->quit_on_exit) t->app->running = false;
     else ended_prompt(t->app, t);
 }
-static void hook_title(void *u, const char *title) {
-    Tab *t = static_cast<Tab *>(u);
-    if (t->app->basic && app_cur_tab(t->app) == t) SDL_SetWindowTitle(t->app->win, title && *title ? title : "Lestrix");
+static void hook_exited(void *u, int) {
+    Pane *p = static_cast<Pane *>(u);
+    Tab *t = p->tab;
+    if (t->root != p) { p->exited = true; app_redraw(t->app); return; }   /* one of several panes: the main loop closes it */
+    tab_session_ended(t);
 }
-static void hook_restarted(void *u) { Tab *t = static_cast<Tab *>(u); t->state = ST_IDLE; t->asked = false; }
-static void hook_cwd(void *u, const char *p) { Tab *t = static_cast<Tab *>(u); if (t->files) t->files->set_cwd(p); }
+static void hook_title(void *u, const char *title) {
+    Pane *p = static_cast<Pane *>(u);
+    Tab *t = p->tab;
+    if (t->app->basic && app_cur_tab(t->app) == t && t->focus == p) SDL_SetWindowTitle(t->app->win, title && *title ? title : "Lestrix");
+}
+static void hook_restarted(void *u) { Pane *p = static_cast<Pane *>(u); p->exited = false; p->tab->state = ST_IDLE; p->tab->asked = false; }
+static void hook_cwd(void *u, const char *path) {
+    Pane *p = static_cast<Pane *>(u);
+    Tab *t = p->tab;
+    p->cwd = path;
+    if (t->focus == p || t->root == p) { t->cwd = path; if (t->files) t->files->set_cwd(path); }
+}
 static void hook_clip_set(void *, const char *text, bool primary) { if (primary) SDL_SetPrimarySelectionText(text); else SDL_SetClipboardText(text); }
 static void hook_clip_request(void *u, bool primary) {
-    Tab *t = static_cast<Tab *>(u);
+    Pane *p = static_cast<Pane *>(u);
     char *s = primary ? SDL_GetPrimarySelectionText() : SDL_GetClipboardText();
-    if (s && *s && t->term) tcore_paste(t->term, s);
+    if (s && *s && p->term) tcore_paste(p->term, s);
     SDL_free(s);
 }
 
+void tab_pane_leaves(Tab *t, std::vector<Pane *> &out) {
+    std::vector<Pane *> st;
+    if (t->root) st.push_back(t->root);
+    while (!st.empty()) {
+        Pane *n = st.back();
+        st.pop_back();
+        if (n->leaf()) out.push_back(n);
+        else { st.push_back(n->b); st.push_back(n->a); }
+    }
+}
+
+std::vector<TermCore *> tab_terms(Tab *t) {
+    std::vector<Pane *> lv;
+    tab_pane_leaves(t, lv);
+    std::vector<TermCore *> out;
+    for (Pane *p : lv) if (p->term) out.push_back(p->term);
+    return out;
+}
+
+static void pane_free_tree(Pane *n) {
+    if (!n) return;
+    pane_free_tree(n->a);
+    pane_free_tree(n->b);
+    if (n->term) { tcore_close(n->term); tcore_free(n->term); }
+    delete n;
+}
+
 Tab::~Tab() {
-    if (term) { tcore_close(term); tcore_free(term); }
+    pane_free_tree(root);
+    root = focus = nullptr;
+    term = nullptr;
     if (files) files->close();
     if (!control_path.empty()) sd_xfer_remove_control_path(control_path);
 }
@@ -331,6 +475,10 @@ Tab::~Tab() {
 static void tab_destroy(App *a, Tab *t) {
     int idx = tab_index(a, t);
     if (idx < 0) return;
+    if (g_drag_pane && g_drag_pane->tab == t) g_drag_pane = nullptr;
+    if (g_div_drag && g_div_drag->tab == t) g_div_drag = nullptr;
+    if (find_is_open(a)) find_close(a);
+    links_clear(a);
     a->tabs.erase(a->tabs.begin() + idx);
     if (a->cur >= (int)a->tabs.size()) a->cur = (int)a->tabs.size() - 1;
     else if (idx < a->cur) a->cur--;
@@ -370,17 +518,33 @@ static bool g_fastcat = true;
 
 void app_fastcat_apply(App *a) { tcore_set_native_cat(a->fast_cat && g_fastcat); }
 
-static TermCore *make_term(App *a, Tab *t, const std::vector<std::string> &args, const char *cwd, bool fastcat) {
+static Pane *pane_new(App *a, Tab *t, const std::vector<std::string> &args, const char *cwd, bool fastcat) {
+    Pane *p = new Pane;
+    p->tab = t;
     TermHooks h{};
     h.wake = hook_wake; h.activity = hook_activity; h.bell = hook_bell; h.exited = hook_exited; h.restarted = hook_restarted;
-    h.cwd = hook_cwd; h.title = hook_title; h.clip_set = hook_clip_set; h.clip_request = hook_clip_request;
+    h.cwd = hook_cwd; h.title = hook_title; h.notify = hook_notify; h.cmd_end = hook_cmd_end; h.clip_set = hook_clip_set; h.clip_request = hook_clip_request;
     int cols, rows;
     float cw = (float)a->W - (a->pinned && a->dock_shown ? P(a->panel_w) : 0) - P(34), ch = (float)a->H - P(130);
     tv_fit(a->term_font, cw, ch, &cols, &rows);
     std::vector<char *> argv;
     for (const std::string &s : args) argv.push_back(const_cast<char *>(s.c_str()));
     argv.push_back(nullptr);
-    return tcore_new(argv.data(), cwd, cols, rows, &h, t, fastcat && g_fastcat);
+    p->term = tcore_new(argv.data(), cwd, cols, rows, &h, p, fastcat && g_fastcat);
+    tcore_set_cell_px(p->term, font_cell_w(a->term_font), font_cell_h(a->term_font));
+    return p;
+}
+
+static void pane_set_focus(Tab *t, Pane *p) {
+    t->focus = p;
+    t->term = p->term;
+    t->cwd = p->cwd;
+    if (t->files && !p->cwd.empty()) t->files->set_cwd(p->cwd);
+}
+
+static void tab_set_root(Tab *t, Pane *p) {
+    t->root = t->focus = p;
+    t->term = p->term;
 }
 
 std::vector<std::string> app_default_shell_argv(const std::string &shell) {
@@ -390,7 +554,7 @@ std::vector<std::string> app_default_shell_argv(const std::string &shell) {
 
 Tab *app_open_local(App *a, const std::string &title, const std::vector<std::string> &argv, const char *cwd) {
     Tab *t = tab_add(a, TAB_LOCAL, title);
-    t->term = make_term(a, t, argv, cwd, true);
+    tab_set_root(t, pane_new(a, t, argv, cwd, true));
     t->local_argv = argv;
     return t;
 }
@@ -416,7 +580,7 @@ static Tab *open_connection_copy(App *a, const SdConn &c) {
     }
     std::string cp = sd_xfer_new_control_path();
     Tab *t = tab_add(a, TAB_SSH, c.name);
-    t->term = make_term(a, t, c.argv(cp.c_str()), nullptr, false);
+    tab_set_root(t, pane_new(a, t, c.argv(cp.c_str()), nullptr, false));
     t->conn = std::make_unique<SdConn>(c);
     t->control_path = cp;
     t->color = c.color;
@@ -431,9 +595,110 @@ Tab *app_open_connection(App *a, const SdConn &conn) {
     return open_connection_copy(a, c);
 }
 
+/* Where a new local tab opened from t should start: the directory its shell reported (OSC 7), else /proc, else the default. */
+static std::string tab_local_cwd(Tab *t) {
+    if (!t || t->conn || !t->term) return "";
+    if (!t->cwd.empty()) return t->cwd;
+    char *p = tcore_proc_cwd(t->term);
+    std::string s = p ? p : "";
+    free(p);
+    return s;
+}
+
+/* Splits the focused pane of t: the new pane gets the same program (a local shell in the same directory, or another session on the
+ * same ssh connection) and the focus. */
+static void tab_split(App *a, Tab *t, bool horiz) {
+    if (!t->focus || !t->term || t->kind == TAB_FTP) return;
+    std::vector<std::string> argv;
+    std::string cwd;
+    bool fast = false;
+    if (t->conn) argv = t->conn->argv(t->control_path.c_str());
+    else {
+        argv = t->local_argv.empty() ? app_default_shell_argv("") : t->local_argv;
+        cwd = t->focus->cwd;
+        if (cwd.empty()) { char *pc = tcore_proc_cwd(t->term); if (pc) cwd = pc; free(pc); }
+        fast = true;
+    }
+    Pane *np = pane_new(a, t, argv, cwd.empty() ? nullptr : cwd.c_str(), fast);
+    if (!np->term) { delete np; return; }
+    Pane *f = t->focus;
+    Pane *in = new Pane;
+    in->tab = t; in->horiz = horiz; in->a = f; in->b = np; in->parent = f->parent; in->r = f->r;
+    if (f->parent) (f->parent->a == f ? f->parent->a : f->parent->b) = in;
+    else t->root = in;
+    f->parent = np->parent = in;
+    np->cwd = cwd;
+    pane_set_focus(t, np);
+    app_redraw(a);
+}
+
+static void tab_close_pane(App *a, Tab *t, Pane *p) {
+    Pane *par = p->parent;
+    if (!par || !p->leaf()) return;
+    if (find_is_open(a)) find_close(a);
+    links_clear(a);
+    if (g_div_drag == par || g_div_drag == p) g_div_drag = nullptr;
+    if (g_drag_pane == p) g_drag_pane = nullptr;
+    Pane *sib = par->a == p ? par->b : par->a, *gp = par->parent;
+    sib->parent = gp;
+    if (gp) (gp->a == par ? gp->a : gp->b) = sib;
+    else t->root = sib;
+    bool had_focus = t->focus == p;
+    if (g_div_drag == par) g_div_drag = nullptr;
+    if (p->term) { tcore_close(p->term); tcore_free(p->term); }
+    delete p;
+    delete par;
+    if (had_focus) {
+        Pane *n = sib;
+        while (!n->leaf()) n = n->a;
+        pane_set_focus(t, n);
+    }
+    app_redraw(a);
+}
+
+static void pane_step_focus(App *a, Tab *t, int dir) {
+    std::vector<Pane *> lv;
+    tab_pane_leaves(t, lv);
+    if (lv.size() < 2) return;
+    size_t i = 0;
+    while (i < lv.size() && lv[i] != t->focus) i++;
+    pane_set_focus(t, lv[(i + lv.size() + (dir < 0 ? lv.size() - 1 : 1)) % lv.size()]);
+    app_redraw(a);
+}
+
+static void app_close_pane(App *a, Tab *t) {
+    std::vector<Pane *> lv;
+    tab_pane_leaves(t, lv);
+    if (lv.size() < 2) return;
+    Pane *p = t->focus;
+    if (p->term && tcore_running(p->term))
+        dlg_confirm(a, "Close pane", "This pane is still running. Close it?", "Close", [a, t, p] {
+            std::vector<Pane *> now;
+            if (tab_index(a, t) < 0) return;
+            tab_pane_leaves(t, now);
+            for (Pane *q : now) if (q == p && now.size() > 1) { tab_close_pane(a, t, p); break; }
+        });
+    else tab_close_pane(a, t, p);
+}
+
+/* Panes whose program ended while others are open are closed here, out of the terminal's own hook. */
+static void reap_exited_panes(App *a) {
+    for (size_t i = 0; i < a->tabs.size(); i++) {
+        Tab *t = a->tabs[i].get();
+        for (bool again = true; again;) {
+            again = false;
+            std::vector<Pane *> lv;
+            tab_pane_leaves(t, lv);
+            if (lv.size() < 2) break;
+            for (Pane *p : lv) if (p->exited) { tab_close_pane(a, t, p); again = true; break; }
+        }
+        if (t->root && t->root->leaf() && t->root->exited) { t->root->exited = false; tab_session_ended(t); }
+    }
+}
+
 void app_dup_tab(App *a, Tab *t) {
     if (t->conn) app_open_connection(a, *t->conn);
-    else if (!t->local_argv.empty()) app_open_local(a, t->title, t->local_argv, nullptr);
+    else if (!t->local_argv.empty()) { std::string d = tab_local_cwd(t); app_open_local(a, t->title, t->local_argv, d.empty() ? nullptr : d.c_str()); }
 }
 
 static void move_current_tab(App *a, int delta) {
@@ -515,7 +780,7 @@ static void probe_all(App *a) {
 
 enum {
     A_NEW_CONN = 100, A_NEW_LOCAL, A_IMPORT_INV, A_IMPORT_SSH, A_QUIT, A_SIDEBAR, A_FILES, A_BIGGER, A_SMALLER, A_RECHECK, A_ACCENT,
-    A_FASTCAT, A_ACCENT_RESET, A_HUD, A_SSHCFG, A_STARTUP, A_SPILL, A_ABOUT, A_FLEET, A_ROUND, A_CACHE,
+    A_PREV_PROMPT, A_NEXT_PROMPT, A_SEL_OUTPUT, A_FASTCAT, A_NOTIFY, A_LIGATURES, A_ACCENT_RESET, A_HUD, A_SSHCFG, A_STARTUP, A_SPILL, A_ABOUT, A_FLEET, A_ROUND, A_CACHE, A_FIND, A_SPLIT_R, A_SPLIT_D, A_PANE_NEXT, A_PANE_PREV, A_PANE_CLOSE,
     A_THEME = 200, A_SB = 300, A_SHELL = 400,
     A_T_RENAME = 600, A_T_CUSTOM, A_T_DEFAULT, A_T_DUP, A_T_CLOSE, A_T_OTHERS, A_T_COLOR = 650,
     A_R_CONNECT = 700, A_R_EDIT, A_R_DUP, A_R_DELETE, A_R_NEW
@@ -588,6 +853,20 @@ static void open_bar_menu(App *a, int which, float x, float y) {
         add("Bigger font", "Ctrl+=", A_BIGGER, 0);
         add("Smaller font", "Ctrl+-", A_SMALLER, 0);
         add("Re-check hosts", "F5", A_RECHECK, 0);
+        add("Previous prompt", "Ctrl+Shift+Up", A_PREV_PROMPT, 0);
+        add("Next prompt", "Ctrl+Shift+Down", A_NEXT_PROMPT, 0);
+        add("Select last command output", "Ctrl+Shift+O", A_SEL_OUTPUT, 0);
+        {
+            Tab *mt = app_cur_tab(a);
+            bool can = mt && mt->term && mt->kind != TAB_FTP, multi = can && mt->root && !mt->root->leaf();
+            sep();
+            add("Find in scrollback", "Ctrl+Shift+F", A_FIND, mt && mt->term ? 0 : MI_DISABLED);
+            add("Split pane right", "Ctrl+Shift+E", A_SPLIT_R, can ? 0 : MI_DISABLED);
+            add("Split pane down", "Ctrl+Shift+R", A_SPLIT_D, can ? 0 : MI_DISABLED);
+            add("Next pane", "Ctrl+Shift+Right", A_PANE_NEXT, multi ? 0 : MI_DISABLED);
+            add("Previous pane", "Ctrl+Shift+Left", A_PANE_PREV, multi ? 0 : MI_DISABLED);
+            add("Close pane", "Ctrl+Shift+X", A_PANE_CLOSE, multi ? 0 : MI_DISABLED);
+        }
         sep();
         add("Theme", nullptr, 0, MI_HEADER);
         add("Follow fleetwm theme", nullptr, A_FLEET, MI_CHECK | (a->follow_fleet ? MI_CHECKED : 0) | (a->fleet.found ? 0 : MI_DISABLED));
@@ -601,6 +880,8 @@ static void open_bar_menu(App *a, int which, float x, float y) {
         add("Spill old scrollback to disk", nullptr, A_SPILL, MI_CHECK | (a->sb_spill ? MI_CHECKED : 0));
         sep();
         add("Fast cat in local tabs", nullptr, A_FASTCAT, MI_CHECK | (a->fast_cat ? MI_CHECKED : 0));
+        add("Ligatures (programming fonts)", nullptr, A_LIGATURES, MI_CHECK | (app_ligatures_on(a) ? MI_CHECKED : 0));
+        add("Desktop notifications", nullptr, A_NOTIFY, MI_CHECK | (a->notify ? MI_CHECKED : 0));
         add("Show performance overlay", nullptr, A_HUD, MI_CHECK | (a->hud ? MI_CHECKED : 0));
         static char cache_hint[48];
         snprintf(cache_hint, sizeof cache_hint, "%s", a->key_cache_sym ? shortcut_label(a->key_cache_mods, a->key_cache_sym).c_str() : "");
@@ -635,13 +916,14 @@ static void rename_tab_dialog(App *a, Tab *t) {
 }
 
 static void apply_history(App *a) {
-    for (auto &t : a->tabs) if (t->term) tcore_set_history(t->term, a->scrollback, a->sb_ram_mb, a->sb_disk_mb, a->sb_spill);
+    for (auto &t : a->tabs) for (TermCore *tc : tab_terms(t.get())) tcore_set_history(tc, a->scrollback, a->sb_ram_mb, a->sb_disk_mb, a->sb_spill);
     tcore_set_history_defaults(a->scrollback, a->sb_ram_mb, a->sb_disk_mb, a->sb_spill);
 }
 
 static void do_new_local(App *a, const std::string &shell) {
     std::vector<std::string> argv = app_default_shell_argv(shell);
-    app_open_local(a, shell.empty() ? "local" : lx::basename(argv[0]), argv, nullptr);
+    std::string d = tab_local_cwd(app_cur_tab(a));
+    app_open_local(a, shell.empty() ? "local" : lx::basename(argv[0]), argv, d.empty() ? nullptr : d.c_str());
 }
 
 static void side_select(App *a, int page) {
@@ -659,6 +941,15 @@ static void run_action(App *a, int id) {
     switch (id) {
     case A_NEW_CONN: dlg_conn_editor(a, nullptr, false); break;
     case A_NEW_LOCAL: do_new_local(a, ""); break;
+    case A_PREV_PROMPT: case A_NEXT_PROMPT: case A_SEL_OUTPUT: {
+        Tab *ct = app_cur_tab(a);
+        if (ct && ct->term) { if (id == A_SEL_OUTPUT) tcore_select_last_output(ct->term); else tcore_jump_prompt(ct->term, id == A_PREV_PROMPT ? -1 : 1); }
+        break;
+    }
+    case A_FIND: find_open(a); break;
+    case A_SPLIT_R: case A_SPLIT_D: { Tab *ct = app_cur_tab(a); if (ct) tab_split(a, ct, id == A_SPLIT_R); break; }
+    case A_PANE_NEXT: case A_PANE_PREV: { Tab *ct = app_cur_tab(a); if (ct) pane_step_focus(a, ct, id == A_PANE_NEXT ? 1 : -1); break; }
+    case A_PANE_CLOSE: { Tab *ct = app_cur_tab(a); if (ct) app_close_pane(a, ct); break; }
     case A_IMPORT_INV:
         dlg_pick_file(a, "Ansible inventory (INI or YAML)", false, false, lx::home_dir(), [a](const std::vector<std::string> &paths) {
             if (paths.empty()) return;
@@ -682,6 +973,8 @@ static void run_action(App *a, int id) {
     case A_ACCENT: dlg_color(a, "Accent color", a->accent, [a](const std::string &text) { a->follow_fleet = false; app_set_accent(a, text); }); break;
     case A_ACCENT_RESET: app_set_accent(a, ""); break;
     case A_HUD: if (a->lite) break; a->hud = !a->hud; app_settings_save(a); break;
+    case A_LIGATURES: a->lig_mode = app_ligatures_on(a) ? 0 : 1; app_ligatures_apply(a); mark_terms_dirty(a); app_settings_save(a); app_redraw(a); break;
+    case A_NOTIFY: a->notify = !a->notify; app_settings_save(a); break;
     case A_FASTCAT: a->fast_cat = !a->fast_cat; app_fastcat_apply(a); app_settings_save(a); break;
     case A_SSHCFG: a->show_ssh_config = !a->show_ssh_config; app_refresh(a); app_settings_save(a); break;
     case A_STARTUP: a->startup_shell = !a->startup_shell; app_settings_save(a); break;
@@ -1072,6 +1365,48 @@ static void draw_welcome(App *a, Rect r) {
     if (!on_row && ui_mouse_pressed(u, 1, r) && ui_clicks(u) >= 2) do_new_local(a, "");   /* a double click on the empty page opens a local tab; there is no strip to click yet */
 }
 
+/* Splits `r` down the tree: every node remembers its rectangle (window pixels) for drawing and for the mouse. */
+static void pane_layout(Pane *n, PaneRect r) {
+    if (!n) return;
+    n->r = R(r.x, r.y, r.w, r.h);
+    if (n->leaf()) return;
+    PaneRect x, y;
+    pane_split_rect(r, n->horiz, n->ratio, &x, &y);
+    pane_layout(n->a, x);
+    pane_layout(n->b, y);
+}
+
+/* The divider between the two children of inner node n. */
+static Rect pane_divider(const Pane *n) {
+    return n->horiz ? R(n->a->r.x + n->a->r.w, n->r.y, PANE_GAP, n->r.h) : R(n->r.x, n->a->r.y + n->a->r.h, n->r.w, PANE_GAP);
+}
+
+static void pane_draw_dividers(App *a, Pane *n) {
+    if (!n || n->leaf()) return;
+    Rect d = pane_divider(n);
+    bool hot = g_div_drag == n || (!g_div_drag && !ui_blocked(a->ui) && rect_has(R(d.x - 3, d.y - 3, d.w + 6, d.h + 6), ui_mx(a->ui), ui_my(a->ui)));
+    r_rect(a->r, d.x, d.y, d.w, d.h, hot ? a->colors.accent : a->colors.border);
+    if (hot) ui_set_cursor(a->ui, n->horiz ? 3 : 4);
+    pane_draw_dividers(a, n->a);
+    pane_draw_dividers(a, n->b);
+}
+
+/* Divider under window pixel (x, y), a little wider than it is drawn so it is easy to grab. */
+static Pane *pane_divider_at(Pane *n, float x, float y) {
+    if (!n || n->leaf()) return nullptr;
+    Rect d = pane_divider(n);
+    if (x >= d.x - 3 && x < d.x + d.w + 3 && y >= d.y - 3 && y < d.y + d.h + 3) return n;
+    Pane *h = pane_divider_at(n->a, x, y);
+    return h ? h : pane_divider_at(n->b, x, y);
+}
+
+static Pane *pane_leaf_at(Tab *t, float x, float y) {
+    std::vector<Pane *> lv;
+    tab_pane_leaves(t, lv);
+    for (Pane *p : lv) if (x >= p->r.x && x < p->r.x + p->r.w && y >= p->r.y && y < p->r.y + p->r.h) return p;
+    return nullptr;
+}
+
 static void draw_content(App *a) {
     Ui *u = a->ui;
     Rect r = lay.content;
@@ -1083,13 +1418,45 @@ static void draw_content(App *a) {
         return;
     }
     term_rect = r;
-    int cols, rows;
-    tv_fit(a->term_font, r.w, r.h, &cols, &rows);
-    tcore_resize(t->term, cols, rows);
-    tcore_set_focus(t->term, !dlg_active(a) && SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS);
-    r_flush(a->r);
-    tv_draw(t->term, a->r, a->term_font, &a->pal, r.x, r.y, r.w, r.h, a->blink_on);
-    if (rect_has(r, ui_mx(u), ui_my(u)) && !ui_blocked(u)) ui_set_cursor(u, 1);
+    PaneRect whole{r.x, r.y, r.w, r.h};
+    pane_layout(t->root, whole);
+    std::vector<Pane *> lv;
+    tab_pane_leaves(t, lv);
+    bool win_focus = !dlg_active(a) && (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS);
+    bool over_term = false;
+    for (Pane *p : lv) {
+        int cols, rows;
+        tv_fit(a->term_font, p->r.w, p->r.h, &cols, &rows);
+        tcore_resize(p->term, cols, rows);
+        tcore_set_focus(p->term, win_focus && p == t->focus);
+        r_flush(a->r);
+        tv_draw(p->term, a->r, a->term_font, &a->pal, p->r.x, p->r.y, p->r.w, p->r.h, a->blink_on, extras_overlay(a, p));
+        if (p == t->focus) {
+            term_rect = p->r;
+            /* tell the input method where the text cursor is, so its candidate popup opens next to it (Wayland text-input, X11 XIM) */
+            tcore_lock(p->term);
+            int icx = vt_cursor_x(tcore_vt(p->term)), icy = vt_cursor_y(tcore_vt(p->term));
+            tcore_unlock(p->term);
+            if (icx >= cols) icx = cols - 1;
+            int cw = font_cell_w(a->term_font), chh = font_cell_h(a->term_font);
+            float inv = a->scale > 0 ? 1.f / a->scale : 1.f;
+            SDL_Rect ir = {(int)((p->r.x + TV_PAD + (float)(icx * cw)) * inv), (int)((p->r.y + TV_PAD + (float)(icy * chh)) * inv), (int)((float)cw * inv) + 1, (int)((float)chh * inv) + 1};
+            static SDL_Rect last_ir;
+            if (memcmp(&ir, &last_ir, sizeof ir)) { last_ir = ir; SDL_SetTextInputRect(&ir); }
+        }
+        if (rect_has(p->r, ui_mx(u), ui_my(u)) && !ui_blocked(u)) over_term = true;
+    }
+    if (over_term) ui_set_cursor(u, 1);
+    if (lv.size() > 1) {
+        pane_draw_dividers(a, t->root);
+        Rect f = t->focus->r;
+        uint32_t ac = a->colors.accent;
+        r_rect(a->r, f.x, f.y, f.w, 2, ac); r_rect(a->r, f.x, f.y + f.h - 2, f.w, 2, ac);
+        r_rect(a->r, f.x, f.y, 2, f.h, ac); r_rect(a->r, f.x + f.w - 2, f.y, 2, f.h, ac);
+    }
+    links_draw_tip(a, t->focus);
+    for (Pane *p : lv) if (p != t->focus) links_draw_tip(a, p);
+    find_frame(a, t, t->focus->r);
 }
 
 static double g_max_fps = 60, g_io_fps = 24;
@@ -1221,11 +1588,11 @@ static void hud_tick(App *a) {
 
 static void trim_tick(App *a) {
     uint64_t total = 0;
-    for (auto &t : a->tabs) if (t->term) total += tcore_bytes_fed(t->term);
+    for (auto &t : a->tabs) for (TermCore *tc : tab_terms(t.get())) total += tcore_bytes_fed(tc);
     if (total != a->trim_prev_bytes) { a->trim_prev_bytes = total; a->trim_dirty = true; return; }
     if (!a->trim_dirty) return;
     a->trim_dirty = false;
-    for (auto &t : a->tabs) if (t->term) tcore_compact(t->term);
+    for (auto &t : a->tabs) for (TermCore *tc : tab_terms(t.get())) tcore_compact(tc);
     malloc_trim(0);
 }
 
@@ -1270,6 +1637,21 @@ static bool shortcut(App *a, SDL_Keycode k, Uint16 m) {
         unsigned pressed = ((m & KMOD_CTRL) ? (unsigned)KMOD_CTRL : 0u) | ((m & KMOD_SHIFT) ? (unsigned)KMOD_SHIFT : 0u) |
                            ((m & KMOD_ALT) ? (unsigned)KMOD_ALT : 0u) | ((m & KMOD_GUI) ? (unsigned)KMOD_GUI : 0u);
         if (a->key_cache_sym && k == (SDL_Keycode)a->key_cache_sym && pressed == a->key_cache_mods) { run_action(a, A_CACHE); return true; }
+    }
+    if (ctrl && shift && !alt && (k == SDLK_UP || k == SDLK_DOWN || k == SDLK_o)) {  /* shell integration: prompt jump, select last output */
+        Tab *ct = app_cur_tab(a);
+        if (ct && ct->term) { if (k == SDLK_o) tcore_select_last_output(ct->term); else tcore_jump_prompt(ct->term, k == SDLK_UP ? -1 : 1); }
+        return true;
+    }
+    if (ctrl && shift && !alt) {   /* find bar and split panes */
+        Tab *ct = app_cur_tab(a);
+        if (k == SDLK_f && ct && ct->term) { find_open(a); return true; }
+        if (ct && ct->term) {
+            if (k == SDLK_e) { tab_split(a, ct, true); return true; }
+            if (k == SDLK_r) { tab_split(a, ct, false); return true; }
+            if (k == SDLK_x) { app_close_pane(a, ct); return true; }
+            if (k == SDLK_LEFT || k == SDLK_RIGHT) { pane_step_focus(a, ct, k == SDLK_LEFT ? -1 : 1); return true; }
+        }
     }
     if (a->basic) {  /* one bare terminal: only the font size keys are Lestrix's, everything else goes to the program */
         if (ctrl && !shift && !alt && (k == SDLK_EQUALS || k == SDLK_PLUS || k == SDLK_KP_PLUS)) { run_action(a, A_BIGGER); return true; }
@@ -1331,9 +1713,9 @@ static TKey map_key(SDL_Keycode k) {
     }
 }
 
-static void cell_at(App *a, double x, double y, int *col, int *row) {
-    *col = (int)((x * a->scale - term_rect.x - TV_PAD) / font_cell_w(a->term_font));
-    *row = (int)((y * a->scale - term_rect.y - TV_PAD) / font_cell_h(a->term_font));
+static void cell_at(App *a, double x, double y, Rect pr, int *col, int *row) {
+    *col = (int)((x * a->scale - pr.x - TV_PAD) / font_cell_w(a->term_font));
+    *row = (int)((y * a->scale - pr.y - TV_PAD) / font_cell_h(a->term_font));
 }
 
 static void handle_event(App *a, SDL_Event *e) {
@@ -1352,7 +1734,11 @@ static void handle_event(App *a, SDL_Event *e) {
         if (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e->window.event == SDL_WINDOWEVENT_RESIZED) {
             if (a->soft) { SDL_Surface *s = SDL_GetWindowSurface(a->win); if (s) { a->W = s->w; a->H = s->h; } }
             else SDL_GL_GetDrawableSize(a->win, &a->W, &a->H);
+            app_rescale(a);
             app_redraw(a);
+        } else if (e->window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED) {
+            if (!a->soft) SDL_GL_GetDrawableSize(a->win, &a->W, &a->H);
+            app_rescale(a);
         } else if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED || e->window.event == SDL_WINDOWEVENT_FOCUS_LOST || e->window.event == SDL_WINDOWEVENT_EXPOSED) app_redraw(a);
         break;
     case SDL_DROPFILE: {
@@ -1363,13 +1749,21 @@ static void handle_event(App *a, SDL_Event *e) {
     case SDL_KEYDOWN: {
         if (e->key.repeat == 0 || true) {
             if (!dlg_active(a) && !ui_menu_is_open(a->ui)) {
+                if (find_is_open(a) && find_key(a, e->key.keysym.sym, e->key.keysym.mod)) { app_redraw(a); break; }
                 if (shortcut(a, e->key.keysym.sym, e->key.keysym.mod)) { app_redraw(a); break; }
             } else if (dlg_active(a)) break;
             if (kbd_ui || !term) break;
             SDL_Keycode k = e->key.keysym.sym;
             uint32_t cp = (k >= 32 && k < 127) ? (uint32_t)k : 0;
             if ((k == SDLK_RETURN || k == SDLK_KP_ENTER)) tcore_cmd_begin(term, now_s());
-            if (tcore_key(term, map_key(k), cp, map_mods(e->key.keysym.mod))) app_redraw(a);
+            if (tcore_key_ev(term, map_key(k), cp, map_mods(e->key.keysym.mod), e->key.repeat ? 2 : 1)) app_redraw(a);
+        }
+        break;
+    }
+    case SDL_KEYUP: {
+        if (!kbd_ui && term && !dlg_active(a)) {
+            SDL_Keycode k = e->key.keysym.sym;
+            tcore_key_ev(term, map_key(k), (k >= 32 && k < 127) ? (uint32_t)k : 0, map_mods(e->key.keysym.mod), 3);
         }
         break;
     }
@@ -1377,13 +1771,24 @@ static void handle_event(App *a, SDL_Event *e) {
         if (!kbd_ui && term && !(SDL_GetModState() & (KMOD_CTRL | KMOD_ALT))) { tcore_text(term, e->text.text); app_redraw(a); }
         break;
     case SDL_MOUSEBUTTONDOWN: {
-        bool inside = term && !a->blocked_for_term && rect_has(term_rect, (float)e->button.x * a->scale, (float)e->button.y * a->scale);
-        if (inside) {
+        float px = (float)e->button.x * a->scale, py = (float)e->button.y * a->scale;
+        bool left = e->button.button == SDL_BUTTON_LEFT, on_div = false;
+        if (left && t && t->root && !a->blocked_for_term && !find_hit(a, px, py)) {
+            Pane *dv = pane_divider_at(t->root, px, py);
+            if (dv) { g_div_drag = dv; on_div = true; ui_release_focus(a->ui); }
+        }
+        Pane *mp = (!on_div && t && t->root && !a->blocked_for_term && !find_hit(a, px, py)) ? pane_leaf_at(t, px, py) : nullptr;
+        if (mp) {
+            if (mp != t->focus) { pane_set_focus(t, mp); term = mp->term; }
             int col, row;
-            cell_at(a, e->button.x, e->button.y, &col, &row);
-            int b = e->button.button == SDL_BUTTON_LEFT ? 1 : e->button.button == SDL_BUTTON_MIDDLE ? 2 : 3;
-            tcore_mouse_button(term, b, true, col, row, e->button.clicks, map_mods(SDL_GetModState()));
-            term_dragging = true;
+            cell_at(a, e->button.x, e->button.y, mp->r, &col, &row);
+            int b = left ? 1 : e->button.button == SDL_BUTTON_MIDDLE ? 2 : 3;
+            if (left && (SDL_GetModState() & KMOD_CTRL) && links_open_at(a, mp, col, row)) { /* the click opened a link, the program does not see it */ }
+            else {
+                tcore_mouse_button(mp->term, b, true, col, row, e->button.clicks, map_mods(SDL_GetModState()));
+                term_dragging = true;
+                g_drag_pane = mp;
+            }
             ui_release_focus(a->ui);
         }
         if (!a->pinned && a->side_open && !dlg_active(a) && !ui_menu_is_open(a->ui)) {
@@ -1394,29 +1799,47 @@ static void handle_event(App *a, SDL_Event *e) {
         break;
     }
     case SDL_MOUSEBUTTONUP:
-        if (term && term_dragging) {
+        if (g_div_drag && e->button.button == SDL_BUTTON_LEFT) g_div_drag = nullptr;
+        else if (term_dragging && g_drag_pane) {
             int col, row;
-            cell_at(a, e->button.x, e->button.y, &col, &row);
+            cell_at(a, e->button.x, e->button.y, g_drag_pane->r, &col, &row);
             int b = e->button.button == SDL_BUTTON_LEFT ? 1 : e->button.button == SDL_BUTTON_MIDDLE ? 2 : 3;
-            tcore_mouse_button(term, b, false, col, row, 1, map_mods(SDL_GetModState()));
-            if (e->button.button == SDL_BUTTON_LEFT) term_dragging = false;
-        }
+            tcore_mouse_button(g_drag_pane->term, b, false, col, row, 1, map_mods(SDL_GetModState()));
+            if (e->button.button == SDL_BUTTON_LEFT) { term_dragging = false; g_drag_pane = nullptr; }
+        } else if (e->button.button == SDL_BUTTON_LEFT) term_dragging = false;
         app_redraw(a);
         break;
-    case SDL_MOUSEMOTION:
-        if (term && (term_dragging || (!a->blocked_for_term && rect_has(term_rect, (float)e->motion.x * a->scale, (float)e->motion.y * a->scale)))) {
+    case SDL_MOUSEMOTION: {
+        float px = (float)e->motion.x * a->scale, py = (float)e->motion.y * a->scale;
+        if (g_div_drag) {
+            Pane *d = g_div_drag;
+            d->ratio = pane_ratio_for(PaneRect{d->r.x, d->r.y, d->r.w, d->r.h}, d->horiz, d->horiz ? px : py);
+            app_redraw(a);
+            break;
+        }
+        Pane *under = (t && t->root && !a->blocked_for_term && !find_hit(a, px, py)) ? pane_leaf_at(t, px, py) : nullptr;
+        Pane *mp = term_dragging ? g_drag_pane : under;
+        if (mp) {
             int col, row;
-            cell_at(a, e->motion.x, e->motion.y, &col, &row);
-            tcore_mouse_move(term, col, row, map_mods(SDL_GetModState()));
+            cell_at(a, e->motion.x, e->motion.y, mp->r, &col, &row);
+            tcore_mouse_move(mp->term, col, row, map_mods(SDL_GetModState()));
+        }
+        {
+            int col = -1, row = -1;
+            if (under && !term_dragging) cell_at(a, e->motion.x, e->motion.y, under->r, &col, &row);
+            if (links_hover(a, term_dragging ? nullptr : under, col, row, (SDL_GetModState() & KMOD_CTRL) != 0)) app_redraw(a);
         }
         if (term_dragging || ui_motion_matters(a->ui)) app_redraw(a);
         break;
+    }
     case SDL_MOUSEWHEEL: {
         float mx = ui_mx(a->ui) / a->scale, my = ui_my(a->ui) / a->scale;
-        if (term && !a->blocked_for_term && rect_has(term_rect, mx * a->scale, my * a->scale) && !dlg_active(a)) {
+        Pane *mp = (t && t->root && !a->blocked_for_term && !dlg_active(a) && !find_hit(a, mx * a->scale, my * a->scale)) ? pane_leaf_at(t, mx * a->scale, my * a->scale) : nullptr;
+        if (mp) {
             int col, row;
-            cell_at(a, mx, my, &col, &row);
-            tcore_wheel(term, e->wheel.preciseY, col, row, map_mods(SDL_GetModState()));
+            cell_at(a, mx, my, mp->r, &col, &row);
+            tcore_wheel(mp->term, e->wheel.preciseY, col, row, map_mods(SDL_GetModState()));
+            if (links_hover(a, mp, col, row, (SDL_GetModState() & KMOD_CTRL) != 0)) app_redraw(a);
         }
         app_redraw(a);
         break;
@@ -1560,6 +1983,7 @@ struct Script {
     std::vector<std::string> steps;
     size_t i = 0;
     double wait_until = 0;
+    int ctrl_restore = -1;   /* modifier state to put back after a scripted Ctrl+click has been handled */
 };
 
 static void script_key(const std::string &spec) {
@@ -1590,6 +2014,7 @@ static void script_mouse(int type, int button, int x, int y, int clicks = 1) {
 
 static bool script_run(App *a, Script &sc, std::string &shot_out) {
     if (sc.steps.empty() || sc.i >= sc.steps.size() || a->now < sc.wait_until) return false;
+    if (sc.ctrl_restore >= 0) { SDL_SetModState((SDL_Keymod)sc.ctrl_restore); sc.ctrl_restore = -1; }
     const std::string &st = sc.steps[sc.i++];
     int x, y, sx, sy;
     double w;
@@ -1619,6 +2044,23 @@ static bool script_run(App *a, Script &sc, std::string &shot_out) {
         script_mouse(SDL_MOUSEMOTION, 0, sx, sy);
         script_mouse(SDL_MOUSEBUTTONUP, 1, sx, sy);
         sc.wait_until = a->now + 0.15;
+    } else if (sscanf(st.c_str(), "C:%d,%d", &x, &y) == 2) {   /* a real Ctrl+click: Ctrl held in SDL's modifier state while the button events go through the normal handler */
+        const SDL_Keymod before = SDL_GetModState();
+        SDL_SetModState((SDL_Keymod)(before | KMOD_CTRL));
+        script_mouse(SDL_MOUSEMOTION, 0, x, y);
+        script_mouse(SDL_MOUSEBUTTONDOWN, 1, x, y);
+        script_mouse(SDL_MOUSEBUTTONUP, 1, x, y);
+        sc.ctrl_restore = (int)before;
+        sc.wait_until = a->now + 0.3;
+    } else if (sscanf(st.c_str(), "o:%d,%d", &x, &y) == 2) {   /* what a Ctrl+click at x,y does: open the link under it */
+        Tab *ct = app_cur_tab(a);
+        Pane *mp = ct && ct->root ? pane_leaf_at(ct, (float)x, (float)y) : nullptr;
+        if (mp) {
+            int col = (int)(((float)x - mp->r.x - TV_PAD) / font_cell_w(a->term_font)), row = (int)(((float)y - mp->r.y - TV_PAD) / font_cell_h(a->term_font));
+            if (links_open_at(a, mp, col, row)) fprintf(stderr, "script: opened link at %d,%d\n", x, y);
+            else fprintf(stderr, "script: no link at %d,%d\n", x, y);
+        }
+        sc.wait_until = a->now + 0.2;
     } else if (sscanf(st.c_str(), "x:%d", &x) == 1) {
         SDL_Event we;
         SDL_zero(we);
@@ -1626,7 +2068,19 @@ static bool script_run(App *a, Script &sc, std::string &shot_out) {
         SDL_PushEvent(&we);
         sc.wait_until = a->now + 0.1;
     } else if (st.starts_with("k:")) { script_key(st.substr(2)); sc.wait_until = a->now + 0.08; }
-    else if (st.starts_with("t:")) { SDL_Event e; SDL_zero(e); e.type = SDL_TEXTINPUT; snprintf(e.text.text, sizeof e.text.text, "%s", st.c_str() + 2); SDL_PushEvent(&e); sc.wait_until = a->now + 0.08; }
+    else if (st.starts_with("t:")) {
+        /* an SDL text event holds 31 bytes: longer text goes out in several events, cut on a UTF-8 boundary */
+        const std::string txt = st.substr(2);
+        for (size_t pos = 0; pos < txt.size();) {
+            size_t len = std::min<size_t>(sizeof(SDL_TextInputEvent::text) - 1, txt.size() - pos);
+            while (pos + len < txt.size() && len > 1 && ((unsigned char)txt[pos + len] & 0xC0) == 0x80) len--;
+            SDL_Event e; SDL_zero(e); e.type = SDL_TEXTINPUT;
+            memcpy(e.text.text, txt.data() + pos, len);
+            SDL_PushEvent(&e);
+            pos += len;
+        }
+        sc.wait_until = a->now + 0.08;
+    }
     else if (st.starts_with("s:")) { shot_out = st.substr(2); sc.wait_until = a->now + 0.3; }
     a->dirty = true;
     return true;
@@ -1654,9 +2108,10 @@ static void pump_all(App *a) {
     if (jobs_pump()) app_redraw(a);
     for (size_t i = 0; i < a->tabs.size(); i++) {
         Tab *t = a->tabs[i].get();
-        if (t->term && tcore_pump(t->term)) { app_redraw(a); a->last_active = a->now; }
+        for (TermCore *tc : tab_terms(t)) if (tcore_pump(tc)) { app_redraw(a); a->last_active = a->now; }
         if (t->files) t->files->tick(a);
     }
+    reap_exited_panes(a);
 }
 
 static void print_task_cpu() {
@@ -1684,7 +2139,7 @@ static const char *HELP_TEXT =
     "  --max-fps N           cap drawing at N frames per second (default 60; 0 = no cap, vsync off)\n"
     "  --io-fps N            cap drawing at N fps while a big dump pours in, so reading output gets the CPU\n"
     "                        (default 24; lower is faster for output; 0 = no extra cap)\n"
-    "  --read-delay US       wait US microseconds after a tiny (under 1 KB) read of program output (default 200; 0 = off):\n"
+    "  --read-delay US       wait US microseconds after a tiny (under 1 KB) read of program output (default 400; 0 = off):\n"
     "                        far fewer system calls and less CPU in a flood\n"
     "  --render-threads N    helper threads that build the rows of a frame (default 0: measured no gain at this frame cost)\n"
     "  --io-threads N        2: a reader and a writer thread per tab besides the parser; 0: one thread (default: 2 from 4 cores up)\n"
@@ -1692,6 +2147,7 @@ static const char *HELP_TEXT =
     "  --compress-threads N  threads that compress old scrollback (default: a quarter of the cores, 2 to 8)\n"
     "  --no-fastcat          do not take over `cat FILE` in a local tab to print big files at memory speed\n"
     "  --theme NAME          Xylonic Dark, Xylonic Light, Graphite, Nord, Gruvbox or Solarized Dark\n"
+    "  (environment)         LESTRIX_VIDEO=x11|wayland forces the video driver (default: Wayland in a Wayland session, else X11)\n"
     "  -e COMMAND ...        run COMMAND in a new tab (works as x-terminal-emulator)\n\n" APP_CREDIT;
 
 int main(int argc, char **argv) {
@@ -1741,8 +2197,15 @@ int main(int argc, char **argv) {
     const char *wmclass = g_basic ? "lestrix-basic" : g_lite ? "lestrix-lite" : "lestrix";
     setenv("SDL_VIDEO_X11_WMCLASS", wmclass, 0);
     setenv("SDL_VIDEO_WAYLAND_WMCLASS", wmclass, 0);
+    /* In a Wayland session talk to the compositor directly (native scaling, no XWayland hop); SDL falls back to X11 on its own if the
+     * Wayland connection fails. SDL_VIDEODRIVER (or LESTRIX_VIDEO=x11|wayland) still wins. */
+    if (const char *lv = getenv("LESTRIX_VIDEO")) setenv("SDL_VIDEODRIVER", lv, 1);
+    else if (!getenv("SDL_VIDEODRIVER") && getenv("WAYLAND_DISPLAY") && *getenv("WAYLAND_DISPLAY")) setenv("SDL_VIDEODRIVER", "wayland,x11", 0);
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+#ifdef SDL_HINT_APP_ID
+    SDL_SetHint(SDL_HINT_APP_ID, wmclass);   /* Wayland app_id: must equal the .desktop file name so the shell finds the icon */
+#endif
     tmark("main entered");
     std::thread prewarm(font_prewarm);
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); prewarm.join(); return 1; }
@@ -1763,7 +2226,7 @@ int main(int argc, char **argv) {
         if (!ok) { sd_soft = false; for (int i = first; i < n && !ok; i++) ok = gl_init(a, order[i]); }
         if (!ok && !cpu) ok = soft_init(a);   /* no usable GL at all: draw on the CPU instead of giving up */
         if (!ok) { fprintf(stderr, "Lestrix could not start a renderer (needs OpenGL 3.3, ES 3.0 or ES 2.0, or the CPU renderer)\n"); prewarm.join(); return 1; }
-        if (getenv("LESTRIX_TIMING")) fprintf(stderr, "Renderer: %s (%s)\n", a->gl_desc, a->soft ? "CPU" : sd_gl_kind == GLK_CORE ? "desktop core" : sd_gl_kind == GLK_ES3 ? "ES 3.0" : "ES 2.0");
+        if (getenv("LESTRIX_TIMING")) fprintf(stderr, "Video: %s\nRenderer: %s (%s)\n", SDL_GetCurrentVideoDriver(), a->gl_desc, a->soft ? "CPU" : sd_gl_kind == GLK_CORE ? "desktop core" : sd_gl_kind == GLK_ES3 ? "ES 3.0" : "ES 2.0");
     }
     tmark("GL functions loaded");
     prewarm.join();
@@ -1779,6 +2242,7 @@ int main(int argc, char **argv) {
     a->term_font = font_open(a->font_family.c_str(), a->font_size * 96.0 / 72.0 * a->scale, true);
     if (!a->term_font) a->term_font = font_open("monospace", a->font_size * 96.0 / 72.0 * a->scale, true);
     if (!a->ui_font || !a->term_font) { fprintf(stderr, "no usable fonts found\n"); return 1; }
+    app_ligatures_apply(a);
     tmark("fonts opened");
     a->ui_mono = font_open("monospace", 12 * a->scale, true);
     tmark("atlas and renderer ready");
@@ -1824,6 +2288,16 @@ int main(int argc, char **argv) {
     if (script_arg) script.steps = lx::split(script_arg, ';');
     std::string script_shot;
     SDL_Event e;
+    /* Synchronized updates (DEC mode 2026): while the shown terminal is between begin and end of a frame the screen is not presented, so a
+     * redraw that arrives in pieces never shows half done. A program that forgets to end it is cut off after 150 ms. Returns the seconds left to hold. */
+    double sync_since = 0;
+    auto sync_hold = [&]() -> double {
+        Tab *st = app_cur_tab(a);
+        if (!st || !st->term || !(tcore_modes(st->term) & VT_M_SYNC_UPDATE)) { sync_since = 0; return 0; }
+        if (sync_since == 0) sync_since = a->now;
+        double left = sync_since + 0.150 - a->now;
+        return left > 0 ? left : 0;
+    };
     while (a->running) {
         a->now = now_s();
         int wait = 250;
@@ -1845,7 +2319,9 @@ int main(int argc, char **argv) {
             Tab *wt = app_cur_tab(a);
             uint64_t wfed = wt && wt->term ? tcore_bytes_fed(wt->term) : 0;
             double gap = typing_gap(a, frame_gap(wfed - last_draw_bytes >= 256 * 1024));
+            double held = sync_hold();
             if (ui_animating(a->ui)) wait = 4;
+            else if (held > 0 && a->dirty) wait = (int)(held * 1000.0) + 1;   /* wait for the end of the frame (output wakes the loop) or the timeout */
             else if (a->dirty) { double left = last_draw + gap - a->now; wait = left > 0 ? (int)(left * 1000.0) + 1 : 0; }
         }
         if (flood && flood_sent && wait > 2) wait = 2;
@@ -1884,15 +2360,15 @@ int main(int argc, char **argv) {
             a->next_fleet = a->now + (a->fleet_watch ? 30.0 : 1.0);  /* with the watch the timer only catches a missed event */
             if (a->follow_fleet && fleetwm_stamp() != a->fleet.stamp) app_follow_fleetwm(a);
         }
-        if (a->now >= a->next_hud) { a->next_hud = a->now + (!focused ? 5 : a->now - a->last_active > 3.0 ? 3 : 1); if (a->hud) hud_tick(a); }  /* an idle bar is refreshed every 3 s */
-        if (a->now >= a->next_trim) { a->next_trim = a->now + 5; trim_tick(a); }
+        if (a->now >= a->next_hud) { a->next_hud = a->now + (!focused ? (a->now - a->last_active > 30.0 ? 15 : 5) : a->now - a->last_active > 3.0 ? 3 : 1); if (a->hud) hud_tick(a); }  /* an idle bar is refreshed every 3 s */
+        if (a->now >= a->next_trim) { a->next_trim = a->now + (a->now - a->last_active > 15.0 ? 20 : 5); trim_tick(a); }   /* untouched for a while: nothing new to give back */
         if (a->now >= a->next_probe) { a->next_probe = a->now + 30; if (!a->lite && (SDL_GetWindowFlags(a->win) & SDL_WINDOW_INPUT_FOCUS)) probe_all(a); }
         if (!focused || a->now - a->last_active >= BLINK_FOR) { if (!a->blink_on) { a->blink_on = true; app_redraw(a); } a->last_blink = a->now; }
         else if (a->now - a->last_blink > 0.53) { a->last_blink = a->now; a->blink_on = !a->blink_on; if (app_cur_tab(a) && app_cur_tab(a)->term) app_redraw(a); }
         Tab *ct = app_cur_tab(a);
         uint64_t fed = ct && ct->term ? tcore_bytes_fed(ct->term) : 0;
         double min_gap = typing_gap(a, frame_gap(fed - last_draw_bytes >= 256 * 1024));
-        if ((a->dirty || ui_animating(a->ui)) && a->now - last_draw >= min_gap) {
+        if ((a->dirty || ui_animating(a->ui)) && a->now - last_draw >= min_gap && !(sync_hold() > 0 && !ui_animating(a->ui))) {
             last_draw = a->now;
             last_draw_bytes = fed;
             a->dirty = false;

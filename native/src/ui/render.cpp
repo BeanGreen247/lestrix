@@ -14,6 +14,7 @@
 #include "gl.h"
 #include "soft.h"
 
+#include <unordered_map>
 #include <vector>
 
 typedef struct { float x, y, u, v; uint32_t rgba; float lx, ly, sw, sh, ar, ab; } V2;
@@ -32,6 +33,7 @@ struct Renderer {
     SoftTarget st;   /* software rendering target, set by r_set_target before each frame */
     SoftClip sclip;
     struct SoftState *ss;
+    struct GlImages *gi;   /* texture cache and program for inline images, created on first use */
 };
 
 /* Software rendering keeps the pixels of the previous frame and repaints only what changed. The window is cut into
@@ -51,7 +53,59 @@ struct SoftState {
     uint32_t bg = 0, prev_bg = 0, prev_gen = 0;
     SoftTarget prev_t{};
     bool invalid = true;
+    struct SImg { const uint32_t *px; int w, h; void *owner; void (*release)(void *); };
+    std::unordered_map<uint32_t, SImg> imgs;   /* images of the frame being built, each holding its pixels alive */
+    SoftImage found{};
+    void drop_images() { for (auto &kv : imgs) if (kv.second.release) kv.second.release(kv.second.owner); imgs.clear(); }
 };
+
+static const SoftImage *soft_find_image(void *ctx, uint32_t serial) {
+    SoftState *s = static_cast<SoftState *>(ctx);
+    auto it = s->imgs.find(serial);
+    if (it == s->imgs.end()) return nullptr;
+    s->found = SoftImage{it->second.px, it->second.w, it->second.h};
+    return &s->found;
+}
+
+struct GlTex { GLuint tex; int w, h; uint64_t last; };
+struct GlImages {
+    std::unordered_map<uint32_t, GlTex> tex;
+    GLuint prog = 0, vao = 0, vbo = 0;   /* vbo: the ES2 corner buffer */
+    GLint u_res = -1, u_pos = -1, u_size = -1, u_uv0 = -1, u_uv1 = -1, u_img = -1;
+    uint64_t frame = 0;
+    bool failed = false;
+    GLint max_tex = 0;
+};
+
+static const char *IMG_VS =
+    "uniform vec2 u_res; uniform vec2 u_pos; uniform vec2 u_size; uniform vec2 u_uv0; uniform vec2 u_uv1;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "  vec2 c = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+    "  vec2 p = u_pos + c * u_size;\n"
+    "  gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, 0.0, 1.0);\n"
+    "  v_uv = mix(u_uv0, u_uv1, c);\n"
+    "}\n";
+static const char *IMG_FS =
+    "in vec2 v_uv; uniform sampler2D u_img; out vec4 o;\n"
+    "void main() { o = texture(u_img, v_uv); }\n";
+
+/* OpenGL ES 2 has no gl_VertexID and no instancing: the image quad comes from four fixed corners in a small buffer. */
+static const char *IMG_VS2 =
+    "#version 100\n"
+    "attribute vec2 a_c;\n"
+    "uniform vec2 u_res; uniform vec2 u_pos; uniform vec2 u_size; uniform vec2 u_uv0; uniform vec2 u_uv1;\n"
+    "varying vec2 v_uv;\n"
+    "void main() {\n"
+    "  vec2 p = u_pos + a_c * u_size;\n"
+    "  gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, 0.0, 1.0);\n"
+    "  v_uv = mix(u_uv0, u_uv1, a_c);\n"
+    "}\n";
+static const char *IMG_FS2 =
+    "#version 100\n"
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
+    "varying vec2 v_uv; uniform sampler2D u_img;\n"
+    "void main() { gl_FragColor = texture2D(u_img, v_uv); }\n";
 
 #define SDF_BODY \
     "  float a = TEX(u_atlas, v_uv).r;\n" \
@@ -211,7 +265,12 @@ Renderer *r_new(Atlas *a) {
 
 void r_free(Renderer *r) {
     if (!r) return;
+    if (r->ss) r->ss->drop_images();
     delete r->ss;
+    if (r->gi) {
+        for (auto &kv : r->gi->tex) glDeleteTextures(1, &kv.second.tex);
+        delete r->gi;
+    }
     free(r->buf);
     free(r->v2);
     free(r);
@@ -226,7 +285,16 @@ void r_begin(Renderer *r, int w, int h, uint32_t clear_rgba) {
         r->sclip.on = 0;
         s->inst.clear(); s->clipid.clear(); s->clips.assign(1, SoftClip{0, 0, 0, 0, 0}); s->cur_clip = 0;
         s->bg = clear_rgba;
+        s->drop_images();
         return;
+    }
+    if (r->gi) {   /* textures not used for a while go: a scrolled-away or deleted image gives its video memory back */
+        GlImages *g = r->gi;
+        g->frame++;
+        for (auto it = g->tex.begin(); it != g->tex.end();) {
+            if (it->second.last + 30 < g->frame) { glDeleteTextures(1, &it->second.tex); it = g->tex.erase(it); }
+            else ++it;
+        }
     }
     glViewport(0, 0, w, h);
     glDisable(GL_SCISSOR_TEST);
@@ -320,6 +388,7 @@ static void soft_finish(Renderer *r) {
     if (!t.px || t.w <= 0 || t.h <= 0) return;
     const int tw = (t.w + TILE - 1) / TILE, th = (t.h + TILE - 1) / TILE;
     const uint32_t gen = atlas_generation(r->atlas);
+    const SoftImages simgs{soft_find_image, s};
     bool full = s->invalid || s->prev.size() != (size_t)tw * th || s->prev_t.px != t.px || s->prev_t.w != t.w || s->prev_t.h != t.h ||
                 s->prev_t.pitch != t.pitch || s->prev_t.rs != t.rs || s->prev_t.gs != t.gs || s->prev_t.bs != t.bs || s->bg != s->prev_bg || gen != s->prev_gen;
     const uint64_t seed = mix64(0x13198A2E03707344ull, s->bg);
@@ -381,7 +450,7 @@ static void soft_finish(Renderer *r) {
                     if (c.on) { if (c.x > cx0) cx0 = c.x; if (c.y > cy0) cy0 = c.y; if (c.x + c.w < cx1) cx1 = c.x + c.w; if (c.y + c.h < cy1) cy1 = c.y + c.h; }
                     if (cx1 <= cx0 || cy1 <= cy0) continue;
                     SoftClip run{1, cx0, cy0, cx1 - cx0, cy1 - cy0};
-                    soft_draw(&t, &run, &s->inst[i], 1, amono, asz, acol, csz);
+                    soft_draw(&t, &run, &s->inst[i], 1, amono, asz, acol, csz, &simgs);
                 }
                 s->damage.push_back(RDamage{x0, y0, x1 - x0, y1 - y0});
                 tx = tx1 + 1;
@@ -394,7 +463,7 @@ static void soft_finish(Renderer *r) {
         SoftTarget rt = t;
         rt.px = ref.data(); rt.pitch = t.w;
         soft_clear(&rt, s->bg);
-        for (size_t i = 0; i < n; i++) soft_draw(&rt, &s->clips[s->clipid[i]], &s->inst[i], 1, atlas_cpu(r->atlas), atlas_size(r->atlas), atlas_color_cpu(r->atlas), atlas_color_size(r->atlas));
+        for (size_t i = 0; i < n; i++) soft_draw(&rt, &s->clips[s->clipid[i]], &s->inst[i], 1, atlas_cpu(r->atlas), atlas_size(r->atlas), atlas_color_cpu(r->atlas), atlas_color_size(r->atlas), &simgs);
         for (int y = 0; y < t.h; y++)
             if (memcmp(ref.data() + (size_t)y * t.w, t.px + (size_t)y * t.pitch, (size_t)t.w * 4)) {
                 int x = 0;
@@ -487,4 +556,96 @@ void r_rect(Renderer *r, float x, float y, float w, float h, uint32_t rgba) {
     RInst i;
     r_make_rect(r, &i, x, y, w, h, rgba);
     r_push(r, &i, 1);
+}
+
+static bool gl_images_init(Renderer *r) {
+    if (!r->gi) r->gi = new GlImages();
+    GlImages *g = r->gi;
+    if (g->prog) return true;
+    if (g->failed) return false;
+    const bool es2 = sd_gl_kind == GLK_ES2;
+    GLuint vs = es2 ? compile_src(GL_VERTEX_SHADER, "", IMG_VS2) : compile_src(GL_VERTEX_SHADER, glsl_head(), IMG_VS);
+    GLuint fs = es2 ? compile_src(GL_FRAGMENT_SHADER, "", IMG_FS2) : compile_src(GL_FRAGMENT_SHADER, glsl_head(), IMG_FS);
+    if (!vs || !fs) { g->failed = true; return false; }
+    g->prog = gl.CreateProgram();
+    gl.AttachShader(g->prog, vs);
+    gl.AttachShader(g->prog, fs);
+    if (es2) gl.BindAttribLocation(g->prog, 0, "a_c");
+    gl.LinkProgram(g->prog);
+    GLint ok = 0;
+    gl.GetProgramiv(g->prog, GL_LINK_STATUS, &ok);
+    gl.DeleteShader(vs);
+    gl.DeleteShader(fs);
+    if (!ok) { g->prog = 0; g->failed = true; return false; }
+    g->u_res = gl.GetUniformLocation(g->prog, "u_res");
+    g->u_pos = gl.GetUniformLocation(g->prog, "u_pos");
+    g->u_size = gl.GetUniformLocation(g->prog, "u_size");
+    g->u_uv0 = gl.GetUniformLocation(g->prog, "u_uv0");
+    g->u_uv1 = gl.GetUniformLocation(g->prog, "u_uv1");
+    g->u_img = gl.GetUniformLocation(g->prog, "u_img");
+    if (es2) {
+        static const float corners[8] = {0.f, 0.f, 1.f, 0.f, 0.f, 1.f, 1.f, 1.f};
+        gl.GenBuffers(1, &g->vbo);
+        gl.BindBuffer(GL_ARRAY_BUFFER, g->vbo);
+        gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof corners, corners, GL_STATIC_DRAW);
+    } else gl.GenVertexArrays(1, &g->vao);
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &g->max_tex);
+    if (g->max_tex < 1024) g->max_tex = 4096;
+    return true;
+}
+
+void r_image(Renderer *r, uint32_t serial, const uint32_t *px, int iw, int ih, void *owner, void (*release)(void *), float x, float y, float w, float h,
+             float u0, float v0, float u1, float v1) {
+    auto done = [&]() { if (release) release(owner); };
+    if (!px || iw <= 0 || ih <= 0 || w <= 0.f || h <= 0.f) { done(); return; }
+    auto u16 = [](float v) { v = v < 0.f ? 0.f : v > 1.f ? 1.f : v; return (uint16_t)(v * 65535.f + 0.5f); };
+    if (sd_soft) {
+        SoftState *s = r->ss;
+        auto it = s->imgs.find(serial);
+        if (it == s->imgs.end()) s->imgs.emplace(serial, SoftState::SImg{px, iw, ih, owner, release});
+        else done();
+        RInst in{x, y, w, h, u16(u0), u16(v0), u16(u1), u16(v1), 0xffffffffu, SOFT_IMAGE_BIT | (serial & 0x7fffffffu)};
+        r_push(r, &in, 1);
+        return;
+    }
+    if (!gl_images_init(r)) { done(); return; }
+    GlImages *g = r->gi;
+    if (iw > g->max_tex || ih > g->max_tex) { done(); return; }
+    r_flush(r);   /* everything queued so far is drawn first: images keep their place in the paint order */
+    auto it = g->tex.find(serial);
+    if (it == g->tex.end()) {
+        GlTex t{0, iw, ih, g->frame};
+        glGenTextures(1, &t.tex);
+        gl.ActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, t.tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, iw, ih, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        it = g->tex.emplace(serial, t).first;
+    }
+    done();   /* the texture has the pixels now */
+    it->second.last = g->frame;
+    gl.UseProgram(g->prog);
+    gl.Uniform2f(g->u_res, (float)r->w, (float)r->h);
+    gl.Uniform2f(g->u_pos, x, y);
+    gl.Uniform2f(g->u_size, w, h);
+    gl.Uniform2f(g->u_uv0, u0, v0);
+    gl.Uniform2f(g->u_uv1, u1, v1);
+    gl.ActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, it->second.tex);
+    gl.Uniform1i(g->u_img, 0);
+    if (sd_gl_kind == GLK_ES2) {
+        gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        gl.BindBuffer(GL_ARRAY_BUFFER, g->vbo);
+        for (GLuint a = 1; a <= 5; a++) gl.DisableVertexAttribArray(a);   /* flush_es2 enables them again on its next run */
+        gl.EnableVertexAttribArray(0);
+        gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (void *)0);
+        gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        return;
+    }
+    gl.BindVertexArray(g->vao);
+    gl.DrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
 }

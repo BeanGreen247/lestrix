@@ -106,8 +106,8 @@ run ftp    make test-ftp
 run perf   make perf-gate
 
 gui_test() {
-  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then make test-gui
-  elif have xvfb-run; then xvfb-run -a -s "-screen 0 1600x900x24" make test-gui
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then make test-gui || return 1   # make exits 2 on failure, which would read as SKIP below
+  elif have xvfb-run; then xvfb-run -a -s "-screen 0 1600x900x24" make test-gui || return 1
   else echo "no display and no xvfb-run: cannot open a window"; return 2; fi
 }
 if [ -z "$ONLY" ] || [ "$ONLY" = gui ]; then

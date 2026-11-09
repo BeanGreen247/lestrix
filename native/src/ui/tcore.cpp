@@ -7,6 +7,7 @@
 #include "../trace.h"
 
 #include <errno.h>
+#include <time.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -21,6 +22,7 @@
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -32,13 +34,15 @@
 
 #include "../pty.h"
 
-typedef struct PendingEv { VtEvent ev; char *text; struct PendingEv *next; } PendingEv;
+typedef struct PendingEv { VtEvent ev; char *text; double ts; struct PendingEv *next; } PendingEv;
+static double mono_s() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9; }
 
 static int default_scrollback = 10000;
 static size_t default_ram_mb = 32, default_disk_mb = 4096;
 static bool default_spill = true;
 
 struct TermCore {
+    int cpx_w = 0, cpx_h = 0;   /* cell size in pixels, for the pty's ws_xpixel/ws_ypixel (programs like `kitten icat` read it with an ioctl) */
     Vt *vt;
     SdPty pty;
     pthread_mutex_t lock;
@@ -62,6 +66,9 @@ struct TermCore {
     std::atomic<unsigned long long> reads;
     bool running, eof, child_done;
     int exit_status;
+    int last_exit;       /* from OSC 133;D, -1 unknown */
+    double cmd_t0;       /* when the last OSC 133;C arrived (monotonic seconds), 0 none */
+    bool integrated;     /* the shell has sent OSC 133 at least once */
     pthread_mutex_t outlock, evlock;
     uint8_t *outq; size_t outhead, outlen, outcap;
     PendingEv *ev_head, *ev_tail;
@@ -280,6 +287,13 @@ uint32_t tcore_modes(TermCore *t) {
     return m;
 }
 
+int tcore_kitty_flags(TermCore *t) {
+    LOCK(t);
+    int f = vt_kitty_flags(t->vt);
+    UNLOCK(t);
+    return f;
+}
+
 static void wake_ui(TermCore *t) {
     if (t->hooks.wake) t->hooks.wake(t->user);
 }
@@ -320,6 +334,7 @@ static void vt_event_cb(VtEvent ev, const char *text, void *user) {
     PendingEv *pe = static_cast<PendingEv*>(calloc(1, sizeof *pe));
     if (!pe) return;
     pe->ev = ev;
+    pe->ts = ev == VT_EV_CMD_START || ev == VT_EV_CMD_END ? mono_s() : 0;
     pe->text = text ? strdup(text) : NULL;
     pthread_mutex_lock(&t->evlock);
     if (t->ev_tail) t->ev_tail->next = pe; else t->ev_head = pe;
@@ -790,10 +805,9 @@ static void *writer_main(void *data) {
         pthread_mutex_lock(&t->outlock);
         bool empty = t->outlen == 0;
         pthread_mutex_unlock(&t->outlock);
-        if (empty && !t->stop.load()) {
-            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 200 * 1000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-            pthread_cond_timedwait(&t->out_cv, &t->iom, &ts);
-        }
+        /* No timeout: every producer (tcore_send, join_worker's stop) broadcasts out_cv while holding iom, so a wake-up cannot be lost
+         * between the check above and the wait; a timed wait only cost 5 idle wake-ups a second. */
+        if (empty && !t->stop.load()) pthread_cond_wait(&t->out_cv, &t->iom);
         pthread_mutex_unlock(&t->iom);
         if (t->stop.load()) break;
         bool pending = false;
@@ -929,10 +943,10 @@ static void *worker_main(void *data) {
 
 static bool spawn(TermCore *t) {
     LOCK(t);
-    int cols = t->cols, rows = t->rows;
+    int cols = t->cols, rows = t->rows, cw = t->cpx_w, ch = t->cpx_h;
     UNLOCK(t);
     char *extra[1] = {NULL};
-    if (sd_pty_spawn(&t->pty, t->argv, t->cwd, extra, cols, rows) != 0) return false;
+    if (sd_pty_spawn(&t->pty, t->argv, t->cwd, extra, cols, rows, cw, ch) != 0) return false;
     t->running = true;
     t->running_flag.store(1);
     t->eof = t->child_done = false;
@@ -973,6 +987,7 @@ static void join_worker(TermCore *t) {
 TermCore *tcore_new(char *const argv[], const char *cwd, int cols, int rows, const TermHooks *hooks, void *user, bool fastcat) {
     TermCore *t = new (std::nothrow) TermCore();
     if (!t) return NULL;
+    t->last_exit = -1;
     pthread_mutexattr_t at;
     pthread_mutexattr_init(&at);
     pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
@@ -999,6 +1014,7 @@ TermCore *tcore_new(char *const argv[], const char *cwd, int cols, int rows, con
     vt_set_history(t->vt, default_scrollback, default_ram_mb << 20, default_disk_mb << 20, default_spill);
     UNLOCK(t);
     vt_set_callbacks(t->vt, vt_write_cb, vt_event_cb, cache_free_cb, t);
+    vt_set_gfx_files(t->vt, fastcat);   /* kitty file transmission only for local shells */
     if (fastcat) {
         uint8_t rnd[16];
         if (getrandom(rnd, sizeof rnd, 0) == (ssize_t)sizeof rnd) {
@@ -1057,6 +1073,21 @@ bool tcore_pump(TermCore *t) {
         evs = e->next;
         if (e->ev == VT_EV_TITLE) { free(t->title); t->title = e->text ? strdup(e->text) : NULL; if (t->hooks.title) t->hooks.title(t->user, e->text); }
         else if (e->ev == VT_EV_CWD) { if (t->hooks.cwd) t->hooks.cwd(t->user, e->text); }
+        else if (e->ev == VT_EV_NOTIFY) {
+            if (t->hooks.notify && e->text) {
+                char *us = strchr(e->text, '\x1f');
+                if (us) { *us = 0; t->hooks.notify(t->user, e->text, us + 1); }
+            }
+        }
+        else if (e->ev == VT_EV_CMD_START) { t->integrated = true; t->cmd_t0 = e->ts; }
+        else if (e->ev == VT_EV_PROMPT) t->integrated = true;
+        else if (e->ev == VT_EV_CMD_END) {
+            t->integrated = true;
+            t->last_exit = e->text ? atoi(e->text) : -1;
+            double secs = t->cmd_t0 > 0 ? e->ts - t->cmd_t0 : 0;
+            t->cmd_t0 = 0;
+            if (t->hooks.cmd_end) t->hooks.cmd_end(t->user, t->last_exit, secs);
+        }
         else if (t->hooks.bell) t->hooks.bell(t->user);
         free(e->text);
         free(e);
@@ -1073,6 +1104,16 @@ bool tcore_pump(TermCore *t) {
     return changed;
 }
 
+void tcore_set_cell_px(TermCore *t, int cw, int ch) {
+    LOCK(t);
+    vt_set_cell_px(t->vt, cw, ch);
+    if ((cw != t->cpx_w || ch != t->cpx_h) && cw > 0 && ch > 0) {
+        t->cpx_w = cw; t->cpx_h = ch;
+        if (t->running) sd_pty_resize(&t->pty, t->cols, t->rows, cw, ch);
+    }
+    UNLOCK(t);
+}
+
 void tcore_resize(TermCore *t, int cols, int rows) {
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
@@ -1081,7 +1122,7 @@ void tcore_resize(TermCore *t, int cols, int rows) {
     if (cols != t->cols || rows != t->rows) {
         t->cols = cols; t->rows = rows;
         vt_resize(t->vt, cols, rows);
-        if (t->running) sd_pty_resize(&t->pty, cols, rows);
+        if (t->running) sd_pty_resize(&t->pty, cols, rows, t->cpx_w, t->cpx_h);
         t->sel_on = false;
         int max = vt_history_count(t->vt);
         if (t->offset > max) t->offset = max;
@@ -1104,6 +1145,49 @@ void tcore_scroll(TermCore *t, int delta) {
 }
 
 void tcore_scroll_to_live(TermCore *t) { t->offset = 0; }
+
+/* Prompt navigation (shell integration): dir < 0 scrolls so the previous prompt is the top row, dir > 0 the next one, and past the
+ * last one it returns to the live screen. False when there is nothing to jump to. */
+bool tcore_jump_prompt(TermCore *t, int dir) {
+    LOCK(t);
+    int p = vt_prompt_find(t->vt, -t->offset, dir);
+    int max = vt_history_count(t->vt);
+    UNLOCK(t);
+    if (p == INT_MIN) {
+        if (dir > 0 && t->offset > 0) { t->offset = 0; return true; }
+        return false;
+    }
+    t->offset = p >= 0 ? 0 : (-p > max ? max : -p);
+    return true;
+}
+
+/* Selects the output of the last finished command (between OSC 133;C and ;D). */
+bool tcore_select_last_output(TermCore *t) {
+    int a, b;
+    LOCK(t);
+    bool ok = vt_last_output(t->vt, &a, &b);
+    UNLOCK(t);
+    if (!ok) return false;
+    t->sel_a_idx = a; t->sel_a_col = 0;
+    t->sel_b_idx = b; t->sel_b_col = t->cols - 1;
+    t->sel_on = true; t->dragging = false;
+    if (a < -t->offset) { int max = vt_history_count(t->vt); t->offset = -a > max ? max : -a; }
+    return true;
+}
+
+int tcore_last_exit(const TermCore *t) { return t->last_exit; }
+bool tcore_integrated(const TermCore *t) { return t->integrated; }
+
+/* The shell's working directory read from /proc, for a local tab whose shell sends no OSC 7. Caller frees. */
+char *tcore_proc_cwd(const TermCore *t) {
+    if (t->pty.pid <= 0 || t->pty.fd < 0) return NULL;
+    char link[64], buf[4096];
+    snprintf(link, sizeof link, "/proc/%d/cwd", (int)t->pty.pid);
+    ssize_t n = readlink(link, buf, sizeof buf - 1);
+    if (n <= 0) return NULL;
+    buf[n] = 0;
+    return strdup(buf);
+}
 
 void tcore_set_history(TermCore *t, int lines, size_t ram_mb, size_t disk_mb, bool spill) {
     LOCK(t);
@@ -1294,16 +1378,68 @@ static void reconnect(TermCore *t) {
 
 void tcore_restart(TermCore *t) { if (t && !t->running) reconnect(t); }
 
-bool tcore_key(TermCore *t, TKey key, uint32_t cp, int mods) {
+size_t tcore_kitty_encode(int flags, TKey key, uint32_t cp, int mods, int ev, char *b) {
+    bool all = flags & VT_KB_ALL_KEYS;
+    if (!(flags & (VT_KB_DISAMBIGUATE | VT_KB_ALL_KEYS))) return 0;
+    int mod = 1 + (mods & 15);                 /* shift 1, alt 2, ctrl 4, super 8, plus one */
+    int code = 0;
+    char fin = 0;
+    switch (key) {
+    case TK_UP: fin = 'A'; break; case TK_DOWN: fin = 'B'; break; case TK_RIGHT: fin = 'C'; break; case TK_LEFT: fin = 'D'; break;
+    case TK_HOME: fin = 'H'; break; case TK_END: fin = 'F'; break;
+    case TK_F1: fin = 'P'; break; case TK_F2: fin = 'Q'; break; case TK_F3: fin = 'R'; break; case TK_F4: fin = 'S'; break;
+    case TK_INSERT: code = 2; break; case TK_DELETE: code = 3; break; case TK_PGUP: code = 5; break; case TK_PGDN: code = 6; break;
+    case TK_F5: code = 15; break; case TK_F6: code = 17; break; case TK_F7: code = 18; break; case TK_F8: code = 19; break;
+    case TK_F9: code = 20; break; case TK_F10: code = 21; break; case TK_F11: code = 23; break; case TK_F12: code = 24; break;
+    default: break;
+    }
+    char tail = 'u';
+    if (fin || code) {                          /* functional keys keep their legacy form unless modified or an event type is wanted */
+        if (mod == 1 && ev == 1) return 0;
+        tail = fin ? fin : '~';
+        if (fin) code = 1;
+    } else if (key == TK_ESCAPE) {
+        code = 27;
+    } else if (key == TK_ENTER || key == TK_TAB || key == TK_BACKSPACE) {
+        if (!all && (mod == 1 || ev == 3)) return 0;   /* plain Enter, Tab and Backspace stay legacy unless every key is an escape code */
+        code = key == TK_ENTER ? 13 : key == TK_TAB ? 9 : 127;
+    } else if (key == TK_NONE && cp >= 32) {
+        if (!all && !(mods & (TM_CTRL | TM_ALT | TM_META))) return 0;
+        code = (int)(cp >= 'A' && cp <= 'Z' ? cp + 32 : cp);
+    } else {
+        return 0;
+    }
+    int n = snprintf(b, 32, "\x1b[%d", code);
+    if (mod > 1 || ev != 1) n += snprintf(b + n, 32 - (size_t)n, ";%d", mod);
+    if (ev != 1) n += snprintf(b + n, 32 - (size_t)n, ":%d", ev);
+    b[n++] = tail;
+    b[n] = 0;
+    return (size_t)n;
+}
+
+bool tcore_key(TermCore *t, TKey key, uint32_t cp, int mods) { return tcore_key_ev(t, key, cp, mods, 1); }
+
+bool tcore_key_ev(TermCore *t, TKey key, uint32_t cp, int mods, int ev) {
     bool ctrl = mods & TM_CTRL, shift = mods & TM_SHIFT, alt = mods & TM_ALT;
     if (!t->running) {
-        if (key == TK_ENTER) reconnect(t);
+        if (key == TK_ENTER && ev == 1) reconnect(t);
         return true;
     }
+    int kf = tcore_kitty_flags(t);
+    if (ev == 3) {                              /* a release only matters to a program that asked for event types */
+        char k[32];
+        if ((kf & VT_KB_EVENTS) && tcore_kitty_encode(kf, key, cp, mods, 3, k)) tcore_send_str(t, k);
+        return true;
+    }
+    if (ev == 2 && !(kf & VT_KB_EVENTS)) ev = 1;
     if (ctrl && shift && (cp == 'c' || cp == 'C')) { tcore_copy(t); return true; }
     if ((ctrl && shift && (cp == 'v' || cp == 'V')) || (shift && key == TK_INSERT)) { tcore_paste_request(t); return true; }
     if (shift && !ctrl && (key == TK_PGUP || key == TK_PGDN)) { tcore_scroll(t, key == TK_PGUP ? t->rows - 1 : -(t->rows - 1)); return true; }
     if (t->offset) t->offset = 0;
+    if (kf) {
+        char k[32];
+        if (tcore_kitty_encode(kf, key, cp, mods, ev, k)) { tcore_send_str(t, k); return true; }
+    }
     if (key == TK_ENTER) { tcore_send_str(t, alt ? "\x1b\r" : "\r"); return true; }
     if (key == TK_BACKSPACE) { tcore_send_str(t, alt ? "\x1b\x7f" : ctrl ? "\x08" : "\x7f"); return true; }
     if (key == TK_TAB) { tcore_send_str(t, shift ? "\x1b[Z" : "\t"); return true; }
@@ -1332,6 +1468,7 @@ bool tcore_key(TermCore *t, TKey key, uint32_t cp, int mods) {
 
 void tcore_text(TermCore *t, const char *utf8) {
     if (!t->running || !utf8 || !*utf8) return;
+    if (utf8[1] == 0 && (unsigned char)utf8[0] >= 0x20 && (unsigned char)utf8[0] < 0x7f && (tcore_kitty_flags(t) & VT_KB_ALL_KEYS)) return;   /* already sent as a key code */
     if (t->offset) t->offset = 0;
     tcore_send(t, utf8, strlen(utf8));
 }

@@ -5,6 +5,7 @@
 
 #include "termview.h"
 #include "workpool.h"
+#include "ligrun.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -83,12 +84,17 @@ static bool proc_bits(uint32_t cp, int w, int h, uint8_t *b) {
     return true;
 }
 
-typedef struct { uint32_t gen, fontid, epoch; int cols; int n, cap; RInst v[]; } RowCache;
+static bool g_lig = false;   /* ligatures on */
+void tv_set_ligatures(bool on) { g_lig = on; }
+bool tv_ligatures() { return g_lig; }
+
+typedef struct { uint32_t gen, fontid, epoch; int cols; int brk; bool lig; int n, cap; RInst v[]; } RowCache;
 
 typedef struct {
     VtCell *cells; int len;
     VtStyle *styles; uint32_t *ids; int nstyles;
     uint32_t *comb;
+    bool lig; int brk;   /* shape ligature runs; the cursor column that must stay unshaped, or -1 */
 } RowCopy;
 
 static void copy_free(RowCopy *c) { free(c->cells); free(c->styles); free(c->ids); free(c->comb); memset(c, 0, sizeof *c); }
@@ -154,6 +160,87 @@ static void out_add(Out *o, const RInst *i) {
     o->v[o->n++] = *i;
 }
 
+/* One cell's underline: single, double, curly (a sine wave one cell wide, so neighbours join up), dotted or dashed. Everything is
+ * built from small rectangles so the GL and the CPU renderer draw it the same way; plain single lines stay one rectangle. */
+static void underline(Renderer *r, Out *o, int x0, int w, int cw, int ch, int asc, int lh, int kind, uint32_t col) {
+    RInst inst;
+    int y = asc + 1;
+    if (y + lh > ch) y = ch - lh;
+    auto rect = [&](int rx, int ry, int rw, int rh) {
+        if (rw <= 0 || rh <= 0) return;
+        r_make_rect(r, &inst, (float)rx, (float)ry, (float)rw, (float)rh, col);
+        out_add(o, &inst);
+    };
+    switch (kind) {
+    case VT_UL_DOUBLE: {
+        int y1 = y - lh - 1 < 0 ? 0 : y - lh - 1;
+        if (y + lh > ch - 1 && y1 > 0) { y = ch - lh; y1 = y - lh - 1 < 0 ? 0 : y - lh - 1; }
+        rect(x0, y1, w, lh);
+        rect(x0, y1 + lh + 1 > ch - lh ? ch - lh : y1 + lh + 1, w, lh);
+        break;
+    }
+    case VT_UL_CURLY: {
+        int amp = ch / 14 < 1 ? 1 : ch / 14;
+        int base = y - amp < 0 ? 0 : y - amp;
+        if (base + 2 * amp + lh > ch) base = ch - 2 * amp - lh < 0 ? 0 : ch - 2 * amp - lh;
+        int cell = cw > 0 ? cw : 1;
+        for (int px = 0; px < w; px++) {
+            double ph = (double)((x0 + px) % cell) / (double)cell;
+            int dy = (int)((1.0 - cos(ph * 6.283185307179586)) * 0.5 * (double)(2 * amp) + 0.5);
+            rect(x0 + px, base + dy, 1, lh);
+        }
+        break;
+    }
+    case VT_UL_DOTTED: {
+        int d = lh < 1 ? 1 : lh;
+        for (int px = 0; px < w; px += 2 * d) rect(x0 + px, y, px + d > w ? w - px : d, lh);
+        break;
+    }
+    case VT_UL_DASHED: {
+        int half = w / 2 > 0 ? w / 2 : 1, gap = half / 3 > 0 ? half / 3 : 1;
+        for (int px = 0; px < w; px += half) rect(x0 + px, y, half - gap > 0 ? (px + half - gap > w ? w - px : half - gap) : 1, lh);
+        break;
+    }
+    default: rect(x0, y, w, lh); break;
+    }
+}
+
+/* Shapes the ligature runs of one row: lgid[x] is the glyph index to draw at cell x instead of the character, lskip[x] marks the cells a
+ * multi-cell ligature covers. Returns false when a worker pass must hand the row to the main thread (a face or shaper still to be set up). */
+static bool lig_prepare(Font *f, const RowCopy *c, bool peek, uint32_t **lgid, uint8_t **lskip) {
+    int n = c->len;
+    uint32_t *cp = static_cast<uint32_t*>(malloc((size_t)n * (sizeof(uint32_t) * 2 + 1)));
+    if (!cp) return true;
+    uint32_t *sty = cp + n;
+    uint8_t *flg = reinterpret_cast<uint8_t*>(sty + n);
+    for (int x = 0; x < n; x++) {
+        cp[x] = VT_CELL_CH(c->cells[x]);
+        sty[x] = VT_CELL_STYLE(c->cells[x]);
+        flg[x] = (uint8_t)((VT_CELL_FLAGS(c->cells[x]) & (VT_F_WIDE | VT_F_TAIL)) | (c->comb && c->comb[x] ? LR_COMB : 0));
+        if (cp[x] == 0) cp[x] = ' ';
+    }
+    LigRun runs[64];
+    int nr = lig_split(cp, sty, flg, n, c->brk, runs, 64);
+    bool ok = true;
+    for (int k = 0; k < nr && ok; k++) {
+        const VtStyle *st = style_of(c, sty[runs[k].start]);
+        if (st->attrs & VT_INVIS) continue;
+        int fs = ((st->attrs & VT_BOLD) ? FS_BOLD : 0) | ((st->attrs & VT_ITALIC) ? FS_ITALIC : 0);
+        ShapedGlyph sg[LIG_MAX_RUN];
+        int ng = font_shape(f, cp + runs[k].start, runs[k].len, fs, sg, LIG_MAX_RUN, !peek);
+        if (ng < 0) { ok = false; break; }
+        for (int i = 0; i < ng; i++) {
+            if (!*lgid) { *lgid = static_cast<uint32_t*>(calloc((size_t)n, sizeof(uint32_t))); *lskip = static_cast<uint8_t*>(calloc((size_t)n, 1)); }
+            if (!*lgid || !*lskip) { ok = true; break; }
+            int x = runs[k].start + sg[i].cell;
+            (*lgid)[x] = sg[i].gid + 1;   /* +1: glyph index 0 is .notdef and means "none" here */
+            for (int s2 = 1; s2 < sg[i].span && x + s2 < n; s2++) (*lskip)[x + s2] = 1;
+        }
+    }
+    free(cp);
+    return ok;
+}
+
 static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCopy *c, Out *o, bool peek, bool *miss) {
     Atlas *a = r_atlas(r);
     int cw = font_cell_w(f), ch = font_cell_h(f), asc = font_ascent(f);
@@ -163,6 +250,9 @@ static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCop
     uint32_t bg_col = 0;
     RInst inst;
     Out fgl = {0};
+    uint32_t *lgid = NULL;
+    uint8_t *lskip = NULL;
+    if (c->lig && c->len > 1 && !lig_prepare(f, c, peek, &lgid, &lskip)) { *miss = true; goto abandon; }
     for (int x = 0; x < c->len;) {
         VtCell cell = c->cells[x];
         if (VT_CELL_FLAGS(cell) & VT_F_TAIL) { x++; continue; }
@@ -184,10 +274,15 @@ static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCop
         uint32_t cp = VT_CELL_CH(cell);
         if (!(st->attrs & VT_INVIS)) {
             int fs = ((st->attrs & VT_BOLD) ? FS_BOLD : 0) | ((st->attrs & VT_ITALIC) ? FS_ITALIC : 0);
-            if (cp > 0x20 && cp != 0x7f) {
+            if (cp > 0x20 && cp != 0x7f && !(lskip && lskip[x])) {
                 const AtlasGlyph *g = NULL;
                 bool proc = (cp >= 0x2500 && cp <= 0x259f) && wcells == 1;
-                if (proc) {
+                if (lgid && lgid[x]) {
+                    uint32_t gid = lgid[x] - 1;
+                    g = peek ? atlas_peek_gid(a, fid, gid, fs) : atlas_glyph_gid(a, f, gid, fs);
+                    if (peek && !g) { *miss = true; goto abandon; }
+                    if (g && !g->blank) { r_make_glyph(r, &inst, g, (float)(x * cw), (float)asc, fg); out_add(&fgl, &inst); }
+                } else if (proc) {
                     g = atlas_find_custom(a, fid, cp);
                     if (!g && peek) { *miss = true; goto abandon; }
                     if (!g) {
@@ -208,7 +303,11 @@ static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCop
                 }
             }
             int lh = ch >= 28 ? 2 : 1;
-            if (st->attrs & VT_UNDERLINE) { r_make_rect(r, &inst, (float)(x * cw), (float)(asc + 1), (float)(wcells * cw), (float)lh, fg); out_add(&fgl, &inst); }
+            if (st->attrs & VT_UNDERLINE) {
+                uint32_t ulc = fg, cu = st->ul;
+                if (VT_COLOR_KIND(cu) == 1) ulc = pal->pal[cu & 0xff]; else if (VT_COLOR_KIND(cu) == 2) ulc = rgb_u32(cu);
+                underline(r, &fgl, x * cw, wcells * cw, cw, ch, asc, lh, VT_UL_KIND(st->attrs), ulc);
+            }
             if (st->attrs & VT_STRIKE) { r_make_rect(r, &inst, (float)(x * cw), (float)(asc * 5 / 8), (float)(wcells * cw), (float)lh, fg); out_add(&fgl, &inst); }
         }
         x += wcells;
@@ -218,6 +317,8 @@ static void build_row(Renderer *r, Font *f, const TermPalette *pal, const RowCop
 abandon:
     free(fgl.v);
     free(procbuf);
+    free(lgid);
+    free(lskip);
 }
 
 void tv_fit(const Font *f, float w, float h, int *cols, int *rows) {
@@ -227,6 +328,14 @@ void tv_fit(const Font *f, float w, float h, int *cols, int *rows) {
 }
 
 #define MAX_ROWS 512
+
+/* One inline image placement. The view holds a reference on the pixels; r_image drops it once the renderer has them. */
+static void draw_image_view(Renderer *r, const VtImageView &v, float ox, float oy, int cw, int ch, int off) {
+    float x = ox + (float)(v.col * cw), y = oy + (float)((v.idx + off) * ch);
+    float w = v.stretch ? (float)(v.cols * cw) : (float)v.sw, h = v.stretch ? (float)(v.rows * ch) : (float)v.sh;
+    r_image(r, v.serial, v.px, v.iw, v.ih, v.img, vt_image_unref, x, y, w, h, (float)v.sx / (float)v.iw, (float)v.sy / (float)v.ih,
+            (float)(v.sx + v.sw) / (float)v.iw, (float)(v.sy + v.sh) / (float)v.ih);
+}
 
 typedef struct { Renderer *r; Font *f; const TermPalette *pal; RowCopy *copies; Out *outs; bool *missed; const int *todo; } RTask;
 
@@ -238,7 +347,7 @@ static void rtask_fn(void *arg, int i) {
     if (miss) { free(c->outs[row].v); c->outs[row] = (Out){0}; c->missed[row] = true; }
 }
 
-void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x, float y, float w, float h, bool blink_on) {
+void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x, float y, float w, float h, bool blink_on, const TvOverlay *ov) {
     Vt *vt = tcore_vt(t);
     Atlas *a = r_atlas(r);
     int cols = tcore_cols(t), rows = tcore_rows(t), off = tcore_offset(t);
@@ -253,6 +362,13 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
     bool need[MAX_ROWS];
     int cursor_x = -1, cursor_y = -1, cursor_style = 0;
     VtCell cur_cell = {0, 0};
+    VtImageView views[32];
+    int nviews = 0;
+    tcore_lock(t);
+    vt_set_cell_px(vt, cw, ch);
+    nviews = vt_images_in_view(vt, -off, rows, views, 32);
+    tcore_unlock(t);
+    for (int i = 0; i < nviews; i++) if (views[i].z < 0) draw_image_view(r, views[i], ox, oy, cw, ch, off);   /* under the text */
     size_t mark = r_mark(r);
 
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -261,18 +377,22 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
         uint32_t fid = font_id(f);
         memset(copies, 0, (size_t)(rows > 0 ? rows : 0) * sizeof *copies);
         tcore_lock(t);
+        const bool lig = g_lig;
+        int lig_cy = -1, lig_cx = -1;   /* the cursor cell stays unshaped so a ligature is broken under the cursor */
+        if (lig && off == 0 && (vt_modes(vt) & VT_M_CURSOR_VISIBLE)) { lig_cy = vt_cursor_y(vt); lig_cx = vt_cursor_x(vt); if (lig_cx >= cols) lig_cx = cols - 1; }
         for (int row = 0; row < rows; row++) {
             metas[row] = vt_line_meta(vt, row - off);
             need[row] = false;
             VtLineMeta *m = metas[row];
             if (!m) continue;
             RowCache *rc = static_cast<RowCache*>(m->cache);
-            if (rc && !m->dirty && rc->gen == gen0 && rc->fontid == fid && rc->epoch == pal->epoch && rc->cols == cols) {
+            if (rc && !m->dirty && rc->gen == gen0 && rc->fontid == fid && rc->epoch == pal->epoch && rc->cols == cols && rc->lig == lig && rc->brk == (row == lig_cy ? lig_cx : -1)) {
                 r_push_at(r, rc->v, rc->n, ox, oy + (float)(row * ch));
                 sd_cache.row_hit++;
             } else {
                 sd_cache.row_miss++;
                 copy_row(vt, row - off, &copies[row]);
+                copies[row].lig = lig; copies[row].brk = row == lig_cy ? lig_cx : -1;
                 m->dirty = 0;
                 need[row] = true;
             }
@@ -329,7 +449,7 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
                     if (nr) { nr->cap = cap; free(m->cache); m->cache = rc = nr; } else rc = NULL;
                 }
                 if (rc) {
-                    rc->gen = gen0; rc->fontid = fid; rc->epoch = pal->epoch; rc->cols = cols; rc->n = outs[row].n;
+                    rc->gen = gen0; rc->fontid = fid; rc->epoch = pal->epoch; rc->cols = cols; rc->lig = lig; rc->brk = row == lig_cy ? lig_cx : -1; rc->n = outs[row].n;
                     if (outs[row].n) memcpy(rc->v, outs[row].v, (size_t)outs[row].n * sizeof(RInst));
                 }
             }
@@ -339,6 +459,8 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
         break;
     }
 
+    for (int i = 0; i < nviews; i++) if (views[i].z >= 0) draw_image_view(r, views[i], ox, oy, cw, ch, off);   /* over the text */
+
     int ai, ac, bi, bc;
     if (tcore_selection(t, &ai, &ac, &bi, &bc)) {
         for (int row = 0; row < rows; row++) {
@@ -346,6 +468,26 @@ void tv_draw(TermCore *t, Renderer *r, Font *f, const TermPalette *pal, float x,
             if (idx < ai || idx > bi) continue;
             int lo = idx == ai ? ac : 0, hi = idx == bi ? bc : cols - 1;
             r_rect(r, ox + (float)(lo * cw), oy + (float)(row * ch), (float)((hi - lo + 1) * cw), (float)ch, pal->sel);
+        }
+    }
+    if (ov && ov->nmatches > 0) {
+        int hi_idx = rows - 1 - off, lo_idx = -off;
+        int lo = 0, hi = ov->nmatches;   /* first match with idx <= hi_idx: the list is newest first */
+        while (lo < hi) { int mid = (lo + hi) / 2; if (ov->matches[mid].idx > hi_idx) lo = mid + 1; else hi = mid; }
+        for (int i = lo; i < ov->nmatches && ov->matches[i].idx >= lo_idx; i++) {
+            const FindMatch &m = ov->matches[i];
+            int c0 = m.col, c1 = m.col + m.len;
+            if (c0 >= cols) continue;
+            if (c1 > cols) c1 = cols;
+            uint32_t col = i == ov->current ? RGBA(255, 150, 30, 190) : RGBA(255, 214, 0, 110);
+            r_rect(r, ox + (float)(c0 * cw), oy + (float)((m.idx + off) * ch), (float)((c1 - c0) * cw), (float)ch, col);
+        }
+    }
+    if (ov && ov->link) {
+        int row = ov->link_idx + off;
+        if (row >= 0 && row < rows) {
+            int lh = ch >= 28 ? 2 : 1, c1 = ov->link_c1 >= cols ? cols - 1 : ov->link_c1;
+            if (c1 >= ov->link_c0) r_rect(r, ox + (float)(ov->link_c0 * cw), oy + (float)(row * ch + ch - 1 - lh), (float)((c1 - ov->link_c0 + 1) * cw), (float)lh + 1, RGBA(90, 170, 255, 255));
         }
     }
     if (cursor_x >= 0 && cursor_y >= 0 && cursor_y < rows) {

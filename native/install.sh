@@ -41,10 +41,10 @@ for cand in apt-get dnf yum pacman zypper apk; do have "$cand" && { PM="$cand"; 
 
 pkgs() {
   case "$PM" in
-    apt-get) echo build-essential pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libcurl4-openssl-dev openssh-client libgl1 libegl1 libgles2 libgl1-mesa-dri ;;
-    dnf|yum) echo gcc-c++ make pkgconf-pkg-config SDL2-devel freetype-devel fontconfig-devel libcurl-devel openssh-clients mesa-libGL mesa-libEGL mesa-libGLES mesa-dri-drivers ;;
-    pacman)  echo base-devel pkgconf sdl2 freetype2 fontconfig curl openssh mesa ;;
-    zypper)  echo gcc-c++ make pkg-config SDL2-devel freetype2-devel fontconfig-devel libcurl-devel openssh-clients Mesa-libGL1 Mesa-libEGL1 Mesa-libGLESv2-2 Mesa-dri ;;
+    apt-get) echo build-essential pkg-config libsdl2-dev libfreetype-dev libfontconfig-dev libharfbuzz-dev libcurl4-openssl-dev openssh-client libgl1 libegl1 libgles2 libgl1-mesa-dri ;;
+    dnf|yum) echo gcc-c++ make pkgconf-pkg-config SDL2-devel freetype-devel fontconfig-devel harfbuzz-devel libcurl-devel openssh-clients mesa-libGL mesa-libEGL mesa-libGLES mesa-dri-drivers ;;
+    pacman)  echo base-devel pkgconf sdl2 freetype2 fontconfig harfbuzz curl openssh mesa ;;
+    zypper)  echo gcc-c++ make pkg-config SDL2-devel freetype2-devel fontconfig-devel harfbuzz-devel libcurl-devel openssh-clients Mesa-libGL1 Mesa-libEGL1 Mesa-libGLESv2-2 Mesa-dri ;;
   esac
 }
 
@@ -73,7 +73,7 @@ install_deps() {
   esac
 }
 
-need_deps() { pkg-config --exists sdl2 freetype2 fontconfig libcurl 2>/dev/null && have g++ && have make; }
+need_deps() { pkg-config --exists sdl2 freetype2 fontconfig harfbuzz libcurl 2>/dev/null && have g++ && have make; }
 
 if ! need_deps; then
   if [ "$DEPS" = no ]; then :

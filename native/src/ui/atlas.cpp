@@ -273,3 +273,23 @@ const AtlasGlyph *atlas_custom(Atlas *a, uint32_t font_id, uint32_t key, const u
     if (g) return g;
     return insert(a, font_id, key, CUSTOM_STYLE, bits, w, h, 0, 0, (float)w);
 }
+
+/* Ligature glyphs are addressed by glyph index; the key space above the last codepoint keeps them apart from character glyphs. */
+#define GID_KEY(g) (0x40000000u | (uint32_t)(g))
+
+const AtlasGlyph *atlas_glyph_gid(Atlas *a, Font *f, uint32_t gid, int style) {
+    uint32_t fid = font_id(f);
+    bool found;
+    Entry *e = lookup(a, fid, GID_KEY(gid), (uint8_t)style, &found);
+    if (found && valid(a, &e->g)) { sd_cache.glyph_hit++; return &e->g; }
+    sd_cache.glyph_miss++;
+    GlyphBmp b;
+    font_glyph_gid(f, gid, style, &b);
+    return insert(a, fid, GID_KEY(gid), (uint8_t)style, b.buf, b.w, b.h, b.left, b.top, b.adv);
+}
+
+const AtlasGlyph *atlas_peek_gid(const Atlas *a, uint32_t fid, uint32_t gid, int style) {
+    bool found;
+    Entry *e = lookup((Atlas *)a, fid, GID_KEY(gid), (uint8_t)style, &found);
+    return found && valid(a, &e->g) ? &e->g : NULL;
+}

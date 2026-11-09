@@ -24,7 +24,7 @@
 #include "ui.h"
 #include "uitheme.h"
 
-#define APP_VERSION "0.4.1"
+#define APP_VERSION "0.4.2"
 #define APP_CREDIT "Copyright (c) 2026 Thomas Mozdren (BeanGreen247)\nhttps://github.com/BeanGreen247/lestrix\n"
 
 struct App;
@@ -33,13 +33,31 @@ class FilesPane;
 enum TabKind { TAB_LOCAL, TAB_SSH, TAB_FTP };
 enum TabState { ST_IDLE, ST_ACTIVITY, ST_BELL, ST_ENDED };
 
+struct Tab;
+
+/* A node of a tab's split-pane tree. A leaf owns one terminal; an inner node splits its rectangle between two children. The hooks of
+ * a terminal get its leaf as `user`. */
+struct Pane {
+    Tab *tab = nullptr;
+    TermCore *term = nullptr;
+    Pane *a = nullptr, *b = nullptr, *parent = nullptr;
+    bool horiz = true;      /* inner node: children side by side (true) or stacked */
+    float ratio = 0.5f;
+    Rect r{};               /* where it was last drawn, in window pixels (inner nodes: both children and the divider) */
+    std::string cwd;        /* last directory this pane's shell reported with OSC 7 */
+    bool exited = false;    /* its program ended while other panes are open: closed by the main loop */
+    bool leaf() const { return !a; }
+};
+
 struct Tab {
     App *app = nullptr;
     TabKind kind = TAB_LOCAL;
-    TermCore *term = nullptr;
+    TermCore *term = nullptr;   /* the focused pane's terminal */
+    Pane *root = nullptr, *focus = nullptr;
     std::shared_ptr<FilesPane> files;
     std::unique_ptr<SdConn> conn;
     std::string title, color, control_path;
+    std::string cwd;   /* last directory the shell reported with OSC 7 */
     std::vector<std::string> local_argv;
     TabState state = ST_IDLE;
     bool asked = false;
@@ -96,6 +114,7 @@ struct App {
     int side_page = 0;
     double side_anim = 0;
     UiText search{}; char search_buf[128] = "";
+    struct Find *find = nullptr;   /* scrollback find bar, extras.cpp */
     float list_scroll = 0;
     std::unordered_map<std::string, int> up;
     std::string ctx_id;
@@ -103,6 +122,10 @@ struct App {
     int menu_hover = 0;
     double next_probe = 0, next_hud = 0, next_trim = 0;
     bool fast_cat = true;
+    int lig_mode = -1;         /* ligatures: -1 automatic (on when the terminal font has them), 0 off, 1 on */
+    bool notify = true;        /* desktop notifications: OSC 9 / 777 and "command finished" */
+    int notify_secs = 10;      /* a command that ran at least this long notifies when it ends out of sight */
+    double notify_last = 0;
     bool quit_on_exit = false;
     char hud_cache_tip[448] = "", hud_parse_tip[256] = "", title_last[400] = "";
     bool lite = false;
@@ -139,10 +162,31 @@ void app_settings_save(App *a);
 void app_apply_theme(App *a, const UiTheme *t);
 void app_follow_fleetwm(App *a);
 void app_apply_font(App *a);
+void app_ligatures_apply(App *a);
+bool app_ligatures_on(const App *a);
 void app_set_accent(App *a, const std::string &hex);
 void app_dup_tab(App *a, Tab *t);
 void app_set_tab_color(App *a, Tab *t, const std::string &hex);
 std::vector<std::string> app_default_shell_argv(const std::string &shell);
+std::vector<TermCore *> tab_terms(Tab *t);   /* every pane's terminal, in layout order */
+void tab_pane_leaves(Tab *t, std::vector<Pane *> &out);
+
+/* Scrollback find bar and hyperlinks (extras.cpp). */
+void find_open(App *a);
+void find_close(App *a);
+bool find_is_open(const App *a);
+bool find_key(App *a, SDL_Keycode k, Uint16 mods);   /* Esc, Ctrl+Shift+F handled while open; true when consumed */
+/* Draws the bar over the terminal area `r` of the focused pane and runs a slice of the scan; call once per frame after tv_draw. */
+void find_frame(App *a, Tab *t, Rect r);
+/* Overlay (matches, hovered link) for the terminal drawn in pane p; valid until the next frame. */
+const TvOverlay *extras_overlay(App *a, Pane *p);
+/* Pointer over pane p's terminal (px, py in window pixels, cell col/row of the pointer), updates the hovered link. */
+bool links_hover(App *a, Pane *p, int col, int row, bool ctrl);   /* p null clears; true when the hovered link changed (redraw) */
+bool find_hit(const App *a, float x, float y);   /* pointer over the find bar */
+/* Ctrl+click: opens the link under the pointer with xdg-open; true when there was one (the click is then not passed on). */
+bool links_open_at(App *a, Pane *p, int col, int row);
+void links_draw_tip(App *a, Pane *p);
+void links_clear(App *a);
 
 void dlg_push(App *a, std::unique_ptr<Dialog> d);
 bool dlg_active(const App *a);

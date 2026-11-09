@@ -10,12 +10,14 @@
 #include FT_OUTLINE_H
 #include FT_SYNTHESIS_H
 #include <fontconfig/fontconfig.h>
+#include <hb.h>
+#include <hb-ot.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
-typedef struct { FT_Face face; char *path; int index; bool bitmap; } FaceEnt;
+typedef struct { FT_Face face; char *path; int index; bool bitmap; hb_font_t *hb; } FaceEnt;
 
 #define NEG_SLOTS 2048
 
@@ -129,7 +131,7 @@ Font *font_open(const char *family, double px, bool mono) {
 
 void font_close(Font *f) {
     if (!f) return;
-    for (int i = 0; i < 4; i++) { if (f->style[i].face) FT_Done_Face(f->style[i].face); free(f->style[i].path); }
+    for (int i = 0; i < 4; i++) { if (f->style[i].hb) hb_font_destroy(f->style[i].hb); if (f->style[i].face) FT_Done_Face(f->style[i].face); free(f->style[i].path); }
     for (int i = 0; i < f->nfb; i++) { if (f->fb[i].face) FT_Done_Face(f->fb[i].face); free(f->fb[i].path); }
     free(f->fb);
     free(f->family);
@@ -264,14 +266,7 @@ static bool bitmap_glyph(Font *f, FT_Face face, FT_UInt gi, GlyphBmp *out, bool 
     return true;
 }
 
-bool font_glyph(Font *f, uint32_t cp, int style, GlyphBmp *out) { return font_glyph_color(f, cp, style, out, false); }
-
-bool font_glyph_color(Font *f, uint32_t cp, int style, GlyphBmp *out, bool allow_color) {
-    memset(out, 0, sizeof *out);
-    bool sb, si;
-    FT_Face face = pick_face(f, cp, style, &sb, &si);
-    if (!face) return false;
-    FT_UInt gi = FT_Get_Char_Index(face, cp);
+static bool render_gi(Font *f, FT_Face face, FT_UInt gi, bool sb, bool si, GlyphBmp *out, bool allow_color) {
     if (is_bitmap_face(f, face)) return bitmap_glyph(f, face, gi, out, allow_color);
     if (FT_Load_Glyph(face, gi, FT_LOAD_TARGET_LIGHT | FT_LOAD_NO_BITMAP) != 0) return false;
     FT_GlyphSlot slot = face->glyph;
@@ -288,7 +283,7 @@ bool font_glyph_color(Font *f, uint32_t cp, int style, GlyphBmp *out, bool allow
     out->h = (int)bm->rows;
     out->left = slot->bitmap_left;
     out->top = slot->bitmap_top;
-    out->adv = (float)(slot->advance.x / 64.0) + (sb ? 0.f : 0.f);
+    out->adv = (float)(slot->advance.x / 64.0);
     size_t need = (size_t)out->w * out->h;
     if (need > f->scratch_cap) {
         uint8_t *ns = static_cast<uint8_t*>(realloc(f->scratch, need));
@@ -301,6 +296,126 @@ bool font_glyph_color(Font *f, uint32_t cp, int style, GlyphBmp *out, bool allow
     }
     out->buf = f->scratch;
     return true;
+}
+
+bool font_glyph(Font *f, uint32_t cp, int style, GlyphBmp *out) { return font_glyph_color(f, cp, style, out, false); }
+
+bool font_glyph_color(Font *f, uint32_t cp, int style, GlyphBmp *out, bool allow_color) {
+    memset(out, 0, sizeof *out);
+    bool sb, si;
+    FT_Face face = pick_face(f, cp, style, &sb, &si);
+    if (!face) return false;
+    return render_gi(f, face, FT_Get_Char_Index(face, cp), sb, si, out, allow_color);
+}
+
+/* ---- ligatures: HarfBuzz shaping of one run of same-style cells (OpenType funcs, no FreeType, so shaping itself holds no shared state) ---- */
+
+static FaceEnt *ent_of(Font *f, FT_Face face) {
+    for (int i = 0; i < 4; i++) if (f->style[i].face == face) return &f->style[i];
+    return NULL;
+}
+
+static hb_font_t *hb_of(FaceEnt *e) {
+    if (e->hb) return e->hb;
+    if (!e->path) return NULL;
+    hb_blob_t *blob = hb_blob_create_from_file_or_fail(e->path);
+    if (!blob) return NULL;
+    hb_face_t *hf = hb_face_create(blob, (unsigned)e->index);
+    hb_blob_destroy(blob);
+    e->hb = hb_font_create(hf);
+    hb_face_destroy(hf);
+    if (e->hb) hb_ot_font_set_funcs(e->hb);
+    return e->hb;
+}
+
+/* The face a run in this style is shaped with: the style's own face once loaded, else the regular one. No FreeType call, so worker threads may use it. */
+static FT_Face run_face(Font *f, int style, bool init, bool *sb, bool *si) {
+    if ((unsigned)style > 3) style = 0;
+    *sb = *si = false;
+    if (init && style) { load_style(f, style); if (style == FS_BOLD_ITALIC) { load_style(f, FS_BOLD); load_style(f, FS_ITALIC); } }
+    else if (!init && style && !f->tried[style]) return NULL;   /* a worker thread must not load faces */
+    return f->style[style].face ? f->style[style].face : f->style[0].face;
+}
+
+enum { SHAPE_CACHE_MAX = 64, SHAPE_CACHE_SLOTS = 512 };
+
+int font_shape(Font *f, const uint32_t *cps, int n, int style, ShapedGlyph *out, int cap, bool init) {
+    if (n <= 0 || n > 256) return 0;
+    bool sb, si;
+    FT_Face face = run_face(f, style, init, &sb, &si);
+    if (!face || is_bitmap_face(f, face)) return face ? 0 : -1;
+    FaceEnt *e = ent_of(f, face);
+    if (!e) return 0;
+    /* Short runs repeat all the time ("-", "::", "=" in a log), so a small per-thread cache keeps HarfBuzz off the flood path: in a 107 MB
+     * `cat` of log lines the shaper was about 9% of all CPU before this cache. Keyed on the font id (never reused), the face and the text. */
+    struct ShapeSlot { uint32_t fid; const void *face; int n, ng; uint32_t cps[SHAPE_CACHE_MAX]; ShapedGlyph g[SHAPE_CACHE_MAX]; };
+    static thread_local ShapeSlot cache[SHAPE_CACHE_SLOTS];
+    ShapeSlot *slot = NULL;
+    if (n <= SHAPE_CACHE_MAX) {
+        uint32_t h = f->id * 2654435761u ^ (uint32_t)(uintptr_t)face;
+        for (int i = 0; i < n; i++) h = (h ^ cps[i]) * 16777619u;
+        slot = &cache[h % SHAPE_CACHE_SLOTS];
+        if (slot->fid == f->id && slot->face == face && slot->n == n && memcmp(slot->cps, cps, (size_t)n * sizeof(uint32_t)) == 0) {
+            int k = slot->ng < cap ? slot->ng : cap;
+            memcpy(out, slot->g, (size_t)k * sizeof(ShapedGlyph));
+            return k;
+        }
+    }
+    if (!e->hb && !init) return -1;
+    hb_font_t *hf = hb_of(e);
+    if (!hf) return 0;
+    hb_buffer_t *buf = hb_buffer_create();
+    hb_buffer_add_utf32(buf, cps, n, 0, n);
+    hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
+    hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
+    hb_buffer_set_language(buf, hb_language_from_string("en", 2));
+    hb_shape(hf, buf, NULL, 0);
+    unsigned ng = 0;
+    hb_glyph_info_t *gi = hb_buffer_get_glyph_infos(buf, &ng);
+    int no = 0;
+    for (unsigned i = 0; i < ng && no < cap; i++) {
+        int cl = (int)gi[i].cluster;
+        if (cl < 0 || cl >= n) continue;
+        int next = n;
+        for (unsigned j = i + 1; j < ng; j++) if ((int)gi[j].cluster > cl) { next = (int)gi[j].cluster; break; }
+        int span = next - cl;
+        hb_codepoint_t dflt = 0;
+        hb_font_get_nominal_glyph(hf, cps[cl], &dflt);
+        if (gi[i].codepoint == dflt && span == 1) continue;
+        out[no].gid = gi[i].codepoint;
+        out[no].cell = cl;
+        out[no].span = span;
+        no++;
+    }
+    hb_buffer_destroy(buf);
+    if (slot && no <= SHAPE_CACHE_MAX) {
+        slot->fid = f->id; slot->face = face; slot->n = n; slot->ng = no;
+        memcpy(slot->cps, cps, (size_t)n * sizeof(uint32_t));
+        memcpy(slot->g, out, (size_t)no * sizeof(ShapedGlyph));
+    }
+    return no;
+}
+
+bool font_glyph_gid(Font *f, uint32_t gid, int style, GlyphBmp *out) {
+    memset(out, 0, sizeof *out);
+    bool sb, si;
+    FT_Face face = run_face(f, style, true, &sb, &si);
+    if (!face) return false;
+    bool wb = style & FS_BOLD, wi = style & FS_ITALIC;
+    if (face == f->style[0].face) { sb = wb && !f->style[FS_BOLD].face; si = wi && !f->style[FS_ITALIC].face; }
+    return render_gi(f, face, gid, sb, si, out, false);
+}
+
+bool font_has_ligatures(Font *f) {
+    static const char *const tests[] = {"->", "=>", "!=", "==", "<=", ">=", "|>", "::", "www", "<!--", "&&", "||", NULL};
+    for (int t = 0; tests[t]; t++) {
+        uint32_t cps[8];
+        int n = 0;
+        for (const char *p = tests[t]; *p; p++) cps[n++] = (uint8_t)*p;
+        ShapedGlyph g[8];
+        if (font_shape(f, cps, n, FS_REGULAR, g, 8, true) > 0) return true;
+    }
+    return false;
 }
 
 float font_advance(Font *f, uint32_t cp, int style) {

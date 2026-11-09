@@ -7,6 +7,10 @@
 #ifdef __SSE2__
 #include <sys/prctl.h>
 #include <emmintrin.h>
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#define SD_AVX2_PACK 1
+#endif
 #endif
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -24,15 +28,18 @@
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
+#include <algorithm>
 #include <atomic>
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "lz.h"
+#include "vgfx.h"
 
 #define MAX_PARAMS 24
 #define OSC_MAX 4096
@@ -62,7 +69,7 @@ typedef struct { VtLineMeta meta; VtCell *cells; HSeg *seg; const uint8_t *cb; u
 
 typedef struct {
     int x, y;
-    uint32_t fg, bg;
+    uint32_t fg, bg, ul;
     uint16_t attrs;
     uint8_t g[2], gl;
 } Saved;
@@ -109,8 +116,23 @@ typedef struct {
 } CacheEntry;
 
 
+typedef struct { uint64_t row; int col; int exit_code; char kind; } VtMark;
+#define MARKS_MAX 8192
+
 struct Vt {
+    uint8_t pack_scratch[512] = {};   /* hist_push packing buffer (zeroed once with the Vt, not per line) */
+    VtMark *marks;          /* OSC 133 marks (shell integration), oldest first; row = pushed + screen row when the mark was made */
+    int nmarks, cmarks;
+    uint64_t pushed;        /* lines ever moved from the screen into the history, so a mark's row survives scrolling and limit drops */
+    bool saw_c;             /* an OSC 133;C came since the last D: a D without one (empty Enter, first prompt) is not a command end */
+    int last_exit;          /* exit code of the last finished command (OSC 133;D), -1 when none or unknown */
     HSeg *hseg;
+    vg::Store *gfx;         /* inline images, allocated by the first DCS q / APC G string */
+    int gplaces;            /* placements in the store: the one test the scroll paths make */
+    int cell_w, cell_h;     /* cell size in pixels as the UI last told us (sixel and kitty sizes are in pixels) */
+    uint8_t gmode;          /* what the DCS/APC string being read is: GM_* */
+    bool gfiles;            /* kitty t=f / t=t allowed */
+    char ghead[24]; int ghead_n;
     int cols, rows;
     Scr main, alt, *cur;
     int max_lines;
@@ -137,8 +159,12 @@ struct Vt {
     int cx, cy;
     uint32_t pen_fg, pen_bg;
     uint16_t pen_attrs;
+    uint32_t pen_ul;        /* underline colour (SGR 58), 0 = the text colour */
+    uint32_t pen_link;      /* OSC 8 hyperlink id, 0 = none; independent of SGR */
+    char **links; uint32_t nlinks, clinks, link_mask; uint32_t *link_hash; size_t link_bytes;   /* OSC 8 URIs, ids from 1 */
     uint32_t pen_style, erase_style;
-    uint32_t sc_fg[64], sc_bg[64], sc_id[64]; uint16_t sc_attr[64];
+    struct StyleSlot { uint32_t fg, bg, ul, link, id; uint16_t attr; } sc[64];   /* one slot per line of the cache: a pen change touches one cache line, not six */
+    struct { uint8_t cur, n, st[16]; } kb[2];   /* kitty keyboard protocol flags and push stack, [0] main screen, [1] alt screen */
     bool erase_valid;
     int top, bottom;
     uint32_t modes;
@@ -180,6 +206,14 @@ struct Vt {
     VtCacheFree cache_free;
     void *user;
 };
+
+static void gfx_shift(Vt *t, int top, int bottom, int n, bool up);
+static void gfx_erase_rows(Vt *t, int y0, int y1);
+static void gfx_drop_screen(Vt *t, bool alt);
+static void gfx_clear_all(Vt *t);
+static void gfx_prune(Vt *t);
+static void gfx_overprint(Vt *t, int y0, int x0, int y1, int x1) __attribute__((noinline, cold));
+static void gfx_over_cells(Vt *t, int n) __attribute__((noinline, cold));
 
 typedef struct { uint32_t lo, hi; } Range;
 
@@ -232,8 +266,8 @@ int vt_wcwidth(uint32_t cp) {
 
 
 
-static inline uint32_t hash_style(uint32_t fg, uint32_t bg, uint16_t attrs) {
-    uint32_t h = fg * 2654435761u;
+static inline uint32_t hash_style(uint32_t fg, uint32_t bg, uint16_t attrs, uint32_t ul, uint32_t link) {
+    uint32_t h = fg * 2654435761u + ul * 0x27d4eb2fu + link * 0x165667b1u;
     h ^= bg + 0x9e3779b9u + (h << 6) + (h >> 2);
     h ^= attrs * 40503u;
     h ^= h >> 15;
@@ -248,12 +282,12 @@ static void style_table_init(Vt *t) {
     t->style_hash = static_cast<uint32_t*>(calloc(t->hash_mask + 1, sizeof(uint32_t)));
 }
 
-static uint32_t intern_style(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
-    if (!fg && !bg && !attrs) return 0;
-    uint32_t i = hash_style(fg, bg, attrs) & t->hash_mask;
+static uint32_t intern_style(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs, uint32_t ul, uint32_t link) {
+    if (!fg && !bg && !attrs && !ul && !link) return 0;
+    uint32_t i = hash_style(fg, bg, attrs, ul, link) & t->hash_mask;
     while (t->style_hash[i]) {
         const VtStyle *s = &t->styles[t->style_hash[i]];
-        if (s->fg == fg && s->bg == bg && s->attrs == attrs) return t->style_hash[i];
+        if (s->fg == fg && s->bg == bg && s->attrs == attrs && s->ul == ul && s->link == link) return t->style_hash[i];
         i = (i + 1) & t->hash_mask;
     }
     if (t->nstyles >= MAX_STYLES) return 0;
@@ -262,12 +296,12 @@ static uint32_t intern_style(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
         t->styles = static_cast<VtStyle*>(realloc(t->styles, t->cstyles * sizeof(VtStyle)));
     }
     uint32_t id = t->nstyles++;
-    t->styles[id] = (VtStyle){fg, bg, attrs};
+    t->styles[id] = (VtStyle){fg, bg, attrs, ul, link};
     if (t->nstyles * 2 > t->hash_mask) {
         uint32_t nm = (t->hash_mask + 1) * 2 - 1;
         uint32_t *nh = static_cast<uint32_t*>(calloc(nm + 1, sizeof(uint32_t)));
         for (uint32_t k = 1; k < t->nstyles; k++) {
-            uint32_t j = hash_style(t->styles[k].fg, t->styles[k].bg, t->styles[k].attrs) & nm;
+            uint32_t j = hash_style(t->styles[k].fg, t->styles[k].bg, t->styles[k].attrs, t->styles[k].ul, t->styles[k].link) & nm;
             while (nh[j]) j = (j + 1) & nm;
             nh[j] = k;
         }
@@ -281,25 +315,64 @@ static uint32_t intern_style(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
     return id;
 }
 
-static inline uint32_t intern_cached(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs) {
-    uint32_t k = ((fg * 0x9e3779b1u) ^ (bg * 0x85ebca6bu) ^ ((uint32_t)attrs * 0xc2b2ae35u)) >> 26;
-    if (t->sc_id[k] && t->sc_fg[k] == fg && t->sc_bg[k] == bg && t->sc_attr[k] == attrs) return t->sc_id[k];
-    uint32_t id = intern_style(t, fg, bg, attrs);
-    if (id) { t->sc_fg[k] = fg; t->sc_bg[k] = bg; t->sc_attr[k] = attrs; t->sc_id[k] = id; }
+static inline uint32_t intern_cached(Vt *t, uint32_t fg, uint32_t bg, uint16_t attrs, uint32_t ul, uint32_t link) {
+    uint32_t h = (fg * 0x9e3779b1u) ^ (bg * 0x85ebca6bu) ^ ((uint32_t)attrs * 0xc2b2ae35u);
+    if (ul | link) h ^= (ul * 0x27d4eb2fu) ^ (link * 0x165667b1u);   /* both are 0 for nearly all text: two multiplies saved per pen change */
+    uint32_t k = h >> 26;
+    Vt::StyleSlot &sl = t->sc[k];
+    if (sl.id && sl.fg == fg && sl.bg == bg && sl.attr == attrs && sl.ul == ul && sl.link == link) return sl.id;
+    uint32_t id = intern_style(t, fg, bg, attrs, ul, link);
+    if (id) sl = Vt::StyleSlot{fg, bg, ul, link, id, attrs};
     return id;
 }
 
 static inline void pen_commit(Vt *t) {
-    t->pen_style = (t->pen_fg | t->pen_bg | t->pen_attrs) ? intern_cached(t, t->pen_fg, t->pen_bg, t->pen_attrs) : 0;
+    t->pen_style = (t->pen_fg | t->pen_bg | t->pen_attrs | t->pen_ul | t->pen_link) ? intern_cached(t, t->pen_fg, t->pen_bg, t->pen_attrs, t->pen_ul, t->pen_link) : 0;
     t->erase_valid = false;
 }
 
 static inline uint32_t erase_style(Vt *t) {
-    if (!t->erase_valid) { t->erase_style = t->pen_bg ? intern_cached(t, 0, t->pen_bg, 0) : 0; t->erase_valid = true; }
+    if (!t->erase_valid) { t->erase_style = t->pen_bg ? intern_cached(t, 0, t->pen_bg, 0, 0, 0) : 0; t->erase_valid = true; }
     return t->erase_style;
 }
 
 const VtStyle *vt_style(const Vt *t, uint32_t id) { return id < t->nstyles ? &t->styles[id] : &t->styles[0]; }
+
+const char *vt_link(const Vt *t, uint32_t id) { return id && id < t->nlinks ? t->links[id] : NULL; }
+
+/* OSC 8: ids are handed out per distinct URI (the id= parameter is ignored, a run of cells with one id is one link). Capped in count
+ * and bytes: a program printing endless unique links just stops getting clickable ones. */
+#define MAX_LINKS (1u << 16)
+#define MAX_LINK_BYTES ((size_t)8 << 20)
+static uint32_t link_hash_of(const char *s) { uint32_t h = 2166136261u; for (; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; } return h; }
+
+static uint32_t intern_link(Vt *t, const char *uri) {
+    if (!t->link_hash) {
+        t->clinks = 64; t->nlinks = 1;
+        t->links = static_cast<char**>(calloc(t->clinks, sizeof(char*)));
+        t->link_mask = 255;
+        t->link_hash = static_cast<uint32_t*>(calloc(t->link_mask + 1, sizeof(uint32_t)));
+    }
+    uint32_t i = link_hash_of(uri) & t->link_mask;
+    while (t->link_hash[i]) {
+        if (strcmp(t->links[t->link_hash[i]], uri) == 0) return t->link_hash[i];
+        i = (i + 1) & t->link_mask;
+    }
+    size_t n = strlen(uri) + 1;
+    if (t->nlinks >= MAX_LINKS || t->link_bytes + n > MAX_LINK_BYTES) return 0;
+    if (t->nlinks == t->clinks) { t->clinks *= 2; t->links = static_cast<char**>(realloc(t->links, t->clinks * sizeof(char*))); }
+    uint32_t id = t->nlinks++;
+    t->links[id] = static_cast<char*>(malloc(n));
+    memcpy(t->links[id], uri, n);
+    t->link_bytes += n;
+    if (t->nlinks * 2 > t->link_mask) {
+        uint32_t nm = (t->link_mask + 1) * 2 - 1;
+        uint32_t *nh = static_cast<uint32_t*>(calloc(nm + 1, sizeof(uint32_t)));
+        for (uint32_t k = 1; k < t->nlinks; k++) { uint32_t j = link_hash_of(t->links[k]) & nm; while (nh[j]) j = (j + 1) & nm; nh[j] = k; }
+        free(t->link_hash); t->link_hash = nh; t->link_mask = nm;
+    } else t->link_hash[i] = id;
+    return id;
+}
 uint32_t vt_comb_char(const Vt *t, unsigned idx) { return idx && idx <= t->ncombs ? t->combs[idx] : 0; }
 
 static unsigned comb_index(Vt *t, uint32_t cp) {
@@ -904,8 +977,66 @@ static void hist_add_compact(Vt *t, const uint8_t *src, int hw, uint32_t sf, VtL
 
 #define PUSH_BYTES_MIN 32
 #define PUSH_BYTES_MAX 512
+static_assert(sizeof(Vt::pack_scratch) >= PUSH_BYTES_MAX, "pack_scratch too small");
+
+#ifdef SD_AVX2_PACK
+/* 16 cells per step: one permute per 4 cells puts the code points in the low 128 bits and the style words in the high 128 bits. */
+__attribute__((target("avx2"))) static int pack_cells_avx2(const VtCell *src, int len, uint32_t sf, uint8_t *bytes, bool *bad) {
+    const __m256i idx = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+    const __m256i key = _mm256_set_m128i(_mm_set1_epi32((int)sf), _mm_setzero_si128());
+    const __m256i msk = _mm256_set_m128i(_mm_set1_epi32(-1), _mm_set1_epi32((int)~0xFFu));
+    int i = 0;
+    *bad = false;
+    for (; i + 16 <= len; i += 16) {
+        const __m256i v0 = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(src + i)), idx);
+        const __m256i v1 = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(src + i + 4)), idx);
+        const __m256i v2 = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(src + i + 8)), idx);
+        const __m256i v3 = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(src + i + 12)), idx);
+        const __m256i acc = _mm256_or_si256(_mm256_or_si256(_mm256_and_si256(_mm256_xor_si256(v0, key), msk), _mm256_and_si256(_mm256_xor_si256(v1, key), msk)),
+                                            _mm256_or_si256(_mm256_and_si256(_mm256_xor_si256(v2, key), msk), _mm256_and_si256(_mm256_xor_si256(v3, key), msk)));
+        const __m128i lo = _mm_packus_epi16(_mm_packs_epi32(_mm256_castsi256_si128(v0), _mm256_castsi256_si128(v1)), _mm_packs_epi32(_mm256_castsi256_si128(v2), _mm256_castsi256_si128(v3)));
+        _mm_storeu_si128((__m128i *)(bytes + i), lo);
+        if (!_mm256_testz_si256(acc, acc)) { *bad = true; break; }
+    }
+    return i;
+}
+#endif
+
+/* Pack len cells that share style sf into bytes; returns non-zero when a second style or a non-ASCII cell is found. */
+static inline uint32_t pack_line(const VtCell *src, int len, uint32_t sf, uint8_t *bytes) {
+    uint32_t bad = 0;
+    int i = 0;
+#ifdef SD_AVX2_PACK
+    static const bool have_avx2 = __builtin_cpu_supports("avx2");
+    if (have_avx2 && len >= 16) { bool b = false; i = pack_cells_avx2(src, len, sf, bytes, &b); if (b) bad = 1; }
+#endif
+#ifdef __SSE2__
+    if (!bad) {
+        const __m128i sfv = _mm_set1_epi32((int)sf), hi = _mm_set1_epi32((int)~0xFFu), zero = _mm_setzero_si128();
+        __m128i acc = zero;
+        for (; i + 8 <= len; i += 8) {
+            __m128 a = _mm_loadu_ps((const float *)(src + i)), b = _mm_loadu_ps((const float *)(src + i + 2));
+            __m128 c = _mm_loadu_ps((const float *)(src + i + 4)), d = _mm_loadu_ps((const float *)(src + i + 6));
+            __m128i cp0 = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0)));
+            __m128i sf0 = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)));
+            __m128i cp1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(2, 0, 2, 0)));
+            __m128i sf1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(3, 1, 3, 1)));
+            acc = _mm_or_si128(acc, _mm_or_si128(_mm_and_si128(_mm_or_si128(cp0, cp1), hi), _mm_or_si128(_mm_xor_si128(sf0, sfv), _mm_xor_si128(sf1, sfv))));
+            _mm_storel_epi64((__m128i *)(bytes + i), _mm_packus_epi16(_mm_packs_epi32(cp0, cp1), zero));
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) != 0xFFFF) break;  /* a second style or a non-ASCII cell: stop packing */
+        }
+        bad = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) ^ 0xFFFFu;
+    }
+#endif
+    for (; !bad && i < len; i++) {
+        bad |= (src[i].cp & ~0xFFu) | (src[i].sf ^ sf);
+        bytes[i] = (uint8_t)src[i].cp;
+    }
+    return bad;
+}
 
 static void hist_push(Vt *t, int y) {
+    t->pushed++;
     if (t->max_lines == 0) return;
     VtLineMeta *m = rowm(t, y);
     VtLineMeta meta = *m;
@@ -918,43 +1049,21 @@ static void hist_push(Vt *t, int y) {
     int len = m->hw < t->cols ? m->hw : t->cols;
     while (len > 0 && src[len - 1].cp == 0 && src[len - 1].sf == 0) len--;
     if (len >= PUSH_BYTES_MIN && len <= PUSH_BYTES_MAX) {
-        uint8_t bytes[PUSH_BYTES_MAX];
         const uint32_t sf = src[0].sf;
-        uint32_t bad = 0;
-        int i = 0;
-#ifdef __SSE2__
-        {
-            const __m128i sfv = _mm_set1_epi32((int)sf), hi = _mm_set1_epi32((int)~0xFFu), zero = _mm_setzero_si128();
-            __m128i acc = zero;
-            for (; i + 8 <= len; i += 8) {
-                __m128 a = _mm_loadu_ps((const float *)(src + i)), b = _mm_loadu_ps((const float *)(src + i + 2));
-                __m128 c = _mm_loadu_ps((const float *)(src + i + 4)), d = _mm_loadu_ps((const float *)(src + i + 6));
-                __m128i cp0 = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0)));
-                __m128i sf0 = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)));
-                __m128i cp1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(2, 0, 2, 0)));
-                __m128i sf1 = _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(3, 1, 3, 1)));
-                acc = _mm_or_si128(acc, _mm_or_si128(_mm_and_si128(_mm_or_si128(cp0, cp1), hi), _mm_or_si128(_mm_xor_si128(sf0, sfv), _mm_xor_si128(sf1, sfv))));
-                _mm_storel_epi64((__m128i *)(bytes + i), _mm_packus_epi16(_mm_packs_epi32(cp0, cp1), zero));
-                if (_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) != 0xFFFF) break;  /* a second style or a non-ASCII cell: stop packing */
-            }
-            bad = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) ^ 0xFFFFu;
-        }
-#endif
-        for (; !bad && i < len; i++) {
-            bad |= (src[i].cp & ~0xFFu) | (src[i].sf ^ sf);
-            bytes[i] = (uint8_t)src[i].cp;
-        }
-        if (!bad) { hist_add_compact(t, bytes, len, sf, meta, true); return; }
+        uint8_t *bytes = t->pack_scratch;
+        if (!pack_line(src, len, sf, bytes)) { hist_add_compact(t, bytes, len, sf, meta, true); return; }
     }
     hist_add(t, src, m->hw, meta);
 }
 
 void vt_clear_history(Vt *t) {
+    t->nmarks = 0;
     for (int i = 0; i < t->hcount; i++) hist_release(t, &t->hist[(t->hhead + i) & t->hmask]);
     t->hhead = t->hcount = 0;
     while (t->bcount) evict_oldest_block(t);
     for (int i = 0; i < CACHE_ENTRIES; i++) if (t->cache[i]) cache_drop_id(t, t->cache[i]->id);
     t->spill_next_id = t->next_block_id;
+    if (t->gplaces) gfx_prune(t);
 }
 
 static CacheEntry *decode_entry(Vt *t, Block *b) {
@@ -1142,10 +1251,11 @@ size_t vt_compact(Vt *t) {
     return b4 > af ? b4 - af : 0;
 }
 
-static void region_up(Vt *t, int top, int bottom, int n) {
+static void region_up(Vt *t, int top, int bottom, int n, bool track = true) {
     int span = bottom - top + 1;
     if (n > span) n = span;
     if (n <= 0) return;
+    if (track && t->gplaces) gfx_shift(t, top, bottom, n, true);
     int *ord = t->cur->order;
     if (n == 1) {
         Scr *sc = t->cur;
@@ -1172,6 +1282,7 @@ static void region_down(Vt *t, int top, int bottom, int n) {
     int span = bottom - top + 1;
     if (n > span) n = span;
     if (n <= 0) return;
+    if (t->gplaces) gfx_shift(t, top, bottom, n, false);
     int *ord = t->cur->order;
     int tmp[n];
     memcpy(tmp, ord + bottom - n + 1, (size_t)n * sizeof(int));
@@ -1181,11 +1292,13 @@ static void region_down(Vt *t, int top, int bottom, int n) {
 }
 
 static void scroll_up(Vt *t, int n) {
+    bool whole = false;
     if (t->cur == &t->main && t->top == 0 && t->bottom == t->rows - 1) {
         if (n > t->rows) n = t->rows;
         for (int k = 0; k < n; k++) hist_push(t, k);
+        whole = true;   /* the rows went into the history: image anchors (pushed + y) already follow them */
     }
-    region_up(t, t->top, t->bottom, n);
+    region_up(t, t->top, t->bottom, n, !whole);
 }
 
 static void scroll_down(Vt *t, int n) { region_down(t, t->top, t->bottom, n); }
@@ -1260,6 +1373,7 @@ static void put_cp(Vt *t, uint32_t cp) {
     if (t->g[t->gl] == CS_GRAPHICS && cp >= 0x5f && cp <= 0x7e) cp = GRAPHICS[cp - 0x5f];
     int w = vt_wcwidth(cp);
     if (w < 0) return;
+    if (w > 0 && __builtin_expect(t->gplaces != 0, 0)) gfx_over_cells(t, w);
     if (w == 0) {
         int x = (t->cx >= t->cols ? t->cols : t->cx) - 1;
         if (x >= 0) {
@@ -1529,7 +1643,7 @@ static inline __attribute__((always_inline)) void put_ascii_impl(Vt *t, const ui
     }
 }
 
-static void put_ascii(Vt *t, const uint8_t *p, size_t n) {
+static inline __attribute__((always_inline)) void put_ascii(Vt *t, const uint8_t *p, size_t n) {
 #ifndef VT_NO_SHADOW
     if (t->max_lines != 0 && t->cur == &t->main) put_ascii_impl(t, p, n, true);
     else
@@ -1538,30 +1652,37 @@ static void put_ascii(Vt *t, const uint8_t *p, size_t n) {
 }
 
 static void sgr(Vt *t) {
-    if (t->np == 0) { t->pen_fg = t->pen_bg = 0; t->pen_attrs = 0; pen_commit(t); return; }
+    if (t->np == 0) { t->pen_fg = t->pen_bg = t->pen_ul = 0; t->pen_attrs = 0; pen_commit(t); return; }
     for (int i = 0; i < t->np; i++) {
         int a = t->par[i];
         switch (a) {
-        case 0: t->pen_fg = t->pen_bg = 0; t->pen_attrs = 0; break;
+        case 0: t->pen_fg = t->pen_bg = t->pen_ul = 0; t->pen_attrs = 0; break;
         case 1: t->pen_attrs |= VT_BOLD; break;
         case 2: t->pen_attrs |= VT_DIM; break;
         case 3: t->pen_attrs |= VT_ITALIC; break;
-        case 4: t->pen_attrs |= VT_UNDERLINE; break;
+        case 4: {
+            int k = 1;
+            if (i + 1 < t->np && t->sub[i + 1]) { k = t->par[i + 1]; i++; }
+            t->pen_attrs &= (uint16_t)~((int)VT_UNDERLINE | (int)VT_UL_MASK);
+            if (k > 0) t->pen_attrs |= (uint16_t)((int)VT_UNDERLINE | ((k >= 2 && k <= 5 ? k : 0) << VT_UL_SHIFT));
+            break;
+        }
         case 5: case 6: t->pen_attrs |= VT_BLINK; break;
         case 7: t->pen_attrs |= VT_REVERSE; break;
         case 8: t->pen_attrs |= VT_INVIS; break;
         case 9: t->pen_attrs |= VT_STRIKE; break;
         case 22: t->pen_attrs &= (uint16_t)~(VT_BOLD | VT_DIM); break;
         case 23: t->pen_attrs &= (uint16_t)~VT_ITALIC; break;
-        case 24: t->pen_attrs &= (uint16_t)~VT_UNDERLINE; break;
+        case 24: t->pen_attrs &= (uint16_t)~((int)VT_UNDERLINE | (int)VT_UL_MASK); break;
+        case 59: t->pen_ul = 0; break;
         case 25: t->pen_attrs &= (uint16_t)~VT_BLINK; break;
         case 27: t->pen_attrs &= (uint16_t)~VT_REVERSE; break;
         case 28: t->pen_attrs &= (uint16_t)~VT_INVIS; break;
         case 29: t->pen_attrs &= (uint16_t)~VT_STRIKE; break;
         case 39: t->pen_fg = 0; break;
         case 49: t->pen_bg = 0; break;
-        case 38: case 48: {
-            uint32_t *dst = a == 38 ? &t->pen_fg : &t->pen_bg;
+        case 38: case 48: case 58: {
+            uint32_t *dst = a == 38 ? &t->pen_fg : a == 48 ? &t->pen_bg : &t->pen_ul;
             if (i + 1 >= t->np) goto done;
             int kind = t->par[i + 1];
             if (kind == 5 && i + 2 < t->np) {
@@ -1596,20 +1717,21 @@ done:
 }
 
 static void save_cursor(Vt *t, Saved *s) {
-    s->x = t->cx; s->y = t->cy; s->fg = t->pen_fg; s->bg = t->pen_bg; s->attrs = t->pen_attrs;
+    s->x = t->cx; s->y = t->cy; s->fg = t->pen_fg; s->bg = t->pen_bg; s->ul = t->pen_ul; s->attrs = t->pen_attrs;
     s->g[0] = t->g[0]; s->g[1] = t->g[1]; s->gl = t->gl;
 }
 
 static void restore_cursor(Vt *t, const Saved *s) {
     t->cx = clampi(s->x, 0, t->cols);
     t->cy = clampi(s->y, 0, t->rows - 1);
-    t->pen_fg = s->fg; t->pen_bg = s->bg; t->pen_attrs = s->attrs;
+    t->pen_fg = s->fg; t->pen_bg = s->bg; t->pen_ul = s->ul; t->pen_attrs = s->attrs;
     t->g[0] = s->g[0]; t->g[1] = s->g[1]; t->gl = s->gl;
     pen_commit(t);
 }
 
 static void switch_screen(Vt *t, bool alt, bool save) {
     if (alt == (t->cur == &t->alt)) return;
+    if (t->gplaces) gfx_drop_screen(t, true);   /* nothing on the alternate screen outlives a visit */
     if (alt) {
         if (save) save_cursor(t, &t->saved_1049);
         t->cur = &t->alt;
@@ -1646,6 +1768,7 @@ static void set_mode(Vt *t, int mode, bool on, bool priv) {
     case 1004: FLAG(VT_M_FOCUS_EVENTS); break;
     case 1006: FLAG(VT_M_MOUSE_SGR); break;
     case 2004: FLAG(VT_M_BRACKETED_PASTE); break;
+    case 2026: FLAG(VT_M_SYNC_UPDATE); break;
     default: break;
     }
 #undef FLAG
@@ -1657,6 +1780,407 @@ static void reply(Vt *t, const char *s) {
 
 static inline int arg(const Vt *t, int i, int def) { return (i < t->np && t->par[i] > 0) ? t->par[i] : def; }
 
+/* ---- inline images: Sixel (DCS q) and the kitty graphics protocol (APC G) ----------------------------------------------------------
+ * Plain text never gets here: only a DCS or APC string starts the collection below. Placements are anchored to rows the way OSC 133 marks
+ * are (main screen: pushed + y, so an image scrolls into the history with its text; alt screen: y, shifted by the scroll paths). */
+
+enum { GM_IGN = 0, GM_DCS, GM_APC, GM_SIXEL, GM_KITTY };
+
+static inline int gfx_y(const Vt *t, const vg::Place &p) { return p.alt ? (int)p.row : (int)((int64_t)(p.row - t->pushed)); }
+
+static inline void gfx_sync(Vt *t) { t->gplaces = t->gfx ? (int)t->gfx->places.size() : 0; }
+
+template <class F> static void gfx_remove_if(Vt *t, F pred) {
+    vg::Store *s = t->gfx;
+    if (!s) return;
+    size_t o = 0;
+    for (size_t k = 0; k < s->places.size(); k++) if (!pred(s->places[k])) { if (o != k) s->places[o] = s->places[k]; o++; }
+    if (o != s->places.size()) { s->places.resize(o); s->sweep(); }
+    gfx_sync(t);
+}
+
+/* placements whose rows have all left the history are dead */
+static void gfx_prune(Vt *t) {
+    if (!t->gfx) return;
+    const long total = (long)t->hcount + t->block_lines;
+    gfx_remove_if(t, [&](const vg::Place &p) { return !p.alt && gfx_y(t, p) + p.rows - 1 < -(int)total; });
+}
+
+static void gfx_shift(Vt *t, int top, int bottom, int n, bool up) {
+    vg::Store *s = t->gfx;
+    const bool alt = t->cur == &t->alt;
+    bool drop = false;
+    for (vg::Place &p : s->places) {
+        if (p.alt != alt) continue;
+        int y = gfx_y(t, p);
+        if (y < top || y > bottom) continue;
+        int ny = up ? y - n : y + n;
+        if (ny < top || ny > bottom) { p.cols = 0; drop = true; continue; }
+        p.row = alt ? (uint64_t)ny : t->pushed + (uint64_t)ny;
+    }
+    if (drop) gfx_remove_if(t, [](const vg::Place &p) { return p.cols == 0; });
+}
+
+static void gfx_erase_rows(Vt *t, int y0, int y1) {
+    if (!t->gplaces) return;
+    const bool alt = t->cur == &t->alt;
+    gfx_remove_if(t, [&](const vg::Place &p) { if (p.alt != alt) return false; int y = gfx_y(t, p); return y <= y1 && y + p.rows - 1 >= y0; });
+}
+
+/* Text printed over a sixel erases it, as xterm's graphics layer does (here the whole placement goes, not just the cells under the text).
+ * Kitty images stay: that protocol leaves text and images independent. Called only while some placement exists. y0/x0 .. y1/x1: the cells
+ * written, x1 exclusive; when the span covers several rows every column of them counts. */
+static void gfx_overprint(Vt *t, int y0, int x0, int y1, int x1) {
+    const bool alt = t->cur == &t->alt;
+    gfx_remove_if(t, [&](const vg::Place &p) {
+        if (p.alt != alt || p.img->kid || p.img->num) return false;
+        int y = gfx_y(t, p);
+        if (y > y1 || y + p.rows - 1 < y0) return false;
+        return y0 != y1 || (p.col < x1 && p.col + p.cols > x0);
+    });
+}
+
+/* n cells about to be printed from the cursor on, wrapping included */
+static void gfx_over_cells(Vt *t, int n) {
+    int x0 = t->cx, y0 = t->cy;
+    if (x0 >= t->cols) { x0 = 0; y0++; }
+    if (y0 >= t->rows || n <= 0) return;
+    int end = x0 + n, y1 = y0 + (end - 1) / t->cols;
+    if (y1 >= t->rows) y1 = t->rows - 1;
+    gfx_overprint(t, y0, x0, y1, y1 == y0 ? end : t->cols);
+}
+
+static void gfx_drop_screen(Vt *t, bool alt) {
+    if (!t->gplaces) return;
+    gfx_remove_if(t, [&](const vg::Place &p) { return p.alt == alt; });
+}
+
+static void gfx_clear_all(Vt *t) {
+    if (!t->gfx) return;
+    t->gfx->places.clear();
+    t->gfx->sweep();
+    for (size_t k = t->gfx->imgs.size(); k-- > 0;) t->gfx->drop_image(t->gfx->imgs[k]);
+    t->gfx->has_pend = false; t->gfx->raw.clear(); t->gfx->buf.clear();
+    gfx_sync(t);
+}
+
+static inline vg::Store *gfx_store(Vt *t) {
+    if (!t->gfx) t->gfx = new (std::nothrow) vg::Store();
+    return t->gfx;
+}
+
+/* Puts the image at the cursor. Returns the footprint in cells. */
+static void gfx_place(Vt *t, vg::Image *im, uint32_t pid, uint32_t cols_req, uint32_t rows_req, int z, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, int *ocols, int *orows) {
+    vg::Store *s = t->gfx;
+    const uint32_t cw = t->cell_w > 0 ? (uint32_t)t->cell_w : 8, ch = t->cell_h > 0 ? (uint32_t)t->cell_h : 16;
+    if (sx >= (uint32_t)im->w) sx = 0;
+    if (sy >= (uint32_t)im->h) sy = 0;
+    if (!sw || sx + sw > (uint32_t)im->w) sw = (uint32_t)im->w - sx;
+    if (!sh || sy + sh > (uint32_t)im->h) sh = (uint32_t)im->h - sy;
+    const bool stretch = cols_req || rows_req;
+    uint32_t cols, rows;
+    if (stretch) {
+        cols = cols_req; rows = rows_req;
+        if (!cols) cols = (uint32_t)((double)rows * ch * sw / (double)sh / cw + 0.999);
+        if (!rows) rows = (uint32_t)((double)cols * cw * sh / (double)sw / ch + 0.999);
+        if (cols > 2000) cols = 2000;
+        if (rows > 2000) rows = 2000;
+    } else { cols = (sw + cw - 1) / cw; rows = (sh + ch - 1) / ch; }
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+    if (pid) { vg::Image *keep = im; gfx_remove_if(t, [&](const vg::Place &p) { return p.img == keep && p.pid == pid; }); }
+    vg::Place pl;
+    pl.img = im; pl.pid = pid; pl.alt = t->cur == &t->alt;
+    pl.row = pl.alt ? (uint64_t)t->cy : t->pushed + (uint64_t)t->cy;
+    pl.col = t->cx >= t->cols ? t->cols - 1 : t->cx;
+    pl.cols = (int)cols; pl.rows = (int)rows; pl.z = z; pl.stretch = stretch;
+    pl.sx = sx; pl.sy = sy; pl.sw = sw; pl.sh = sh;
+    s->add_place(pl);
+    gfx_sync(t);
+    gfx_prune(t);
+    *ocols = (int)cols; *orows = (int)rows;
+}
+
+static void gfx_advance(Vt *t, int cols, int rows, bool sixel) {
+    if (sixel) { for (int k = 0; k < rows; k++) do_index(t); t->cx = 0; return; }
+    for (int k = 0; k < rows - 1; k++) do_index(t);
+    int nx = t->cx + cols;
+    if (nx >= t->cols) { do_index(t); nx = 0; }
+    t->cx = nx;
+}
+
+static void gfx_str_begin(Vt *t, char kind) {
+    t->gmode = kind == 'P' ? GM_DCS : kind == '_' ? GM_APC : GM_IGN;
+    t->ghead_n = 0;
+    if (t->gfx) { t->gfx->buf.clear(); t->gfx->overflow = false; }
+}
+
+static void gfx_str_abort(Vt *t) {
+    if (t->gmode >= GM_SIXEL && t->gfx) { t->gfx->buf.clear(); t->gfx->overflow = false; }
+    t->gmode = GM_IGN;
+}
+
+/* Consumes string bytes up to (not including) the next terminator or CAN/SUB/ESC/BEL. While the kind is still unknown the first bytes
+ * decide it: a DCS whose final byte is 'q' is a sixel, an APC starting with 'G' is a kitty command, anything else is skipped as before. */
+static size_t gfx_scan(Vt *t, const uint8_t *p, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        uint8_t c = p[i];
+        if (c == 0x1b || c == 0x07 || c == 0x18 || c == 0x1a) break;
+        if (t->gmode == GM_DCS) {
+            i++;
+            if (c >= 0x40 && c <= 0x7e) {
+                if (c == 'q' && gfx_store(t)) { t->gmode = GM_SIXEL; t->gfx->buf.clear(); t->gfx->overflow = false; }
+                else t->gmode = GM_IGN;
+                return i;
+            }
+            if (c < 0x30 || c > 0x3f || t->ghead_n >= (int)sizeof t->ghead - 1) { t->gmode = GM_IGN; return i; }   /* an intermediate ($q DECRQSS) or an absurd header: not a sixel */
+            t->ghead[t->ghead_n++] = (char)c;
+            continue;
+        }
+        if (t->gmode == GM_APC) {
+            i++;
+            if (c == 'G' && gfx_store(t)) { t->gmode = GM_KITTY; t->gfx->buf.clear(); t->gfx->overflow = false; }
+            else t->gmode = GM_IGN;
+            return i;
+        }
+        size_t j = i;
+        while (j < n && p[j] != 0x1b && p[j] != 0x07 && p[j] != 0x18 && p[j] != 0x1a) j++;
+        vg::Store *s = t->gfx;
+        const size_t lim = t->gmode == GM_SIXEL ? vg::SIXEL_MAX : vg::APC_MAX;
+        if (!s->overflow) {
+            if (s->buf.size() + (j - i) > lim) { s->overflow = true; s->buf.clear(); s->buf.shrink_to_fit(); }
+            else s->buf.insert(s->buf.end(), p + i, p + j);
+        }
+        i = j;
+    }
+    return i;
+}
+
+static void gfx_sixel_done(Vt *t) {
+    vg::Store *s = t->gfx;
+    if (s->overflow || s->buf.empty()) { s->buf.clear(); s->overflow = false; return; }
+    int w = 0, h = 0;
+    uint32_t *px = NULL;
+    int rc = vg::sixel_decode(s->buf.data(), s->buf.size(), s->cap, &w, &h, &px);
+    s->buf.clear();
+    if (s->buf.capacity() > ((size_t)1 << 20)) std::vector<uint8_t>().swap(s->buf);
+    if (rc != vg::SX_OK) return;
+    vg::Image *im = s->add_image(w, h, px, 0, 0);
+    if (!im) return;
+    int cols, rows;
+    gfx_place(t, im, 0, 0, 0, 0, 0, 0, 0, 0, &cols, &rows);
+    gfx_advance(t, cols, rows, true);
+}
+
+static void kitty_reply(Vt *t, const vg::KCmd &k, uint32_t id, const char *msg) {
+    const bool ok = !strcmp(msg, "OK");
+    if (k.q == 2 || (k.q == 1 && ok)) return;
+    if (!k.has_i && !k.has_I) return;
+    char out[200];
+    int n = snprintf(out, sizeof out, "\x1b_Gi=%u", id);
+    if (k.has_I) n += snprintf(out + n, sizeof out - (size_t)n, ",I=%u", k.I);
+    if (k.p) n += snprintf(out + n, sizeof out - (size_t)n, ",p=%u", k.p);
+    snprintf(out + n, sizeof out - (size_t)n, ";%s\x1b\\", msg);
+    reply(t, out);
+}
+
+/* t=f / t=t: the payload is a path. Only for local shells, absolute, no /proc /sys /dev, final component not a symlink, regular file,
+ * size-capped. t=t files must live in /tmp or /dev/shm with "tty-graphics-protocol" in the name and are deleted after the read. */
+static bool gfx_read_file(Vt *t, const std::vector<uint8_t> &path, bool tmp, uint32_t off, uint32_t size, std::vector<uint8_t> &out, const char **err) {
+    if (!t->gfiles) { *err = "EPERM:file transmission is not allowed here"; return false; }
+    if (path.empty() || path.size() >= PATH_MAX || path[0] != '/' || memchr(path.data(), 0, path.size())) { *err = "EINVAL:bad file path"; return false; }
+    std::string ps((const char *)path.data(), path.size());
+    char rp[PATH_MAX];
+    if (!realpath(ps.c_str(), rp)) { *err = "ENOENT:no such file"; return false; }
+    auto under = [&](const char *pre) { size_t l = strlen(pre); return !strncmp(rp, pre, l) && (rp[l] == '/' || rp[l] == 0); };
+    if (under("/proc") || under("/sys") || under("/dev")) {
+        if (!(tmp && !strncmp(rp, "/dev/shm/", 9))) { *err = "EPERM:file location not allowed"; return false; }
+    }
+    if (tmp && !(!strncmp(rp, "/tmp/", 5) || !strncmp(rp, "/dev/shm/", 9))) { *err = "EPERM:temporary file location not allowed"; return false; }
+    if (tmp && !strstr(strrchr(rp, '/'), "tty-graphics-protocol")) { *err = "EPERM:not a graphics temporary file"; return false; }
+    int fd = open(rp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) { *err = "ENOENT:cannot open file"; return false; }
+    struct stat st;
+    bool ok = false;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t)st.st_size <= vg::KITTY_RAW_MAX + (uint64_t)off) {
+        size_t avail = (uint64_t)st.st_size > off ? (size_t)st.st_size - off : 0;
+        if (size && size < avail) avail = size;
+        if (avail > vg::KITTY_RAW_MAX) avail = vg::KITTY_RAW_MAX;
+        out.resize(avail);
+        size_t got = 0;
+        while (got < avail) {
+            ssize_t r = pread(fd, out.data() + got, avail - got, (off_t)off + (off_t)got);
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        out.resize(got);
+        ok = true;
+    } else *err = "EINVAL:not a regular file or too large";
+    close(fd);
+    if (tmp) unlink(rp);
+    return ok;
+}
+
+static void gfx_kitty_delete(Vt *t, const vg::KCmd &k) {
+    vg::Store *s = t->gfx;
+    const bool alt = t->cur == &t->alt, free_data = k.d >= 'A' && k.d <= 'Z';
+    const char d = (char)(free_data ? k.d + 32 : k.d);
+    auto on_screen = [&](const vg::Place &p) {
+        if (p.alt != alt) return false;
+        int y = gfx_y(t, p);
+        return y + p.rows - 1 >= 0 && y < t->rows;
+    };
+    auto covers = [&](const vg::Place &p, int cx, int cy) {   /* 0-based cell */
+        if (p.alt != alt) return false;
+        int y = gfx_y(t, p);
+        return cy >= y && cy < y + p.rows && cx >= p.col && cx < p.col + p.cols;
+    };
+    switch (d) {
+    case 'a': gfx_remove_if(t, [&](const vg::Place &p) { return on_screen(p); }); break;
+    case 'i': case 'n': {
+        vg::Image *im = d == 'i' ? s->by_kid(k.i) : s->by_num(k.I);
+        if (!im) break;
+        gfx_remove_if(t, [&](const vg::Place &p) { return p.img == im && (!k.p || p.pid == k.p); });
+        if (free_data && !s->referenced(im)) s->drop_image(im);
+        break;
+    }
+    case 'c': gfx_remove_if(t, [&](const vg::Place &p) { return covers(p, t->cx, t->cy); }); break;
+    case 'p': gfx_remove_if(t, [&](const vg::Place &p) { return covers(p, (int)k.x - 1, (int)k.y - 1); }); break;
+    case 'x': gfx_remove_if(t, [&](const vg::Place &p) { return p.alt == alt && (int)k.x - 1 >= p.col && (int)k.x - 1 < p.col + p.cols; }); break;
+    case 'y': gfx_remove_if(t, [&](const vg::Place &p) { if (p.alt != alt) return false; int y = gfx_y(t, p); return (int)k.y - 1 >= y && (int)k.y - 1 < y + p.rows; }); break;
+    case 'z': gfx_remove_if(t, [&](const vg::Place &p) { return p.alt == alt && p.z == k.z; }); break;
+    default: return;
+    }
+    if (free_data) {
+        for (size_t i = s->imgs.size(); i-- > 0;) if (!s->referenced(s->imgs[i])) s->drop_image(s->imgs[i]);
+    }
+    gfx_sync(t);
+}
+
+/* Checks a transmission's header before any payload is kept: refuses what cannot work (so a hostile stream of chunks is not buffered) and
+ * sets how many decoded bytes it may carry. */
+static bool gfx_kitty_header(const vg::Store *s, const vg::KCmd &k, size_t *limit, const char **err) {
+    if (k.o && k.o != 'z') { *err = "EINVAL:unknown compression"; return false; }
+    if (k.t == 'f' || k.t == 't') { *limit = 8192; return true; }
+    if (k.t != 'd') { *err = "ENOTSUP:transmission medium not supported"; return false; }
+    if (k.f == 100) { *limit = s->cap; return true; }   /* the PNG carries its own size, checked when it is decoded */
+    if (k.f != 24 && k.f != 32) { *err = "EINVAL:unsupported pixel format"; return false; }
+    if (!vg::fits(k.s, k.v, s->cap)) { *err = "EFBIG:image too large"; return false; }
+    *limit = (size_t)k.s * (size_t)k.v * (size_t)(k.f / 8);
+    if (k.o) *limit += *limit / 64 + 1024;   /* deflate can grow incompressible data a little */
+    return true;
+}
+
+static void gfx_kitty_done(Vt *t) {
+    vg::Store *s = t->gfx;
+    if (s->overflow) {
+        s->buf.clear(); s->overflow = false;
+        if (s->has_pend) { s->has_pend = false; s->raw.clear(); }
+        s->skip = false;
+        return;
+    }
+    const uint8_t *b = s->buf.data();
+    const size_t n = s->buf.size();
+    const uint8_t *semi = static_cast<const uint8_t *>(n ? memchr(b, ';', n) : NULL);
+    const size_t cn = semi ? (size_t)(semi - b) : n;
+    const uint8_t *pay = semi ? semi + 1 : b + n;
+    const size_t pn = semi ? n - cn - 1 : 0;
+    vg::KCmd k;
+    if (s->skip) {
+        vg::KCmd c;
+        vg::kitty_parse(b, cn, &c);
+        if (c.m != 1) s->skip = false;
+        s->buf.clear();
+        return;
+    }
+    if (s->has_pend) {
+        vg::KCmd c;
+        vg::kitty_parse(b, cn, &c);
+        vg::b64_feed(s->dec, pay, pn, s->raw, s->raw_limit);
+        if (s->dec.bad) { vg::KCmd p = s->pend; s->has_pend = false; s->raw.clear(); kitty_reply(t, p, p.i, "EINVAL:bad base64 data"); s->buf.clear(); return; }
+        s->pend.m = c.m;
+        if (c.m == 1) { s->buf.clear(); return; }
+        k = s->pend;
+        s->has_pend = false;
+    } else {
+        vg::kitty_parse(b, cn, &k);
+        if (k.a == 't' || k.a == 'T' || k.a == 'q') {
+            const char *herr = NULL;
+            if (!gfx_kitty_header(s, k, &s->raw_limit, &herr)) {
+                kitty_reply(t, k, k.i, herr);
+                if (k.m == 1) s->skip = true;
+                s->buf.clear();
+                return;
+            }
+            s->raw.clear();
+            s->dec = vg::B64();
+            vg::b64_feed(s->dec, pay, pn, s->raw, s->raw_limit);
+            if (s->dec.bad) { s->raw.clear(); kitty_reply(t, k, k.i, "EINVAL:bad base64 data"); s->buf.clear(); return; }
+            if (k.m == 1) { s->pend = k; s->has_pend = true; s->buf.clear(); return; }
+        }
+    }
+    s->buf.clear();
+    if (s->buf.capacity() > ((size_t)1 << 20)) std::vector<uint8_t>().swap(s->buf);
+    switch (k.a) {
+    case 't': case 'T': case 'q': {
+        const char *err = NULL;
+        std::vector<uint8_t> file;
+        const uint8_t *data = s->raw.data();
+        size_t dlen = s->raw.size();
+        if (k.t == 'f' || k.t == 't') {
+            if (gfx_read_file(t, s->raw, k.t == 't', k.O, k.S, file, &err)) { data = file.data(); dlen = file.size(); }
+        } else if (k.t != 'd') err = "ENOTSUP:transmission medium not supported";
+        uint32_t *px = NULL;
+        int iw = 0, ih = 0;
+        if (!err) px = vg::kitty_decode(data, dlen, k.f, k.o, k.s, k.v, s->cap, &iw, &ih, &err);
+        std::vector<uint8_t>().swap(s->raw);
+        if (!px) { kitty_reply(t, k, k.i, err ? err : "EINVAL:bad image"); return; }
+        if (k.a == 'q') { free(px); kitty_reply(t, k, k.i, "OK"); return; }
+        uint32_t id = k.i;
+        if (!k.has_i && k.has_I) id = s->next_auto_id++;
+        if (id) { vg::Image *old = s->by_kid(id); if (old) { s->drop_image(old); gfx_sync(t); } }
+        vg::Image *im = s->add_image(iw, ih, px, id, k.I);
+        gfx_sync(t);
+        if (!im) { kitty_reply(t, k, id, "ENOMEM:image does not fit in the image memory limit"); return; }
+        if (k.a == 'T') {
+            int cols, rows;
+            gfx_place(t, im, k.p, k.c, k.r, k.z, k.x, k.y, k.w, k.h, &cols, &rows);
+            if (!k.C) gfx_advance(t, cols, rows, false);
+        }
+        kitty_reply(t, k, id, "OK");
+        break;
+    }
+    case 'p': {
+        vg::Image *im = k.has_i ? s->by_kid(k.i) : k.has_I ? s->by_num(k.I) : NULL;
+        if (!im) { kitty_reply(t, k, k.i, "ENOENT:no such image"); return; }
+        int cols, rows;
+        gfx_place(t, im, k.p, k.c, k.r, k.z, k.x, k.y, k.w, k.h, &cols, &rows);
+        if (!k.C) gfx_advance(t, cols, rows, false);
+        kitty_reply(t, k, im->kid, "OK");
+        break;
+    }
+    case 'd': gfx_kitty_delete(t, k); break;
+    default: break;
+    }
+}
+
+static void gfx_str_end(Vt *t) {
+    if (t->gmode == GM_SIXEL && t->gfx) gfx_sixel_done(t);
+    else if (t->gmode == GM_KITTY && t->gfx) gfx_kitty_done(t);
+    t->gmode = GM_IGN;
+}
+
+/* DECRQM-style graphics queries: CSI ? Pi ; Pa ; Pv S (XTSMGRAPHICS). Item 1 is the sixel colour registers, item 2 the largest graphic. */
+static void gfx_xtsmgraphics(Vt *t) {
+    int item = t->np > 0 ? t->par[0] : 0, action = t->np > 1 ? t->par[1] : 0;
+    char out[64];
+    if (item == 1 && action >= 1 && action <= 4 && action != 3) snprintf(out, sizeof out, "\x1b[?1;0;256S");
+    else if (item == 2 && (action == 1 || action == 2 || action == 4)) snprintf(out, sizeof out, "\x1b[?2;0;%d;%dS", t->cols * (t->cell_w > 0 ? t->cell_w : 8), t->rows * (t->cell_h > 0 ? t->cell_h : 16));
+    else snprintf(out, sizeof out, "\x1b[?%d;3;0S", item);
+    reply(t, out);
+}
+
 static void erase_line(Vt *t, int how) {
     VtCell *r = rowp(t, t->cy);
     int x = t->cx >= t->cols ? t->cols - 1 : t->cx;
@@ -1666,24 +2190,66 @@ static void erase_line(Vt *t, int how) {
     touch_row(t, t->cy);
 }
 
+static int mark_idx(const Vt *t, const VtMark *m);
+
 static void erase_display(Vt *t, int how) {
     if (how == 0) {
         erase_line(t, 0);
         for (int y = t->cy + 1; y < t->rows; y++) clear_row(t, y);
+        if (t->gplaces) gfx_erase_rows(t, t->cy + 1, t->rows - 1);
     } else if (how == 1) {
         for (int y = 0; y < t->cy; y++) clear_row(t, y);
         erase_line(t, 1);
+        if (t->gplaces && t->cy > 0) gfx_erase_rows(t, 0, t->cy - 1);
     } else {
         for (int y = 0; y < t->rows; y++) clear_row(t, y);
+        if (t->gplaces) gfx_erase_rows(t, 0, t->rows - 1);
+        while (t->nmarks && mark_idx(t, &t->marks[t->nmarks - 1]) >= 0) t->nmarks--;
         if (how == 3) vt_clear_history(t);
     }
 }
+
+/* Kitty keyboard protocol: CSI > flags u pushes, CSI < n u pops, CSI = flags ; mode u sets, CSI ? u queries. Flags this terminal does not
+ * implement (alternate keys, associated text) are dropped so a query tells a program what it really gets. */
+static void kitty_kbd(Vt *t) {
+    auto &k = t->kb[t->cur == &t->alt ? 1 : 0];
+    int v = t->np ? t->par[0] : 0;
+    if (t->priv == '?') {
+        char buf[24];
+        snprintf(buf, sizeof buf, "\x1b[?%du", (int)k.cur);
+        reply(t, buf);
+    } else if (t->priv == '>') {
+        if (k.n == sizeof k.st) { memmove(k.st, k.st + 1, sizeof k.st - 1); k.n--; }
+        k.st[k.n++] = k.cur;
+        k.cur = (uint8_t)(v & VT_KB_SUPPORTED);
+    } else if (t->priv == '<') {
+        int n = t->np && t->par[0] > 0 ? t->par[0] : 1;
+        if (n > k.n) { k.cur = 0; k.n = 0; }   /* more pops than pushes: back to nothing */
+        else { k.n = (uint8_t)(k.n - n); k.cur = k.st[k.n]; }
+    } else {
+        int mode = t->np > 1 && t->par[1] > 0 ? t->par[1] : 1;
+        uint8_t f = (uint8_t)(v & VT_KB_SUPPORTED);
+        if (mode == 1) k.cur = f; else if (mode == 2) k.cur |= f; else if (mode == 3) k.cur &= (uint8_t)~f;
+    }
+}
+
+int vt_kitty_flags(const Vt *t) { return t->kb[t->cur == &t->alt ? 1 : 0].cur; }
 
 static void csi_dispatch(Vt *t, uint8_t f) {
     int n;
     bool priv = t->priv == '?';
     if (t->inter == ' ' && f == 'q') { t->cursor_style = t->np ? t->par[0] : 0; return; }
+    if (t->inter == '$' && f == 'p' && priv) {   /* DECRQM: is the mode set? 1 set, 2 reset, 0 unknown */
+        int m = t->np ? t->par[0] : 0, v = 0;
+        uint32_t bit = m == 2026 ? VT_M_SYNC_UPDATE : m == 2004 ? VT_M_BRACKETED_PASTE : m == 25 ? VT_M_CURSOR_VISIBLE : m == 7 ? VT_M_AUTOWRAP : m == 1 ? VT_M_APP_CURSOR : m == 1004 ? VT_M_FOCUS_EVENTS : m == 1006 ? VT_M_MOUSE_SGR : m == 1049 ? VT_M_ALT_SCREEN : 0;
+        if (bit) v = (t->modes & bit) ? 1 : 2;
+        char buf[32];
+        snprintf(buf, sizeof buf, "\x1b[?%d;%d$y", m, v);
+        reply(t, buf);
+        return;
+    }
     if (t->inter) return;
+    if (f == 'u' && (t->priv == '>' || t->priv == '<' || t->priv == '=' || priv)) { kitty_kbd(t); return; }
     if (t->priv && !priv) {
         if (f == 'c' && t->priv == '>') reply(t, "\x1b[>1;10;0c");
         return;
@@ -1723,7 +2289,10 @@ static void csi_dispatch(Vt *t, uint8_t f) {
         touch_row(t, t->cy);
         break;
     }
-    case 'S': scroll_up(t, arg(t, 0, 1)); break;
+    case 'S':
+        if (t->priv == '?') gfx_xtsmgraphics(t);
+        else scroll_up(t, arg(t, 0, 1));
+        break;
     case 'T': scroll_down(t, arg(t, 0, 1)); break;
     case 'X': {
         int x = t->cx >= t->cols ? t->cols - 1 : t->cx;
@@ -1743,7 +2312,7 @@ static void csi_dispatch(Vt *t, uint8_t f) {
     }
     case 'b': for (n = arg(t, 0, 1); n > 0 && t->last_cp; n--) put_cp(t, t->last_cp); break;
     case 'c':
-        if (!priv && (t->np == 0 || t->par[0] == 0)) reply(t, "\x1b[?62;22c");
+        if (!priv && (t->np == 0 || t->par[0] == 0)) reply(t, "\x1b[?62;4;22c");
         break;
     case 'd': {
         int row = arg(t, 0, 1) - 1;
@@ -1759,6 +2328,15 @@ static void csi_dispatch(Vt *t, uint8_t f) {
         for (int i = 0; i < (t->np ? t->np : 1); i++) set_mode(t, t->np ? t->par[i] : 0, f == 'h', priv);
         break;
     case 'm': if (!priv) sgr(t); break;
+    case 't': {   /* XTWINOPS size reports, what image tools ask before scaling: 14 text area pixels, 16 cell pixels, 18 size in cells */
+        if (priv || !t->np) break;
+        const int cw = t->cell_w > 0 ? t->cell_w : 8, chh = t->cell_h > 0 ? t->cell_h : 16;
+        char buf[48];
+        if (t->par[0] == 14) { snprintf(buf, sizeof buf, "\x1b[4;%d;%dt", t->rows * chh, t->cols * cw); reply(t, buf); }
+        else if (t->par[0] == 16) { snprintf(buf, sizeof buf, "\x1b[6;%d;%dt", chh, cw); reply(t, buf); }
+        else if (t->par[0] == 18) { snprintf(buf, sizeof buf, "\x1b[8;%d;%dt", t->rows, t->cols); reply(t, buf); }
+        break;
+    }
     case 'n': {
         int what = t->np ? t->par[0] : 0;
         if (what == 5) reply(t, "\x1b[0n");
@@ -1805,6 +2383,87 @@ static void esc_dispatch(Vt *t, uint8_t c) {
 
 static int hexv(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 
+
+/* OSC 133 (FinalTerm / iTerm2 / kitty / foot shell integration): A prompt start, B prompt end (the command is typed after it),
+ * C command output starts, D command finished (optional exit code). Only recorded on the main screen. */
+static int mark_idx(const Vt *t, const VtMark *m) {
+    return (int)((int64_t)(m->row - t->pushed)); }
+
+static void shell_mark(Vt *t, const char *text) {
+    char kind = text[0];
+    if ((kind != 'A' && kind != 'B' && kind != 'C' && kind != 'D') || (text[1] && text[1] != ';')) return;
+    int code = -1;
+    if (kind == 'D' && text[1] == ';') { char *e; long v = strtol(text + 2, &e, 10); if (e != text + 2) code = (int)v; }
+    if (kind == 'C') t->saw_c = true;
+    if (kind == 'D') {
+        if (!t->saw_c) return;
+        t->saw_c = false;
+        t->last_exit = code;
+        if (t->event_fn) { char b[16]; snprintf(b, sizeof b, "%d", code); t->event_fn(VT_EV_CMD_END, b, t->user); }
+    } else if (kind == 'A' && t->event_fn) t->event_fn(VT_EV_PROMPT, NULL, t->user);
+    else if (kind == 'C' && t->event_fn) t->event_fn(VT_EV_CMD_START, NULL, t->user);
+    if (t->cur == &t->alt) return;
+    if (t->nmarks && kind == 'A') {  /* a prompt redrawn on the same row replaces its earlier marks */
+        while (t->nmarks && t->marks[t->nmarks - 1].row == t->pushed + (uint64_t)t->cy && (t->marks[t->nmarks - 1].kind == 'A' || t->marks[t->nmarks - 1].kind == 'B')) t->nmarks--;
+    }
+    if (t->nmarks == t->cmarks) {
+        long total = (long)t->hcount + t->block_lines;
+        int drop = 0;  /* marks whose line has left the history are dead */
+        while (drop < t->nmarks && mark_idx(t, &t->marks[drop]) < -(int)total) drop++;
+        if (!drop && t->nmarks >= MARKS_MAX) drop = MARKS_MAX / 4;
+        if (drop) { memmove(t->marks, t->marks + drop, (size_t)(t->nmarks - drop) * sizeof(VtMark)); t->nmarks -= drop; }
+        else {
+            int nc = t->cmarks ? t->cmarks * 2 : 64;
+            VtMark *nm = static_cast<VtMark*>(realloc(t->marks, (size_t)nc * sizeof(VtMark)));
+            if (!nm) return;
+            t->marks = nm; t->cmarks = nc;
+        }
+    }
+    VtMark *m = &t->marks[t->nmarks++];
+    m->row = t->pushed + (uint64_t)t->cy;
+    m->col = t->cx;
+    m->exit_code = code;
+    m->kind = kind;
+}
+
+int vt_prompt_find(const Vt *t, int from_idx, int dir) {
+    long total = (long)t->hcount + t->block_lines;
+    int best = INT_MIN;
+    if (t->cur == &t->alt) return best;
+    for (int i = 0; i < t->nmarks; i++) {
+        const VtMark *m = &t->marks[i];
+        if (m->kind != 'A') continue;
+        int idx = mark_idx(t, m);
+        if (idx < -(int)total || idx >= t->rows) continue;
+        if (dir < 0 ? idx < from_idx && (best == INT_MIN || idx > best) : idx > from_idx && (best == INT_MIN || idx < best)) best = idx;
+    }
+    return best;
+}
+
+bool vt_last_output(const Vt *t, int *first_idx, int *last_idx) {
+    if (t->cur == &t->alt) return false;
+    long total = (long)t->hcount + t->block_lines;
+    for (int d = t->nmarks - 1; d >= 0; d--) {
+        if (t->marks[d].kind != 'D') continue;
+        int c = d - 1;
+        while (c >= 0 && t->marks[c].kind != 'C') { if (t->marks[c].kind == 'D') { c = -1; break; } c--; }
+        int first, last = mark_idx(t, &t->marks[d]) - (t->marks[d].col == 0 ? 1 : 0);
+        if (c >= 0) first = mark_idx(t, &t->marks[c]) + (t->marks[c].col > 0 ? 1 : 0);
+        else {
+            int b = d - 1;
+            while (b >= 0 && t->marks[b].kind != 'B') b--;
+            if (b < 0) return false;
+            first = mark_idx(t, &t->marks[b]) + 1;
+        }
+        if (first < -(int)total || last < first || last >= t->rows) return false;
+        *first_idx = first; *last_idx = last;
+        return true;
+    }
+    return false;
+}
+
+int vt_last_exit(const Vt *t) { return t->last_exit; }
+
 static void osc_dispatch(Vt *t) {
     t->osc[t->osc_len] = 0;
     char *semi = strchr(t->osc, ';');
@@ -1830,7 +2489,31 @@ static void osc_dispatch(Vt *t) {
         t->stream_pending = t->stream_path[0] == '/';
         return;
     }
+    if (code == 133) { shell_mark(t, text); return; }
+    if (code == 8) {
+        const char *uri = strchr(text, ';');
+        uint32_t id = 0;
+        if (uri && uri[1]) {
+            bool ok = true;
+            for (const unsigned char *q = (const unsigned char *)uri + 1; *q; q++) if (*q < 0x20 || *q == 0x7f) { ok = false; break; }
+            if (ok) id = intern_link(t, uri + 1);
+        }
+        t->pen_link = id;
+        pen_commit(t);
+        return;
+    }
     if ((code == 0 || code == 2) && t->event_fn) t->event_fn(VT_EV_TITLE, text, t->user);
+    else if (code == 9 && t->event_fn) {
+        if (text[0] == '4' && text[1] == ';') return;   /* ConEmu progress report, not a notification */
+        char b[OSC_MAX + 2];
+        snprintf(b, sizeof b, "\x1f%s", text);
+        t->event_fn(VT_EV_NOTIFY, b, t->user);
+    } else if (code == 777 && t->event_fn && strncmp(text, "notify;", 7) == 0) {
+        char b[OSC_MAX + 2];
+        const char *ti = text + 7, *sc = strchr(ti, ';');
+        snprintf(b, sizeof b, "%.*s\x1f%s", sc ? (int)(sc - ti) : (int)strlen(ti), ti, sc ? sc + 1 : "");
+        t->event_fn(VT_EV_NOTIFY, b, t->user);
+    }
     else if (code == 7 && t->event_fn) {
         const char *p = strstr(text, "://");
         p = p ? strchr(p + 3, '/') : NULL;
@@ -1873,7 +2556,7 @@ static inline void csi_start(Vt *t) {
 static inline size_t sgr_quick(Vt *t, const uint8_t *p, size_t n) {
     uint8_t a = p[2];
     if (a == 'm' || (a == '0' && p[3] == 'm')) {
-        t->pen_fg = t->pen_bg = 0; t->pen_attrs = 0;
+        t->pen_fg = t->pen_bg = t->pen_ul = 0; t->pen_attrs = 0;
         pen_commit(t);
         return a == 'm' ? 3 : 4;
     }
@@ -1886,6 +2569,34 @@ static inline size_t sgr_quick(Vt *t, const uint8_t *p, size_t n) {
         else return 0;
         pen_commit(t);
         return 5;
+    }
+    /* "38;5;N", "48;5;N", "38;2;R;G;B", "48;2;R;G;B" followed by m: 256-colour and truecolor (bat, delta, prompts, themes) */
+    if ((a == '3' || a == '4') && n >= 8 && p[3] == '8' && p[4] == ';' && (p[5] == '5' || p[5] == '2') && p[6] == ';') {
+        size_t i = 7;
+        int v[3] = {0, 0, 0};
+        const int want = p[5] == '5' ? 1 : 3;
+        for (int k = 0; k < want; k++) {
+            int digits = 0, x = 0;
+            while (i < n && p[i] >= '0' && p[i] <= '9' && digits < 3) { x = x * 10 + (p[i] - '0'); i++; digits++; }
+            if (!digits || i >= n || p[i] != (k + 1 < want ? ';' : 'm')) return 0;
+            v[k] = x > 255 ? 255 : x;
+            i++;
+        }
+        (a == '3' ? t->pen_fg : t->pen_bg) = want == 1 ? VT_COLOR_IDX(v[0]) : VT_COLOR_RGB(v[0], v[1], v[2]);
+        pen_commit(t);
+        return i;
+    }
+    /* "0;31m" and "1;34m" (ls, grep, compilers): reset or bold plus one plain colour */
+    if (n >= 7 && (a == '0' || a == '1') && p[3] == ';' && p[6] == 'm' && p[5] >= '0' && p[5] <= '7') {
+        unsigned d = (unsigned)(p[5] - '0');
+        uint8_t k = p[4];
+        if (k != '3' && k != '4' && k != '9') return 0;
+        if (a == '0') { t->pen_fg = t->pen_bg = t->pen_ul = 0; t->pen_attrs = 0; } else t->pen_attrs |= VT_BOLD;
+        if (k == '3') t->pen_fg = VT_COLOR_IDX(d);
+        else if (k == '4') t->pen_bg = VT_COLOR_IDX(d);
+        else t->pen_fg = VT_COLOR_IDX(d + 8);
+        pen_commit(t);
+        return 7;
     }
     return 0;
 }
@@ -1928,7 +2639,9 @@ static inline size_t csi_fast(Vt *t, const uint8_t *p, size_t n) {
     return 0;
 }
 
-static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
+/* G: some inline-image placement exists, so text printed over a sixel must erase it. The plain instance has no such code at all; it hands
+ * the rest of the buffer to the G instance the moment a graphics string leaves a placement behind. */
+template <bool G> static size_t feed_serial_impl(Vt *t, const uint8_t *p, size_t n) {
     size_t i = 0;
     while (i < n && !t->stream_pending) {
         uint8_t c = p[i];
@@ -1940,6 +2653,7 @@ static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
             }
             if (t->utf_need == 0 && c >= 0x20 && c < 0x7f) {
                 size_t run = ascii_run(p + i, n - i);
+                if constexpr (G) gfx_over_cells(t, (int)run);
                 put_ascii(t, p + i, run);
                 i += run;
                 if (i < n && p[i] == '\r') { t->cx = 0; i++; }
@@ -1947,7 +2661,9 @@ static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
                 continue;
             }
             if (t->utf_need == 0 && c >= 0xc2 && c <= 0xef) {
+                const int ox = t->cx, oy = t->cy;
                 size_t used = utf8_run(t, p + i, n - i);
+                if constexpr (G) { if (used) gfx_overprint(t, oy, ox, t->cy, t->cy == oy ? t->cx : t->cols); }
                 if (used) { i += used; continue; }
             }
             i++;
@@ -1978,7 +2694,7 @@ static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
             switch (c) {
             case '[': csi_start(t); break;
             case ']': t->st = ST_OSC; t->osc_len = 0; break;
-            case 'P': case 'X': case '^': case '_': t->st = ST_STR; break;
+            case 'P': case 'X': case '^': case '_': t->st = ST_STR; gfx_str_begin(t, (char)c); break;
             case '(': case ')': case '*': case '+': t->st = ST_CHARSET; t->charset_slot = c == '(' ? 0 : c == ')' ? 1 : 2; break;
             case '#': case '%': case ' ': t->st = ST_SKIP1; if (c == '#') t->inter = '#'; else t->inter = 0; break;
             default: esc_dispatch(t, c); t->st = ST_GROUND; break;
@@ -2041,14 +2757,22 @@ static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
             continue;
 
         case ST_STR:
+            if (t->gmode) {   /* a DCS or APC string: collect it when it is a sixel or a kitty graphics command */
+                i += gfx_scan(t, p + i, n - i);
+                if constexpr (!G) { if (t->gplaces) return i + feed_serial_impl<true>(t, p + i, n - i); }
+                if (i >= n) continue;
+                c = p[i];
+                if (c != 0x1b && c != 0x07 && c != 0x18 && c != 0x1a) continue;
+            }
             i++;
             if (c == 0x1b) t->st = ST_STR_ESC;
-            else if (c == 0x07 || c == 0x18 || c == 0x1a) t->st = ST_GROUND;
+            else if (c == 0x07) { gfx_str_end(t); t->st = ST_GROUND; }
+            else if (c == 0x18 || c == 0x1a) { gfx_str_abort(t); t->st = ST_GROUND; }
             continue;
         case ST_STR_ESC:
             i++;
-            if (c == '\\') t->st = ST_GROUND;
-            else { t->st = ST_ESC; i--; }
+            if (c == '\\') { gfx_str_end(t); t->st = ST_GROUND; }
+            else { gfx_str_abort(t); t->st = ST_ESC; i--; }
             continue;
         }
     }
@@ -2419,6 +3143,11 @@ static size_t bulk_region(Vt *t, const uint8_t *p, size_t n) {
     return consumed;
 }
 
+
+static size_t feed_serial(Vt *t, const uint8_t *p, size_t n) {
+    return t->gplaces ? feed_serial_impl<true>(t, p, n) : feed_serial_impl<false>(t, p, n);
+}
+
 static size_t feed_bulk(Vt *t, const uint8_t *p, size_t n) {
     size_t i = 0;
     bool bulk_off = false;
@@ -2495,8 +3224,12 @@ static void reset_tabs(Vt *t) {
 }
 
 void vt_reset(Vt *t) {
-    t->pen_fg = t->pen_bg = 0;
+    t->nmarks = 0;
+    gfx_clear_all(t);
+    t->gmode = GM_IGN;
+    t->pen_fg = t->pen_bg = t->pen_ul = t->pen_link = 0;
     t->pen_attrs = 0;
+    memset(t->kb, 0, sizeof t->kb);
     pen_commit(t);
     t->modes = VT_M_AUTOWRAP | VT_M_CURSOR_VISIBLE;
     t->cur = &t->main;
@@ -2532,6 +3265,7 @@ Vt *vt_new(int cols, int rows, int scrollback) {
     if (cols < 2) cols = 2;
     if (rows < 2) rows = 2;
     t->cols = cols; t->rows = rows;
+    t->last_exit = -1;
     t->spill_fd = -1;
     t->ram_budget = DEFAULT_RAM_BUDGET;
     t->disk_budget = DEFAULT_DISK_BUDGET;
@@ -2552,12 +3286,51 @@ void vt_free(Vt *t) {
     vt_clear_history(t);
     if (t->hseg) { free(t->hseg->buf); free(t->hseg->bbuf); free(t->hseg); }
     free(t->hist);
+    free(t->marks);
+    delete t->gfx;
     free(t->blocks);
     spill_close(t);
     scr_free(t, &t->main, t->rows);
     scr_free(t, &t->alt, t->rows);
     free(t->tabs); free(t->styles); free(t->style_hash);
+    for (uint32_t k = 1; k < t->nlinks; k++) free(t->links[k]);
+    free(t->links); free(t->link_hash);
     free(t);
+}
+
+void vt_set_cell_px(Vt *t, int cw, int ch) { if (cw > 0 && ch > 0) { t->cell_w = cw; t->cell_h = ch; } }
+void vt_set_gfx_files(Vt *t, bool allow) { t->gfiles = allow; }
+void vt_set_image_cap(Vt *t, size_t bytes) { vg::Store *s = gfx_store(t); if (s) { s->cap = bytes; s->make_room(0); gfx_sync(t); } }
+size_t vt_image_bytes(const Vt *t) { return t->gfx ? t->gfx->bytes : 0; }
+int vt_image_count(const Vt *t) { return t->gfx ? (int)t->gfx->imgs.size() : 0; }
+void vt_image_unref(void *img) { vg::unref(static_cast<vg::Image *>(img)); }
+
+int vt_images_in_view(Vt *t, int first_idx, int nrows, VtImageView *out, int max) {
+    if (!t->gplaces || max <= 0) return 0;
+    gfx_prune(t);
+    vg::Store *s = t->gfx;
+    if (!s) return 0;
+    const bool alt = t->cur == &t->alt;
+    struct Hit { const vg::Place *p; int idx; };
+    std::vector<Hit> hits;
+    for (const vg::Place &p : s->places) {
+        if (p.alt != alt) continue;
+        int y = gfx_y(t, p);
+        if (y + p.rows > first_idx && y < first_idx + nrows) hits.push_back({&p, y});
+    }
+    std::stable_sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) { return a.p->z < b.p->z; });
+    int n = 0;
+    for (const Hit &h : hits) {
+        if (n >= max) break;
+        vg::Image *im = h.p->img;
+        im->refs.fetch_add(1, std::memory_order_relaxed);
+        im->stamp = ++s->clock;
+        VtImageView &v = out[n++];
+        v.img = im; v.serial = im->serial; v.px = im->px; v.iw = im->w; v.ih = im->h;
+        v.idx = h.idx; v.col = h.p->col; v.cols = h.p->cols; v.rows = h.p->rows; v.z = h.p->z; v.stretch = h.p->stretch;
+        v.sx = (int)h.p->sx; v.sy = (int)h.p->sy; v.sw = (int)h.p->sw; v.sh = (int)h.p->sh;
+    }
+    return n;
 }
 
 void vt_set_callbacks(Vt *t, VtWriteFn w, VtEventFn e, VtCacheFree cf, void *user) {
@@ -2570,6 +3343,8 @@ void vt_resize(Vt *t, int cols, int rows) {
     if (cols == t->cols && rows == t->rows) return;
     bool was_alt = t->cur == &t->alt;
     int old_cols = t->cols, old_rows = t->rows;
+    t->nmarks = 0;  /* rows shift and reflow: the marks no longer point at the same lines */
+    if (t->gplaces) gfx_drop_screen(t, true);   /* the alternate screen is redrawn by its program after a resize; main-screen images keep their rows */
 
     Scr *m = &t->main;
     int shift = (!was_alt && t->cy >= rows) ? t->cy - rows + 1 : 0;

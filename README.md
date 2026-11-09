@@ -10,7 +10,7 @@ A fast, light SSH terminal manager in C++. No GTK, no Qt: the window, the widget
   <img src="native/docs/welcome.png" alt="Lestrix start page with saved connections" width="900"/>
 </p>
 
-**Version:** 0.4.1  
+**Version:** 0.4.2  
 **Author:** BeanGreen247  
 **License:** MIT
 
@@ -426,9 +426,32 @@ Run `make test` in `native/` for the core, compressor and parser tests under ASa
 - **~/.ssh/config hosts appear automatically**, including `Include` files, and connect with plain `ssh <alias>` so ProxyJump, IdentityFile and the rest keep working. Ansible `hosts.ini` import is built in.
 - **Real shells**: bash, zsh, fish, sh, dash, ksh, tcsh, nushell, PowerShell. Full-screen programs (vim, htop, less, tmux, mc), mouse reporting and bracketed paste work.
 - **X11 forwarding** per connection (`-X` or trusted `-Y`).
+- **Clickable links.** OSC 8 hyperlinks (`ls --hyperlink`, `gcc`, `cargo`...) and plain `http`, `https`, `ftp`, `file` and `mailto` addresses are underlined under the pointer, the address shows in the corner, and Ctrl+click opens it with `xdg-open` (no shell, only those schemes).
+- **Find in scrollback.** Ctrl+Shift+F opens a find bar over the terminal: incremental, case-insensitive (toggle `Aa`), whole word (`W`), all matches highlighted, Enter / Shift+Enter (or F3 / Shift+F3) to step to the next older / newer match, Esc to close. The scan runs a few milliseconds per frame, so a huge scrollback never freezes the window, and compressed or spilled history is searched too.
+- **Split panes.** Ctrl+Shift+E splits the focused pane side by side, Ctrl+Shift+R stacks a new one below; each pane is its own shell (on an ssh tab, a new session on the same connection) and starts in the directory of the pane you split. Click a pane or press Ctrl+Shift+Left/Right to move between them, drag the divider to resize, Ctrl+Shift+X (or `exit`) closes one. The View menu lists them all.
+- **Shell integration (OSC 133 and OSC 7).** Source `native/data/shell-integration/bash.sh`, `zsh.zsh` or `fish.fish` from your shell's rc file (`make install` copies them to `share/lestrix/shell-integration/`). Then `Ctrl+Shift+Up`/`Down` jump to the previous/next prompt in the scrollback, `Ctrl+Shift+O` selects the output of the last finished command, and *New local shell* / *Duplicate tab* start in the directory the current tab is in (from OSC 7, or `/proc` without it). Marks are dropped when the window is resized.
+- **Desktop notifications.** Programs can ask with `OSC 9` or `OSC 777;notify;title;body`, and a command that ran 10 s or longer (shell integration, `OSC 133`) notifies when it ends while the window is unfocused or the tab is in the background. Sent through `notify-send` (no shell, text stripped of control characters, at most one every 2 s); View menu > Desktop notifications switches it off, `notifications` and `notify_after_s` in `settings.ini` set it and the threshold.
 - **Six themes** (Xylonic Dark and Light, Graphite, Nord, Gruvbox, Solarized Dark) and a custom accent color. View > Theme.
+- **Inline images.** Sixel (`img2sixel`, `chafa -f sixel`, `lsix`, gnuplot, ...) and the kitty graphics protocol (direct, chunked and local-file transmission; PNG (`f=100`) and zlib (`o=z`) data; place, delete, z-order, cell sizing, source crop; `a=q` queries; `kitten icat` works) draw in the GPU renderer (OpenGL 3.3, ES 3 and ES 2) and the CPU renderer. A sixel is erased when text is printed over it; kitty images stay, as that protocol says. DA1 advertises sixel, `CSI 14/16/18 t` and `CSI ? 1/2 ; ... S` report pixel and cell sizes. Images scroll with the text into the scrollback and leave with it, clear with `clear`, and live in at most 128 MB of pixels per tab (least recently used goes first). Size, payload and file transfers are capped against hostile output, and `t=f`/`t=t` files are read only in local shells.
 - **GPU rendering** through OpenGL, redrawing at most once per frame, with an automatic software fallback.
+- **Ligatures** for programming fonts (Fira Code, JetBrains Mono, Cascadia Code and the like): `->`, `=>`, `!=`, `<=` and friends are shaped with HarfBuzz, in both renderers. Automatic by default (on when the terminal font has ligature features); View > Ligatures or `ligatures=true|false` under `[ui]` in `settings.ini` forces it. Runs are shaped per row and cached with the row, a ligature is broken under the cursor, and with ligatures off the text path is unchanged. HarfBuzz is a build dependency (`libharfbuzz-dev`).
+- **Modern terminal protocols.** Synchronized updates (mode 2026, with the 150 ms safety timeout), styled and coloured underlines (`SGR 4:1`-`4:5`, `58`/`59`), and the kitty keyboard protocol (push/pop/set/query; flags 1 disambiguate, 2 event types, 8 all keys as escape codes) so editors and tmux can tell `Ctrl+I` from Tab. Not supported: kitty flags 4 and 16, kitty graphics shared memory (`t=s`) and animation frames.
 - Acts as a terminal app: it takes `-e command` like `x-terminal-emulator`, and can open a local shell on startup.
+
+### Keyboard shortcuts
+
+| Keys | Action |
+|---|---|
+| `Ctrl+Shift+F` | find in scrollback (`Enter`/`Shift+Enter` or `F3`/`Shift+F3` step, `Esc` closes) |
+| `Ctrl+Shift+Up` / `Down` | jump to the previous / next prompt (shell integration) |
+| `Ctrl+Shift+O` | select the output of the last finished command (shell integration) |
+| `Ctrl+Shift+E` / `R` / `X` | split side by side / split below / close the pane |
+| `Ctrl+Shift+Left` / `Right` | move between panes |
+| `Ctrl+click` | open the link under the pointer |
+| `Ctrl` + `+` / `-` | bigger / smaller font |
+| `Alt+1` ... `Alt+9` | switch to tab 1 ... 9 |
+| `F5` | recheck the connection state of the sessions |
+| `Ctrl+Shift+I` | cache statistics overlay |
 
 ## Use it
 
@@ -498,8 +521,8 @@ It covers the terminal engine under ASan/UBSan (and against pyte), the UTF-8 fas
 
 - Linux only for now: there is no Windows or macOS build (the file browser also needs OpenSSH's ControlMaster, which Windows' OpenSSH lacks).
 - Follow-path polling needs a Linux server (`/proc`); on others it relies on the shell sending `OSC 7`.
-- Sixel and image protocols are not supported.
-- Wayland goes through SDL's Wayland driver and has not been tested here (only X11).
+- Inline images: shared-memory transfer (`t=s`) is not supported, PNG must be 8-bit and not interlaced (what every kitty client sends), and a sixel is erased as a whole when text touches any of its cells, not just the cells under the text. Images are dropped when the window is resized on the alternate screen.
+- Wayland: in a Wayland session Lestrix talks to the compositor directly (SDL's Wayland driver, falling back to X11 if the connection fails; force one with `LESTRIX_VIDEO=wayland|x11` or `SDL_VIDEODRIVER`). Tested on the fleetwm compositor with both renderers, the GUI script suite and clipboard paste. Not tested: copying out to the clipboard with real input (SDL needs a real input serial, the script harness has none), drag and drop of files, fractional scaling and moving the window between monitors of different scale (scale is read once at start).
 
 ## Support
 

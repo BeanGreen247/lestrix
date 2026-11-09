@@ -2,6 +2,29 @@
 
 Machine: Intel i5-8265U (4 cores, 8 threads), Debian 13, GCC 14.2, X11. All timings are interleaved A/B runs, `perf stat -e task-clock` for CPU time.
 
+## Index of every optimization (applied and dropped), newest last
+
+Rule: every optimization, applied or dropped, gets an entry here with before/after numbers. Details are in the sections named in the last column.
+
+| Date | Commit | Optimization | Status | Detail |
+|---|---|---|---|---|
+| 2026-10 | 055ee9f | Compact scrollback, deferred compression, fast output, pipelined parser, lite mode | applied | Gains so far |
+| 2026-10 | bb77cac | Compact scrolled rows on the serial path, inline CR/LF after ASCII runs | applied | Serial parser and speed gate |
+| 2026-10-08 | 51f9cd7 | Shadow ASCII rows for scrollback, splice in lxcat, input queue head offset | applied | Gaps 1, 3, 6 |
+| 2026-10-08 | 9af718a | Fast output for 43 more plain printers | applied | Remaining gaps |
+| 2026-10-08 | 7cca07a | inotify for the theme, idle sleep to the next timer | applied | Idle wake-ups |
+| 2026-10-08 | - | lxcat hand-off polling via inotify; `sched_yield` spin in `feed_sliced` | dropped | Gaps 4, 5 |
+| 2026-10 | 0b24169, bd475d4 | SGR straight to the pen, pack scan stops at the first second style, style cache skipped for the default pen, quick CUP, memmove for the scroll order | applied | Serial parser and speed gate |
+| 2026-10 | e2c8ebd, 0289c8e, 9c735b9 | UI: clear only used rows, cursor stops blinking when idle, on-demand job threads, adaptive frame cap, echo without frame gap (16.9 to 2.9 ms) | applied | Idle wake-ups, README |
+| 2026-10-27 | 2c94b47 | Full-screen scroll slides a window over the row order | applied | region_up row-order window |
+| 2026-11-03 | 5c6a55c..81b2f71 | Colour emoji atlas, CPU renderer, changed-tiles repaint, UI wake-up storm fix (UI thread CPU 4x lower) | applied | Round 2026-11-03 |
+| 2026-11-05 | 944dee3 | Read delay 200 to 400 us | applied | Read delay |
+| 2026-11-09 | 0.4.2 | `sgr_quick` pairs, 256-colour and truecolor fast paths (colour 418 to 450 MB/s, 256/truecolor 257 to 307) | applied | Colour parsing round |
+| 2026-11-09 | 0.4.2 | AVX2 packing loop in `hist_push` (runtime dispatch), colour driver about 281-290 to 296-301 MB/s | applied | Gap hunt round 2 |
+| 2026-11-09 | - | Pack scrollback bytes straight into the history segment (no second copy) | dropped | Gap hunt round 2 |
+| 2026-11-09 | - | Cheaper `hist_add` (cell copy into history) | dropped | Gap hunt round 2 |
+| 2026-11-09 | - | One-entry style cache in front of `intern_style` | dropped | Gap hunt round 2 |
+
 ## Gains so far this session
 
 | Change | Result |
@@ -355,3 +378,38 @@ CPU renderer, default read delay 400 us: median 0.8-0.9 ms, p90 0.9-1.2 ms, max 
 Latency under load (same method, CPU renderer, cursor hidden so the cursor jumping to the status row cannot trigger the detector; load writes one status row with save/restore cursor). Idle: median 0.9 ms, p90 1.0. Light load (shell loop, 2 ms between writes): median 0.6-0.7, p90 1.0-1.2, max 2.2. Saturating load (awk, no pacing, one core busy): median 1.2-1.7 ms, p90 9-31 ms, max 35-101 ms, read delay 200 vs 400 us not distinguishable (3 runs of 40 each, p90 10-25 vs 18-31). Probable cause, not verified: the echo queues behind up to a full pty buffer of pending output, plus 2 vCPUs shared by awk, Lestrix, Xorg and the probe. Not fixable by ordering: the echo is data in the same byte stream.
 
 Replay of recorded full-screen sessions (vim with syntax, 300 page-downs, `script` recording x10 = 11 MB; `top -d 0.01`, 19.7 MB; `cat` of the file into Lestrix, 3 runs each): vim 0.26-0.37 s wall, 60-80 ms CPU (CPU renderer) vs 0.42-0.47 s, 140-150 ms (OpenGL); top 0.42-0.47 s, 90-120 ms vs 0.52-0.58 s, 170-200 ms. Profile (`top` replay): `feed_serial` 4.2%, `hist_push` 2.0%, `soft_draw` 1.7%, `csi_dispatch` 1.1% of samples, nothing else of Lestrix above 1%. Startup: window mapped 83-96 ms (CPU renderer), 119-150 ms (OpenGL); startup CPU 50-60 ms vs 160-170 ms; RSS 32 MB vs 133 MB. Memory with scrollback: 3M-line flood (22.9 MB) 38 MB RSS, 300k coloured lines (18.7 MB) 35 MB. The `XSync` per present was not changed: SDL-internal, under 1% of samples in every profile above.
+
+## Colour parsing round (2026-11-09)
+
+Method: a driver that builds 8 MB once and feeds it 30 times into a 176x49 terminal with 10,000 lines of scrollback (best of 30, project flags `-O3 -freorder-blocks-algorithm=simple -fvect-cost-model=unlimited`, perf `--fp` recordings in claude-memory-bank `perf-data/lestrix-2026-11-09/`). The built-in benchmark's colour figure moved 0.27 -> 0.31 s after the feature batch; the driver shows the real parser cost was 424 -> 418 MB/s (1.5%), spread over the parser, no single function. The rest was noise.
+
+| Workload | Before | After |
+|---|---|---|
+| Colour (`3Xm`, `0m`, `1;9Xm`, `0;3Xm` mix) | 418 MB/s | 444-453 MB/s |
+| 256-colour and truecolor (`38;5;N`, `48;5;N`, `38;2;R;G;B`) | 257 MB/s | 307 MB/s |
+| Plain log | 960 MB/s | 960-971 MB/s |
+
+Change: `sgr_quick` also takes `0;3Xm`/`1;3Xm`/`1;9Xm`-style pairs and the 256-colour and truecolor forms, so they skip the parameter array and the general SGR loop. `tests/test_fast_paths.cpp` now feeds its oracle one byte at a time (no escape sequence is ever whole in the buffer, so the fast paths cannot run) and compares the resolved fg/bg/attrs/underline colour, not only the cell flags; a deliberately wrong clamp fails on round 0.
+
+Rejected (measured): forcing `put_ascii` out of line (-6%), padded or packed style-cache slots and a 64-bit packed key (no gain, a bad hash made it -7%), `cold` attribute on the graphics-string hooks (+1%), 256 instead of 64 style-cache slots (+1% on a worst-case mix, plain output not better).
+
+Whole application (CPU renderer, `--flood` of a 320 MB colour file through the built-in cat): 0.85 s, 380 MB/s; `feed_serial` 35%, `csi_fast` 12%, `intern_style` 5%, `hist_push` 5%, UI thread about 1%. Idle: 1 ms CPU per 10 s, 7 context switches, 38.6 MB RSS (12 MB anonymous).
+
+Test harness fixes found on the way: `--script` `t:` text was cut at 31 bytes (an SDL text event), so `cd /tmp/...` and long commands in `test-gui` were truncated and the image check could never pass on a machine whose shell starts slowly; it now sends long text in several events. `test.sh` read make's exit status 2 as "skipped", so a failing `test-gui` looked like SKIP.
+
+## Gap hunt round 2 (2026-11-09, project flags, no `-march`, colour driver and a plain-text driver)
+
+Method: driver feeding 32 MB (4 KB chunks) into a 200x50 terminal with 10,000 lines of scrollback, best of 8 interleaved A/B runs. Workloads: colour (first 32 MB of the 320 MB colour file) and plain (random words, 8-24 per line, 32 MB). Recordings in claude-memory-bank `perf-data/scratchpad-2026-11-09/recordings/` (`085047-drv.data` before, `085410-drv_new.data` after the AVX2 change; open with `hotspot <file>`). clang-tidy `performance-*` on `src/vt.cpp`: only three enum base-size notes, nothing to act on. The built-in `bench_vt` profile is dominated by its own workload generator (`printf`, `memmove`), so it was not used for tuning.
+
+Before: colour 281 MB/s; `feed_serial_impl` 28%, `hist_push` 13.5%, `csi_fast` 10%, `memmove` 7.5%, `hist_add` 6.7%, `memset` 6.6%, `pen_commit` 4.8%, `intern_style` 4.3%. `feed_serial_impl` is flat: dozens of source lines, none above 2.5%.
+
+**Applied: AVX2 packing loop in `hist_push`** (`pack_cells_avx2`, chosen at run time with `__builtin_cpu_supports("avx2")`, the SSE2 and scalar loops still take the tail and non-AVX2 CPUs). 16 cells per step: one `vpermd` per 4 cells puts code points in the low half and style words in the high half, one xor/and/or accumulates the "second style or non-ASCII" test, one pack stores 16 bytes. Colour 281-290 to 296-301 MB/s (3-7%, interleaved runs); `hist_push` plus the new function 9.4% of samples (was 13.5%). The shared packing code is now `pack_line()` and uses a scratch buffer inside `Vt` (zeroed once with the struct); a per-call zeroed 512 byte stack buffer cost 7% and was removed. Tests: `./test.sh --no-deps` 10 of 11 groups pass; `engine` fails only on the known 57 pyte seeds (1443/1500 identical, same 57 on unmodified HEAD), `make test-vt` 590 checks 0 failures.
+
+**Dropped: pack straight into the history segment.** `memmove` under `do_linefeed` (8.8%) is the copy of the packed bytes into the segment, so the packer was pointed at the segment to skip it. Allocating the compact buffer early made every cell-only segment carry a spare 26 KB buffer that `pack_oldest` then moved (`memmove` 9.8% to 21.6%, colour -20%). Restricting it to segments that already have a compact buffer and falling back to a stack buffer: colour 0 to -3%, plain -1.5%. Not kept.
+
+**Dropped: `hist_add`.** What is left in it is the cell copy into the history ring (`copy_cells`, 1.4% on the hottest line) and bookkeeping, no avoidable work; nothing changed.
+
+**Dropped: one-entry style cache.** `intern_cached` already has a 64-slot direct-mapped cache in front of `intern_style`. The 4% left in `intern_style` is cache misses of the random 256-colour/truecolor mix, which a one-entry cache cannot serve. Nothing changed.
+
+Not done this round: bloaty (needs a debug-info build), heaptrack, callgrind, PGO/BOLT.
+

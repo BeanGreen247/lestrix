@@ -45,8 +45,8 @@ static char **build_env(char *const extra[]) {
     return env;
 }
 
-int sd_pty_spawn(SdPty *p, char *const argv[], const char *cwd, char *const extra_env[], int cols, int rows) {
-    struct winsize ws = {(unsigned short)rows, (unsigned short)cols, 0, 0};
+int sd_pty_spawn(SdPty *p, char *const argv[], const char *cwd, char *const extra_env[], int cols, int rows, int cw, int ch) {
+    struct winsize ws = {(unsigned short)rows, (unsigned short)cols, (unsigned short)(cw > 0 ? cols * cw : 0), (unsigned short)(ch > 0 ? rows * ch : 0)};
     char **env = build_env(extra_env);
     int master;
     pid_t pid = forkpty(&master, NULL, NULL, &ws);
@@ -73,8 +73,8 @@ int sd_pty_spawn(SdPty *p, char *const argv[], const char *cwd, char *const extr
     return 0;
 }
 
-void sd_pty_resize(SdPty *p, int cols, int rows) {
-    struct winsize ws = {(unsigned short)rows, (unsigned short)cols, 0, 0};
+void sd_pty_resize(SdPty *p, int cols, int rows, int cw, int ch) {
+    struct winsize ws = {(unsigned short)rows, (unsigned short)cols, (unsigned short)(cw > 0 ? cols * cw : 0), (unsigned short)(ch > 0 ? rows * ch : 0)};
     if (p->fd >= 0) ioctl(p->fd, TIOCSWINSZ, &ws);
 }
 

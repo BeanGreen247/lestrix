@@ -36,6 +36,8 @@ uint32_t atlas_generation(const Atlas *a);
 void atlas_white(const Atlas *a, uint16_t *x, uint16_t *y);
 const AtlasGlyph *atlas_glyph(Atlas *a, Font *f, uint32_t cp, int style);
 const AtlasGlyph *atlas_custom(Atlas *a, uint32_t font_id, uint32_t key, const uint8_t *bits, int w, int h);
+const AtlasGlyph *atlas_glyph_gid(Atlas *a, Font *f, uint32_t gid, int style);
+const AtlasGlyph *atlas_peek_gid(const Atlas *a, uint32_t font_id, uint32_t gid, int style);
 const AtlasGlyph *atlas_peek(const Atlas *a, uint32_t font_id, uint32_t cp, int style);
 const AtlasGlyph *atlas_find_custom(Atlas *a, uint32_t font_id, uint32_t key);
 #endif

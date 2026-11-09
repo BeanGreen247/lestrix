@@ -54,6 +54,7 @@ void ui_set_colors(Ui *u, const UiColors *c);
 void ui_set_rounded(Ui *u, bool rounded);
 const UiColors *ui_colors(const Ui *u);
 float ui_scale(const Ui *u);
+void ui_set_scale(Ui *u, float scale, void *font, void *mono);   /* display scale changed at run time: new fonts opened for it */
 float S(const Ui *u, float v);
 void ui_event(Ui *u, const SDL_Event *e);
 void ui_begin(Ui *u, int w, int h, double now);

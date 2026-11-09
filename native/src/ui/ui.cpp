@@ -43,7 +43,7 @@ struct Ui {
     bool press_this_frame, input_claimed;
     double want_until;
     int want_cursor;
-    SDL_Cursor *cursors[3];
+    SDL_Cursor *cursors[5];
     SDL_Cursor *cur_set;
     char tip[256];
     Rect tip_r;
@@ -91,6 +91,8 @@ Ui *ui_new(Renderer *r, void *font, void *mono, float scale) {
     u->cursors[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
     u->cursors[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_IBEAM);
     u->cursors[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_HAND);
+    u->cursors[3] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZEWE);
+    u->cursors[4] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZENS);
     u->menu_result = -1;
     u->rounded = true;
     return u;
@@ -98,7 +100,7 @@ Ui *ui_new(Renderer *r, void *font, void *mono, float scale) {
 
 void ui_free(Ui *u) {
     if (!u) return;
-    for (int i = 0; i < 3; i++) if (u->cursors[i]) SDL_FreeCursor(u->cursors[i]);
+    for (int i = 0; i < 5; i++) if (u->cursors[i]) SDL_FreeCursor(u->cursors[i]);
     free(u->menu_items);
     free(u);
 }
@@ -107,6 +109,7 @@ void ui_set_colors(Ui *u, const UiColors *c) { u->c = *c; }
 void ui_set_rounded(Ui *u, bool rounded) { u->rounded = rounded; }
 const UiColors *ui_colors(const Ui *u) { return &u->c; }
 float ui_scale(const Ui *u) { return u->scale; }
+void ui_set_scale(Ui *u, float scale, void *font, void *mono) { u->scale = scale; u->font = static_cast<Font*>(font); u->mono = static_cast<Font*>(mono); }
 float S(const Ui *u, float v) { return (float)floor(v * u->scale + 0.5); }
 
 float ui_ptr_x = -1, ui_ptr_y = -1;
@@ -194,7 +197,7 @@ bool ui_animating(const Ui *u) { return u->now < u->want_until; }
 void ui_want_frames(Ui *u, double seconds) { if (u->now + seconds > u->want_until) u->want_until = u->now + seconds; }
 
 SDL_Cursor *ui_wanted_cursor(Ui *u) { return u->cursors[u->want_cursor]; }
-void ui_set_cursor(Ui *u, int kind) { if (kind >= 0 && kind < 3) u->want_cursor = kind; }
+void ui_set_cursor(Ui *u, int kind) { if (kind >= 0 && kind < 5) u->want_cursor = kind; }
 
 void ui_rect(Ui *u, Rect r, uint32_t c) { if (r.w > 0 && r.h > 0) r_rect(u->r, r.x, r.y, r.w, r.h, c); }
 void ui_rrect(Ui *u, Rect r, uint32_t c, float radius) {

@@ -75,7 +75,7 @@ ui_step "Installing the compiler and the libraries Lestrix is built from" \
   "What: installs g++/make and the development files for SDL2, FreeType, fontconfig and libcurl," \
   "      plus OpenGL drivers and the ssh client. Packages that are already present are skipped." \
   "Why:  Lestrix is built from source on your machine, tuned for your exact CPU."
-need_deps() { pkg-config --exists sdl2 freetype2 fontconfig libcurl 2>/dev/null && command -v g++ >/dev/null && command -v make >/dev/null; }
+need_deps() { pkg-config --exists sdl2 freetype2 fontconfig harfbuzz libcurl 2>/dev/null && command -v g++ >/dev/null && command -v make >/dev/null; }
 if [ "$DEPS" = no ]; then
   ui_note "skipped (--no-deps)"
 elif need_deps && [ "$DRY" = 0 ]; then

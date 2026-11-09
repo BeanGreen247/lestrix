@@ -28,6 +28,8 @@ typedef struct {
     void (*clip_set)(void *user, const char *text, bool primary);
     void (*clip_request)(void *user, bool primary);
     void (*wake)(void *user);
+    void (*cmd_end)(void *user, int exit_code, double secs);   /* OSC 133;D: exit code or -1, seconds since 133;C (0 if unknown) */
+    void (*notify)(void *user, const char *title, const char *body);   /* OSC 9 / OSC 777;notify, text is raw (sanitize it) */
 } TermHooks;
 
 typedef struct TermCore TermCore;
@@ -44,6 +46,7 @@ void tcore_unlock(TermCore *t);
 int tcore_cols(const TermCore *t);
 int tcore_rows(const TermCore *t);
 void tcore_resize(TermCore *t, int cols, int rows);
+void tcore_set_cell_px(TermCore *t, int cw, int ch);   /* cell size in pixels, for sixel / kitty image sizing and the size reports */
 bool tcore_running(const TermCore *t);
 void tcore_restart(TermCore *t);
 uint64_t tcore_bytes_fed(const TermCore *t);
@@ -68,8 +71,18 @@ void tcore_send_str(TermCore *t, const char *s);
 int tcore_offset(const TermCore *t);
 void tcore_scroll(TermCore *t, int delta);
 void tcore_scroll_to_live(TermCore *t);
+bool tcore_jump_prompt(TermCore *t, int dir);
+bool tcore_select_last_output(TermCore *t);
+int tcore_last_exit(const TermCore *t);
+bool tcore_integrated(const TermCore *t);
+char *tcore_proc_cwd(const TermCore *t);
 
 bool tcore_key(TermCore *t, TKey key, uint32_t cp, int mods);
+/* ev: 1 press, 2 repeat, 3 release. Releases and repeats only reach the program when it asked for them (kitty keyboard protocol flag 2). */
+bool tcore_key_ev(TermCore *t, TKey key, uint32_t cp, int mods, int ev);
+int tcore_kitty_flags(TermCore *t);
+/* The kitty keyboard protocol encoding of one key event into out (at least 32 bytes); 0 when the key keeps its legacy encoding. */
+size_t tcore_kitty_encode(int flags, TKey key, uint32_t cp, int mods, int ev, char *out);
 void tcore_text(TermCore *t, const char *utf8);
 void tcore_mouse_button(TermCore *t, int button, bool press, int col, int row, int clicks, int mods);
 void tcore_mouse_move(TermCore *t, int col, int row, int mods);

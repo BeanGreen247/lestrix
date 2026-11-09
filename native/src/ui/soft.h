@@ -22,6 +22,11 @@ typedef struct { int on, x, y, w, h; } SoftClip;   /* top-left origin, pixels */
 
 void soft_clear(const SoftTarget *t, uint32_t rgba);
 void soft_clear_rect(const SoftTarget *t, int x0, int y0, int x1, int y1, uint32_t rgba);   /* half-open, clipped to the target */
+/* An RInst whose pad has bit 31 set is an image: pad & 0x7fffffff is its serial, x,y,w,h the destination, u0..v1 the source in 1/65535ths
+ * of the image. The caller resolves serials to pixels. */
+typedef struct { const uint32_t *px; int w, h; } SoftImage;
+typedef struct { const SoftImage *(*find)(void *ctx, uint32_t serial); void *ctx; } SoftImages;
+#define SOFT_IMAGE_BIT 0x80000000u
 void soft_draw(const SoftTarget *t, const SoftClip *clip, const RInst *in, size_t n,
-               const uint8_t *atlas, int asize, const uint32_t *catlas, int csize);
+               const uint8_t *atlas, int asize, const uint32_t *catlas, int csize, const SoftImages *imgs = nullptr);
 #endif

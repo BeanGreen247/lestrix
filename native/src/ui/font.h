@@ -28,6 +28,13 @@ int font_cell_w(const Font *f);
 int font_cell_h(const Font *f);
 int font_ascent(const Font *f);
 bool font_glyph(Font *f, uint32_t cp, int style, GlyphBmp *out);
+/* Ligatures: shape a run of codepoints (one per cell) and report only the glyphs that differ from the plain per-character ones. cell is the
+ * index in the run, span the number of cells the glyph covers (>1 for a true ligature). Returns -1 when it would have to load a face or build
+ * HarfBuzz state and init is false (worker threads), else the number of entries. */
+typedef struct { uint32_t gid; int cell, span; } ShapedGlyph;
+int font_shape(Font *f, const uint32_t *cps, int n, int style, ShapedGlyph *out, int cap, bool init);
+bool font_glyph_gid(Font *f, uint32_t gid, int style, GlyphBmp *out);
+bool font_has_ligatures(Font *f);
 bool font_glyph_color(Font *f, uint32_t cp, int style, GlyphBmp *out, bool allow_color);
 float font_advance(Font *f, uint32_t cp, int style);
 char *font_pick_family(const char *const *wanted);

@@ -14,8 +14,8 @@ typedef struct {
     pid_t pid;
 } SdPty;
 
-int sd_pty_spawn(SdPty *p, char *const argv[], const char *cwd, char *const extra_env[], int cols, int rows);
-void sd_pty_resize(SdPty *p, int cols, int rows);
+int sd_pty_spawn(SdPty *p, char *const argv[], const char *cwd, char *const extra_env[], int cols, int rows, int cw, int ch);
+void sd_pty_resize(SdPty *p, int cols, int rows, int cw, int ch);   /* cw/ch: cell size in pixels (0 if unknown), reported as ws_xpixel/ws_ypixel */
 ssize_t sd_pty_write(SdPty *p, const void *buf, size_t len);
 void sd_pty_hangup(SdPty *p);
 void sd_pty_close(SdPty *p);

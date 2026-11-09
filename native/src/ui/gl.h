@@ -31,6 +31,7 @@ typedef struct {
     void (APIENTRY *GetIntegerv)(GLenum, GLint *);
     const GLubyte *(APIENTRY *GetString)(GLenum);
     void (APIENTRY *DrawElements)(GLenum, GLsizei, GLenum, const void *);
+    void (APIENTRY *DrawArrays)(GLenum, GLint, GLsizei);
     void (APIENTRY *DeleteBuffers)(GLsizei, const GLuint *);
     void (APIENTRY *DisableVertexAttribArray)(GLuint);
     void (APIENTRY *BindAttribLocation)(GLuint, GLuint, const GLchar *);

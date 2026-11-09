@@ -84,6 +84,50 @@ static void draw_rrect(const SoftTarget *t, const Fmt &f, const RInst &in, Rect 
     (void)ix0; (void)iy0;
 }
 
+static inline uint32_t texel(const SoftImage *im, int x, int y) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= im->w) x = im->w - 1;
+    if (y >= im->h) y = im->h - 1;
+    return im->px[(size_t)y * (size_t)im->w + (size_t)x];
+}
+
+/* Draws an image instance: nearest sampling when it lands 1:1 (sixels, natural-size kitty images), bilinear when scaled. */
+static void draw_image(const SoftTarget *t, const Fmt &f, const RInst &q, Rect r, const SoftImage *im) {
+    if (!im || !im->px || im->w <= 0 || im->h <= 0) return;
+    const float su0 = (float)q.u0 / 65535.f * (float)im->w, sv0 = (float)q.v0 / 65535.f * (float)im->h;
+    const float su1 = (float)q.u1 / 65535.f * (float)im->w, sv1 = (float)q.v1 / 65535.f * (float)im->h;
+    const float dx = (su1 - su0) / q.w, dy = (sv1 - sv0) / q.h;
+    const bool one = fabsf(dx - 1.f) < 0.001f && fabsf(dy - 1.f) < 0.001f;
+    for (int y = r.y0; y < r.y1; y++) {
+        uint32_t *row = t->px + (size_t)y * t->pitch;
+        const float fy = sv0 + ((float)y + 0.5f - q.y) * dy;
+        for (int x = r.x0; x < r.x1; x++) {
+            const float fx = su0 + ((float)x + 0.5f - q.x) * dx;
+            uint32_t p;
+            if (one) p = texel(im, (int)floorf(fx), (int)floorf(fy));
+            else {
+                const float gx = fx - 0.5f, gy = fy - 0.5f;
+                const int x0 = (int)floorf(gx), y0 = (int)floorf(gy);
+                const float ax = gx - (float)x0, ay = gy - (float)y0;
+                const uint32_t p00 = texel(im, x0, y0), p10 = texel(im, x0 + 1, y0), p01 = texel(im, x0, y0 + 1), p11 = texel(im, x0 + 1, y0 + 1);
+                uint32_t c[4];
+                for (int k = 0; k < 4; k++) {
+                    const int s = 8 * k;
+                    const float top = (float)((p00 >> s) & 255) * (1.f - ax) + (float)((p10 >> s) & 255) * ax;
+                    const float bot = (float)((p01 >> s) & 255) * (1.f - ax) + (float)((p11 >> s) & 255) * ax;
+                    c[k] = (uint32_t)(top * (1.f - ay) + bot * ay + 0.5f);
+                }
+                p = c[0] | c[1] << 8 | c[2] << 16 | c[3] << 24;
+            }
+            const uint32_t a = p >> 24;
+            if (!a) continue;
+            if (a >= 255) row[x] = pack(f, p & 255, (p >> 8) & 255, (p >> 16) & 255) | (row[x] & t->amask);
+            else blend_px(row + x, f, p & 255, (p >> 8) & 255, (p >> 16) & 255, a);
+        }
+    }
+}
+
 }  // namespace
 
 void soft_clear_rect(const SoftTarget *t, int x0, int y0, int x1, int y1, uint32_t rgba) {
@@ -99,7 +143,7 @@ void soft_clear_rect(const SoftTarget *t, int x0, int y0, int x1, int y1, uint32
 void soft_clear(const SoftTarget *t, uint32_t rgba) { soft_clear_rect(t, 0, 0, t->w, t->h, rgba); }
 
 void soft_draw(const SoftTarget *t, const SoftClip *clip, const RInst *in, size_t n, const uint8_t *atlas, int asize,
-               const uint32_t *catlas, int csize) {
+               const uint32_t *catlas, int csize, const SoftImages *imgs) {
     const Fmt f{t->rs, t->gs, t->bs};
     Rect bounds{0, 0, t->w, t->h};
     if (clip && clip->on) bounds = isect(bounds, Rect{clip->x, clip->y, clip->x + clip->w, clip->y + clip->h});
@@ -113,6 +157,7 @@ void soft_draw(const SoftTarget *t, const SoftClip *clip, const RInst *in, size_
         int ix1 = (int)ceilf(q.x + q.w - 0.5f), iy1 = (int)ceilf(q.y + q.h - 0.5f);
         Rect r = isect(Rect{ix0, iy0, ix1, iy1}, bounds);
         if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
+        if (q.pad & SOFT_IMAGE_BIT) { if (imgs && imgs->find) draw_image(t, f, q, r, imgs->find(imgs->ctx, q.pad & 0x7fffffffu)); continue; }
         bool plain = q.u0 == q.u1 && q.v0 == q.v1;
         if (plain) {
             if (q.pad & 0xffff) { draw_rrect(t, f, q, r, ix0, iy0, cr, cg, cb, ca); continue; }
